@@ -15,6 +15,9 @@ This repository is suitable for quickly reproducing small-scale RWKV v7 series m
 
 We love and give back to the open-source community and appreciate any implementations from it. If you find any issues in our code repository, including but not limited to code quality, code style, code interpretability, or numerical precision errors, you are welcome to submit an issue.
 
+> [!WARNING]
+> Note: This is WIP (very likely correct, and more efficient). On the other hand, you can still use [RWKV-LM](https://github.com/BlinkDL/RWKV-LM/tree/main/RWKV-v7/train_temp) as reference implementation.
+
 [Chinese Version/中文版本](./README_CN.md)
 
 ## How to start?

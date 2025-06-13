@@ -1,9 +1,7 @@
 import os
-import shutil
 import struct
 from functools import lru_cache
 from itertools import accumulate
-from lib2to3.pgen2 import token
 
 import numpy as np
 import torch

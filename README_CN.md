@@ -1,53 +1,60 @@
+
+<div align="center">
+
 # RWKV-LM-V7
+[![English](https://img.shields.io/badge/README-English-blue.svg)](./README.md) 
+[![中文](https://img.shields.io/badge/README-中文版本-red.svg)](./README_CN.md)
+
+</div>
+
 ## 项目介绍
-让任何研究者在15分钟内开始预训练一个完全对齐的RWKV v7模型。当然不包括下载数据 :) 
+让任何研究者在 15 分钟内开始预训练一个完全对齐的 RWKV v7 模型。当然不包括下载数据 :) 。
 
-所有的代码来源于原始 RWKV-LM 项目， https://github.com/BlinkDL/RWKV-LM
+所有的代码来源于原始 RWKV-LM 项目：https://github.com/BlinkDL/RWKV-LM
 
-此仓库适合快速的在英伟达显卡上使用样例数据或私有数据小规模的复现 RWKV v7 系列模型，例如191M~3B等大小，我们接下来会重点改善：
+此仓库适合快速的在英伟达显卡上使用样例数据或私有数据小规模的复现 RWKV v7 系列模型，例如 191M ~ 3B 等大小，我们接下来会重点改善：
 
 - 提供 RWKV 系列模型在多模态等任务的模板代码
 - 提供跨平台的内核实现
 - 提供可配置的 RWKV Layer 类
 - 提供高性能的 Pytorch 推理实现
-- 提供适合 3-70B 的集群训练框架及脚本
+- 提供适合 3 ~ 70B 的集群训练框架及脚本
 
-我们热爱并回馈开源社区，感谢任何开源社区的实现。如果您发现我们的代码仓库有包含但不限于：代码质量，代码风格，代码可解释性，数值精度误差的问题，欢迎提交 issue。
+我们热爱并回馈开源社区，感谢任何开源社区的实现。如果您发现我们的代码仓库有包含但不限于：代码质量，代码风格，代码可解释性，数值精度误差的问题，欢迎[提交 issue](https://github.com/RWKV-Vibe/RWKV-LM-V7/issues/new)。
 
 > [!WARNING]
-> Note: 整个仓库仍处于 WIP 阶段(与基线相比，我们改进了融合算子的使用，计算更高效). 如果您有所顾虑， 您可以使用 [RWKV-LM](https://github.com/BlinkDL/RWKV-LM/tree/main/RWKV-v7/train_temp) 作为参考实现.
+> Note: 整个仓库仍处于 WIP 阶段（与基线相比，我们改进了融合算子的使用，计算更高效）。如果您有所顾虑，则可以使用 [RWKV-LM](https://github.com/BlinkDL/RWKV-LM/tree/main/RWKV-v7/train_temp) 作为参考实现。
 
 ## 如何开始？
 
 ### 准备环境
-环境准备，请使用miniforge等conda兼容包管理器，创建一个全新的环境
+
+环境准备，请使用 miniforge 等 conda 兼容包管理器，创建一个全新的环境：
 ```
 conda create -n rwkv-lm-v7 python=3.12
 conda activate rwkv-lm-v7
 ```
-
-随后安装下列依赖，请注意，pytorch-lightning 固定使用了 1.9.5 版本，此为本仓库特性，请不要升级此依赖包。
+随后安装下列依赖，注意 `pytorch-lightning` 固定使用了 `1.9.5` 版本，此为本仓库特性，请不要升级此依赖包。
 ```
 pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 pip3 install -r requirements.txt
 ```
 
 ### 下载数据
+
 ```
-cd data
 wget --continue -O data/minipile.idx https://huggingface.co/datasets/BlinkDL/minipile-tokenized/resolve/main/rwkv_vocab_v20230424/minipile.idx
 wget --continue -O data/minipile.bin https://huggingface.co/datasets/BlinkDL/minipile-tokenized/resolve/main/rwkv_vocab_v20230424/minipile.bin
-
 ```
 
 ### 开始训练
 
-1. 初始化空 RWKV7 模型
+1. 初始化空 RWKV-7 模型
 ```
 sh ./demo-training-prepare.sh
 ```
 
-2. 登录wandb账号
+2. 登录 WandB 账号
 
 3. 开始训练
 ```
@@ -57,19 +64,22 @@ sh ./demo-training-run.sh
 ## 详细解释
 
 此章节包含模型初始化、学习率及细节解释。
-RWKV7使用了包含经过设计和数学论证的初始化和基于训练结果分析的初始化，加速模型收敛及其性能。
+
+RWKV-7 使用了包含经过设计和数学论证的初始化和基于训练结果分析的初始化，加速模型收敛及其性能。
 
 ### L2Warp
-此类惩罚模型，避免模型过度自信，从而缓解BF16中间的精度损失。
+此类惩罚模型，避免模型过度自信，从而缓解 BF16 中间的精度损失。
 
 ### 权重及其初始化样例
-请严格注意上下文学习率等相关设置。
+
+请严格注意上下文学习率等相关设置：
 ```
 self.k_k = nn.Parameter(torch.zeros(1, 1, C)+0.71 - linear*0.1)
 self.k_a = nn.Parameter(torch.zeros(1, 1, C)+1.02)
 ```
 
 RWKV-7 weight example for 1.5B (L24-D2048, vocab 65536):
+
 | name                | shape         | comment      | initialization  |
 |---------------------|---------------|--------------|-----------------|
 | emb.weight          | [65536, 2048] | wdecay       | see code        |
@@ -116,7 +126,9 @@ RWKV-7 weight example for 1.5B (L24-D2048, vocab 65536):
 | head.weight   | [65536, 2048] | wdecay | see code  |
 
 ## 检查结果
-在 out/....../train_log.txt 路径下，您的损失应该非常接近:
+
+在 `out/....../train_log.txt` 路径下，您的损失应该非常接近：
+
 ```
 0 4.875856 131.0863 0.00059975 2025-04-24 02:23:42.481256 0
 1 4.028621 56.1834 0.00059899 2025-04-24 02:28:16.674463 1

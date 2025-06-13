@@ -1,6 +1,13 @@
+<div align="center">
+
 # RWKV-LM-V7
+[![English](https://img.shields.io/badge/README-English-blue.svg)](./README.md) 
+[![中文](https://img.shields.io/badge/README-中文版本-red.svg)](./README_CN.md)
+
+</div>
 
 ## Project Introduction
+
 This project allows any researcher to start pre-training a fully aligned RWKV v7 model within 15 minutes. Of course, this does not include the time to download the data :)
 
 All code is sourced from the original RWKV-LM project: https://github.com/BlinkDL/RWKV-LM
@@ -13,16 +20,15 @@ This repository is suitable for quickly reproducing small-scale RWKV v7 series m
 -   Provide a high-performance PyTorch inference implementation.
 -   Provide a cluster training framework and scripts suitable for models from 3B to 70B.
 
-We love and give back to the open-source community and appreciate any implementations from it. If you find any issues in our code repository, including but not limited to code quality, code style, code interpretability, or numerical precision errors, you are welcome to submit an issue.
+We love and give back to the open-source community and appreciate any implementations from it. If you find any issues in our code repository, including but not limited to code quality, code style, code interpretability, or numerical precision errors, you are welcome to [submit an issue](https://github.com/RWKV-Vibe/RWKV-LM-V7/issues/new).
 
 > [!WARNING]
 > Note: This is WIP (very likely correct, and more efficient). On the other hand, you can still use [RWKV-LM](https://github.com/BlinkDL/RWKV-LM/tree/main/RWKV-v7/train_temp) as reference implementation.
 
-[Chinese Version/中文版本](./README_CN.md)
-
 ## How to start?
 
 ### Prepare Environment
+
 To prepare the environment, please use a conda-compatible package manager like miniforge to create a new environment.
 ```
 conda create -n rwkv-lm-v7 python=3.12
@@ -33,21 +39,21 @@ Next, install the following dependencies. Please note that `pytorch-lightning` i
 pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 pip3 install -r requirements.txt
 ```
+
 ### Download Data
+
 ```
-cd data
 wget --continue -O data/minipile.idx https://huggingface.co/datasets/BlinkDL/minipile-tokenized/resolve/main/rwkv_vocab_v20230424/minipile.idx
 wget --continue -O data/minipile.bin https://huggingface.co/datasets/BlinkDL/minipile-tokenized/resolve/main/rwkv_vocab_v20230424/minipile.bin
-
 ```
 ### Start Training
 
-1. Initialize an empty RWKV7 model
+1. Initialize an empty RWKV-7 model
 ```
 sh ./demo-training-prepare.sh
 ```
 
-2. Log in to your wandb account
+2. Log in to your WandB account
 
 3. Start training
 ```
@@ -57,20 +63,24 @@ sh ./demo-training-run.sh
 ## Detailed Explanation
 
 This section contains explanations of model initialization, learning rates, and other details.
-RWKV7 uses initializations that are both theoretically designed with mathematical proof and empirically derived from training results to accelerate model convergence and improve performance.
+
+RWKV-7 uses initializations that are both theoretically designed with mathematical proof and empirically derived from training results to accelerate model convergence and improve performance.
 
 ### L2Warp
+
 This type of penalty prevents the model from becoming overconfident, thereby mitigating precision loss in BF16.
 
 ### Weights and Initialization Example
+
 Please pay close attention to the learning rate and related settings in the context.
+
 ```python
 self.k_k = nn.Parameter(torch.zeros(1, 1, C)+0.71 - linear*0.1)
 self.k_a = nn.Parameter(torch.zeros(1, 1, C)+1.02)
 ```
 
-
 RWKV-7 weight example for 1.5B (L24-D2048, vocab 65536):
+
 | name                | shape         | comment      | initialization  |
 |---------------------|---------------|--------------|-----------------|
 | emb.weight          | [65536, 2048] | wdecay       | see code        |
@@ -117,7 +127,7 @@ RWKV-7 weight example for 1.5B (L24-D2048, vocab 65536):
 | head.weight   | [65536, 2048] | wdecay | see code  |
 
 ## Check Result
-your out/....../train_log.txt should have losses similar to:
+your `out/....../train_log.txt` should have losses similar to:
 ```
 0 4.875856 131.0863 0.00059975 2025-04-24 02:23:42.481256 0
 1 4.028621 56.1834 0.00059899 2025-04-24 02:28:16.674463 1

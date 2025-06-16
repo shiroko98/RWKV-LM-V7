@@ -11,14 +11,13 @@ if __name__ == "__main__":
 
     import pytorch_lightning as pl
     from pytorch_lightning import Trainer
-    from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
+    from pytorch_lightning.utilities import rank_zero_info
 
     rank_zero_info("########## work in progress ##########")
 
     parser = ArgumentParser()
 
-    parser.add_argument("--load_model", default="",
-                        type=str)  # full path, with .pth
+    parser.add_argument("--load_model", default="", type=str)  # full path, with .pth
     # wandb project name. if "" then don't use wandb
     parser.add_argument("--wandb", default="", type=str)
     parser.add_argument("--proj_dir", default="out", type=str)
@@ -49,8 +48,9 @@ if __name__ == "__main__":
     # 6e-4 for L12-D768, 4e-4 for L24-D1024, 3e-4 for L24-D2048
     parser.add_argument("--lr_init", default=6e-4, type=float)
     parser.add_argument("--lr_final", default=1e-5, type=float)
-    parser.add_argument("--warmup_steps", default=-1,
-                        type=int)  # try 10 if you load a model
+    parser.add_argument(
+        "--warmup_steps", default=-1, type=int
+    )  # try 10 if you load a model
     parser.add_argument("--beta1", default=0.9, type=float)
     parser.add_argument("--beta2", default=0.99, type=float)
     parser.add_argument("--adam_eps", default=1e-18, type=float)
@@ -60,8 +60,7 @@ if __name__ == "__main__":
     # reduce it to 0.7 / 0.5 / 0.3 / 0.2 for problematic samples
     parser.add_argument("--grad_clip", default=1.0, type=float)
 
-    parser.add_argument("--train_stage", default=0,
-                        type=int)  # my special pile mode
+    parser.add_argument("--train_stage", default=0, type=int)  # my special pile mode
     # deepspeed bucket size in MB. 200 seems enough
     parser.add_argument("--ds_bucket_mb", default=200, type=int)
 
@@ -69,8 +68,9 @@ if __name__ == "__main__":
     parser.add_argument("--head_size", default=64, type=int)
     parser.add_argument("--load_partial", default=0, type=int)
     parser.add_argument("--magic_prime", default=0, type=int)
-    parser.add_argument("--my_testing", default='x070', type=str)
+    parser.add_argument("--my_testing", default="x070", type=str)
     parser.add_argument("--my_exit_tokens", default=0, type=int)
+    parser.add_argument("--compile", default=1, type=int)
 
     parser = Trainer.add_argparse_args(parser)
     args = parser.parse_args()
@@ -78,29 +78,31 @@ if __name__ == "__main__":
     ########################################################################################################
 
     import datetime
-    import math
     import os
-    import sys
-    import time
     import warnings
 
     import numpy as np
     import torch
     from torch.utils.data import DataLoader
+
     if "deepspeed" in args.strategy:
         import deepspeed
     from pytorch_lightning import seed_everything
 
     if args.random_seed >= 0:
         print(
-            f"########## WARNING: GLOBAL SEED {args.random_seed} THIS WILL AFFECT MULTIGPU SAMPLING ##########\n" * 3)
+            f"########## WARNING: GLOBAL SEED {args.random_seed} THIS WILL AFFECT MULTIGPU SAMPLING ##########\n"
+            * 3
+        )
         seed_everything(args.random_seed)
 
     np.set_printoptions(precision=4, suppress=True, linewidth=200)
     warnings.filterwarnings(
-        "ignore", ".*Consider increasing the value of the `num_workers` argument*")
+        "ignore", ".*Consider increasing the value of the `num_workers` argument*"
+    )
     warnings.filterwarnings(
-        "ignore", ".*The progress bar already tracks a metric with the*")
+        "ignore", ".*The progress bar already tracks a metric with the*"
+    )
     # os.environ["WDS_SHOW_SEED"] = "1"
 
     args.my_timestamp = datetime.datetime.today().strftime("%Y-%m-%d-%H-%M-%S")
@@ -120,10 +122,11 @@ if __name__ == "__main__":
     if args.dim_att <= 0:
         args.dim_att = args.n_embd
     if args.dim_ffn <= 0:
-        args.dim_ffn = int((args.n_embd * 3.5) // 32 *
-                           32)  # default = 3.5x emb size
+        args.dim_ffn = int((args.n_embd * 3.5) // 32 * 32)  # default = 3.5x emb size
 
-    args.run_name = f"{args.vocab_size} ctx{args.ctx_len} L{args.n_layer} D{args.n_embd}"
+    args.run_name = (
+        f"{args.vocab_size} ctx{args.ctx_len} L{args.n_layer} D{args.n_embd}"
+    )
     if not os.path.exists(args.proj_dir):
         os.makedirs(args.proj_dir)
 
@@ -158,7 +161,7 @@ if __name__ == "__main__":
     tokens_per_epoch = samples_per_epoch * args.ctx_len
     try:
         deepspeed_version = deepspeed.__version__
-    except:
+    except ImportError:
         deepspeed_version = None
         pass
     rank_zero_info(
@@ -190,21 +193,31 @@ if __name__ == "__main__":
 
     if args.lr_final == 0 or args.lr_init == 0:
         rank_zero_info(
-            "\n\nNote: lr_final = 0 or lr_init = 0. Using linear LR schedule instead.\n\n")
+            "\n\nNote: lr_final = 0 or lr_init = 0. Using linear LR schedule instead.\n\n"
+        )
 
     assert args.precision in ["fp32", "tf32", "fp16", "bf16"]
     os.environ["RWKV_FLOAT_MODE"] = args.precision
     if args.precision == "fp32":
         for i in range(10):
             rank_zero_info(
-                "\n\nNote: you are using fp32 (very slow). Try bf16 / tf32 for faster training.\n\n")
+                "\n\nNote: you are using fp32 (very slow). Try bf16 / tf32 for faster training.\n\n"
+            )
     if args.precision == "fp16":
         rank_zero_info(
-            "\n\nNote: you are using fp16 (might overflow). Try bf16 / tf32 for stable training.\n\n")
+            "\n\nNote: you are using fp16 (might overflow). Try bf16 / tf32 for stable training.\n\n"
+        )
 
-    os.environ["RWKV_JIT_ON"] = "1"
+    if args.compile == 1:
+        os.environ["RWKV_COMPILE_ON"] = "1"
+    else:
+        os.environ["RWKV_COMPILE_ON"] = "0"
+
     if "deepspeed_stage_3" in args.strategy:
         os.environ["RWKV_JIT_ON"] = "0"  # somehow incompatible
+        os.environ["RWKV_COMPILE_ON"] = "0"  # somehow incompatible
+    else:
+        os.environ["RWKV_JIT_ON"] = "1"
 
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.enabled = True
@@ -231,9 +244,12 @@ if __name__ == "__main__":
     args.vocab_size = train_data.vocab_size
 
     from src.model import RWKV
+
     model = RWKV(args)
 
-    if len(args.load_model) == 0 or args.train_stage == 1:  # shall we build the initial weights?
+    if (
+        len(args.load_model) == 0 or args.train_stage == 1
+    ):  # shall we build the initial weights?
         init_weight_name = f"{args.proj_dir}/rwkv-init.pth"
         generate_init_weight(model, init_weight_name)  # save initial weights
         args.load_model = init_weight_name
@@ -243,10 +259,10 @@ if __name__ == "__main__":
         load_dict = torch.load(args.load_model, map_location="cpu")
         load_keys = list(load_dict.keys())
         for k in load_keys:
-            if k.startswith('_forward_module.'):
-                load_dict[k.replace('_forward_module.', '')] = load_dict[k]
+            if k.startswith("_forward_module."):
+                load_dict[k.replace("_forward_module.", "")] = load_dict[k]
                 del load_dict[k]
-    except:
+    except BaseException:
         rank_zero_info(f"Bad checkpoint {args.load_model}")
         if args.train_stage >= 2:  # try again using another checkpoint
             max_p = args.my_pile_prev_p
@@ -280,11 +296,22 @@ if __name__ == "__main__":
             print(f"{s0.ljust(5)} {s1.ljust(5)} {s2.ljust(5)} {s3.ljust(5)} {n}")
 
     if "deepspeed" in args.strategy:
-        trainer.strategy.config["zero_optimization"]["allgather_bucket_size"] = args.ds_bucket_mb * 1000 * 1000
-        trainer.strategy.config["zero_optimization"]["reduce_bucket_size"] = args.ds_bucket_mb * 1000 * 1000
+        trainer.strategy.config["zero_optimization"]["allgather_bucket_size"] = (
+            args.ds_bucket_mb * 1000 * 1000
+        )
+        trainer.strategy.config["zero_optimization"]["reduce_bucket_size"] = (
+            args.ds_bucket_mb * 1000 * 1000
+        )
 
     # must set shuffle=False, persistent_workers=False (because worker is in another thread)
-    data_loader = DataLoader(train_data, shuffle=False, pin_memory=True,
-                             batch_size=args.micro_bsz, num_workers=1, persistent_workers=False, drop_last=True)
+    data_loader = DataLoader(
+        train_data,
+        shuffle=False,
+        pin_memory=True,
+        batch_size=args.micro_bsz,
+        num_workers=1,
+        persistent_workers=False,
+        drop_last=True,
+    )
 
     trainer.fit(model, data_loader)

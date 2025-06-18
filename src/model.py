@@ -1,6 +1,6 @@
-########################################################################################################
+#################################################################
 # The RWKV Language Model - https://github.com/BlinkDL/RWKV-LM
-########################################################################################################
+#################################################################
 
 import gc
 import importlib
@@ -37,9 +37,9 @@ if os.environ["RWKV_COMPILE_ON"] == "1":
     CompileFunction = torch.compile
 
 
-########################################################################################################
+#################################################################
 # CUDA Kernel
-########################################################################################################
+#################################################################
 
 
 HEAD_SIZE = int(os.environ["RWKV_HEAD_SIZE"])
@@ -117,7 +117,7 @@ if "x070" in os.environ["RWKV_MY_TESTING"]:
         return WindBackstepping.apply(w, q, k, v, a, b).view(B, T, HC)
 
 
-########################################################################################################
+#################################################################
 
 
 class RWKV_Tmix_x070(nn.Module):
@@ -261,7 +261,7 @@ class RWKV_Tmix_x070(nn.Module):
         return x, v_first
 
 
-########################################################################################################
+#################################################################
 
 
 class RWKV_CMix_x070(nn.Module):
@@ -294,9 +294,9 @@ class RWKV_CMix_x070(nn.Module):
         return self.value(k)
 
 
-########################################################################################################
+#################################################################
 # The RWKV Model with our blocks
-########################################################################################################
+#################################################################
 
 
 class Block(nn.Module):
@@ -349,13 +349,11 @@ class RWKV(pl.LightningModule):
         self.args = args
         if not hasattr(args, "dim_att"):
             args.dim_att = args.n_embd
-        if not hasattr(args, "dim_ffn"):
-            if args.my_testing == "x070":
-                args.dim_ffn = int((args.n_embd * 4) // 32 *
-                            32)  # default = 4x emb size
-            else:
-                args.dim_ffn = int((args.n_embd * 3.5) // 32 *
-                            32)  # default = 3.5x emb size
+        # Set a sane default when the flag is missing *or* non-positive
+        if not hasattr(args, "dim_ffn") or args.dim_ffn <= 0:
+            # RWKV-7 uses 4x emb size, RWKV-6 uses 3.5x emb size
+            multiplier = 4 if args.my_testing == "x070" else 3.5
+            args.dim_ffn = int((args.n_embd * multiplier) // 32 * 32)  # multiple of 32
         assert args.n_embd % 32 == 0
         assert args.dim_att % 32 == 0
         assert args.dim_ffn % 32 == 0

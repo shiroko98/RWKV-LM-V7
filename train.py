@@ -122,12 +122,8 @@ if __name__ == "__main__":
     if args.dim_att <= 0:
         args.dim_att = args.n_embd
     if args.dim_ffn <= 0:
-        if args.my_testing == "x070":
-            args.dim_ffn = int((args.n_embd * 4) // 32 *
-                           32)  # default = 4x emb size
-        else:
-            args.dim_ffn = int((args.n_embd * 3.5) // 32 *
-                           32)  # default = 3.5x emb size
+        multiplier = 4 if args.my_testing == "x070" else 3.5
+        args.dim_ffn = int((args.n_embd * multiplier) // 32 * 32)  # multiple of 32
 
     args.run_name = (
         f"{args.vocab_size} ctx{args.ctx_len} L{args.n_layer} D{args.n_embd}"
@@ -170,28 +166,33 @@ if __name__ == "__main__":
         deepspeed_version = None
         pass
     rank_zero_info(
-        f"""
-############################################################################
-#
-# RWKV-7 {args.precision.upper()} on {args.num_nodes}x{args.devices} {args.accelerator.upper()}, bsz {args.num_nodes}x{args.devices}x{args.micro_bsz}={args.real_bsz}, {args.strategy} {'with grad_cp' if args.grad_cp > 0 else ''}
-#
-# Data = {args.data_file} ({args.data_type}), ProjDir = {args.proj_dir}
-#
-# Epoch = {args.epoch_begin} to {args.epoch_begin + args.epoch_count - 1} (will continue afterwards), save every {args.epoch_save} epoch
-#
-# Each "epoch" = {args.epoch_steps} steps, {samples_per_epoch} samples, {tokens_per_epoch} tokens
-#
-# Model = {args.n_layer} n_layer, {args.n_embd} n_embd, {args.ctx_len} ctx_len
-#
-# Adam = lr {args.lr_init} to {args.lr_final}, warmup {args.warmup_steps} steps, beta {args.betas}, eps {args.adam_eps}
-#
-# Found torch {torch.__version__}, recommend latest torch
-# Found deepspeed {deepspeed_version}, recommend latest deepspeed
-# Found pytorch_lightning {pl.__version__}, recommend 1.9.5
-#
-############################################################################
-"""
+        (
+            "############################################################################\n"
+            f"#\n"
+            f"# RWKV-7 {args.precision.upper()} on {args.num_nodes}x{args.devices} {args.accelerator.upper()}, "
+            f"bsz {args.num_nodes}x{args.devices}x{args.micro_bsz}={args.real_bsz}, "
+            f"{args.strategy} {'with grad_cp' if args.grad_cp > 0 else ''}\n"
+            f"#\n"
+            f"# Data = {args.data_file} ({args.data_type}), ProjDir = {args.proj_dir}\n"
+            f"#\n"
+            f"# Epoch = {args.epoch_begin} to {args.epoch_begin + args.epoch_count - 1} "
+            f"(will continue afterwards), save every {args.epoch_save} epoch\n"
+            f"#\n"
+            f'# Each "epoch" = {args.epoch_steps} steps, {samples_per_epoch} samples, {tokens_per_epoch} tokens\n'
+            f"#\n"
+            f"# Model = {args.n_layer} n_layer, {args.n_embd} n_embd, {args.ctx_len} ctx_len\n"
+            f"#\n"
+            f"# Adam = lr {args.lr_init} to {args.lr_final}, warmup {args.warmup_steps} steps, "
+            f"beta {args.betas}, eps {args.adam_eps}\n"
+            f"#\n"
+            f"# Found torch {torch.__version__}, recommend latest torch\n"
+            f"# Found deepspeed {deepspeed_version}, recommend latest deepspeed\n"
+            f"# Found pytorch_lightning {pl.__version__}, recommend 1.9.5\n"
+            f"#\n"
+            "############################################################################"
+        )
     )
+
     rank_zero_info(str(vars(args)) + "\n")
 
     assert args.data_type in ["binidx"]

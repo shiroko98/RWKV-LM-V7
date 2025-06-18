@@ -350,9 +350,12 @@ class RWKV(pl.LightningModule):
         if not hasattr(args, "dim_att"):
             args.dim_att = args.n_embd
         if not hasattr(args, "dim_ffn"):
-            args.dim_ffn = int(
-                (args.n_embd * 3.5) // 32 * 32
-            )  # default = 3.5x emb size
+            if args.my_testing == "x070":
+                args.dim_ffn = int((args.n_embd * 4) // 32 *
+                            32)  # default = 4x emb size
+            else:
+                args.dim_ffn = int((args.n_embd * 3.5) // 32 *
+                            32)  # default = 3.5x emb size
         assert args.n_embd % 32 == 0
         assert args.dim_att % 32 == 0
         assert args.dim_ffn % 32 == 0

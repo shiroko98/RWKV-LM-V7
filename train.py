@@ -122,7 +122,12 @@ if __name__ == "__main__":
     if args.dim_att <= 0:
         args.dim_att = args.n_embd
     if args.dim_ffn <= 0:
-        args.dim_ffn = int((args.n_embd * 3.5) // 32 * 32)  # default = 3.5x emb size
+        if args.my_testing == "x070":
+            args.dim_ffn = int((args.n_embd * 4) // 32 *
+                           32)  # default = 4x emb size
+        else:
+            args.dim_ffn = int((args.n_embd * 3.5) // 32 *
+                           32)  # default = 3.5x emb size
 
     args.run_name = (
         f"{args.vocab_size} ctx{args.ctx_len} L{args.n_layer} D{args.n_embd}"

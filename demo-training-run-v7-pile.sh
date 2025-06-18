@@ -1,5 +1,5 @@
 #!/bin/bash
-#######################################################################################################################
+################################################################################
 #
 # Run demo-training-prepare.sh with the same MODEL_TYPE & N_LAYER & N_EMBD first
 # Or, rename your base model to rwkv-init.pth and put it in the output folder
@@ -7,7 +7,7 @@
 # The trainer will load the last rwkv-*.pth in the folder, such that it can continue from a stopped run
 # Therefore check the log (### Loading rwkv-xxx.pth... ###), and make sure you don't have extra rwkv-*.pth there
 #
-#######################################################################################################################
+################################################################################
 #
 MODEL_TYPE="x070" # x070 => rwkv-7.0
 #
@@ -17,7 +17,7 @@ N_EMBD="768"
 CTX_LEN="4096" # !!! change magic_prime if you change ctx_len !!!
 PROJ_DIR="out/L"$N_LAYER"-D"$N_EMBD"-"$MODEL_TYPE # set output folder
 #
-#######################################################################################################################
+################################################################################
 #
 M_BSZ="30" # for 80G VRAM GPUs
 LR_INIT="8e-4"
@@ -30,7 +30,7 @@ ADAM_EPS="1e-18"
 GRAD_CP=1 # 1 => slower, save VRAM; 0 => faster, more VRAM
 EPOCH_SAVE=50 # save every 50 "miniepochs" (1 miniepoch = 40320 * ctx_len tokens) => decrease if your GPU is weak
 #
-#######################################################################################################################
+################################################################################
 #
 N_NODE=1 # number of nodes
 GPU_PER_NODE=8 # number of GPUs per node

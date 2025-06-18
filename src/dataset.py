@@ -1,14 +1,9 @@
-########################################################################################################
+#################################################################
 # The RWKV Language Model - https://github.com/BlinkDL/RWKV-LM
-########################################################################################################
+#################################################################
 
-import json
 import math
-import os
-import random
-import sys
 
-import numpy as np
 import torch
 from pytorch_lightning.utilities import rank_zero_info
 from torch.utils.data import Dataset

@@ -1,5 +1,5 @@
 #!/bin/bash
-#######################################################################################################################
+################################################################################
 #
 # Run demo-training-prepare.sh with the same MODEL_TYPE & N_LAYER & N_EMBD first
 # Or, rename your base model to rwkv-init.pth and put it in the output folder
@@ -7,7 +7,7 @@
 # The trainer will load the last rwkv-*.pth in the folder, such that it can continue from a stopped run
 # Therefore check the log (### Loading rwkv-xxx.pth... ###), and make sure you don't have extra rwkv-*.pth there
 #
-#######################################################################################################################
+################################################################################
 #
 MODEL_TYPE="x070" # x060 => rwkv-6.0
 #
@@ -17,7 +17,7 @@ N_EMBD="768"
 CTX_LEN="512" # !!! change magic_prime if you change ctx_len !!!
 PROJ_DIR="out/L"$N_LAYER"-D"$N_EMBD"-"$MODEL_TYPE # set output folder
 #
-#######################################################################################################################
+################################################################################
 #
 # Note bsz & lr affects model & training performance
 # Small data => use smaller bsz & slightly smaller LR
@@ -31,7 +31,7 @@ LR_FINAL="6e-5"
 GRAD_CP=1 # 1 => slower, save VRAM; 0 => faster, more VRAM
 EPOCH_SAVE=10 # save every 10 "miniepochs" (1 miniepoch = 40320 * ctx_len tokens) => decrease if your GPU is weak
 #
-#######################################################################################################################
+################################################################################
 #
 # magic_prime = the largest 3n+2 prime smaller than datalen/ctxlen-1 (= 1498226207/512-1 = 2926222.06 in this case) = 2926181 in this case
 # use https://www.dcode.fr/prime-numbers-search

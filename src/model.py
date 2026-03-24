@@ -469,24 +469,20 @@ class FusedLinearCrossEntropyWithL2Warp(torch.autograd.Function):
         # Cross entropy gradient: softmax - one_hot(target)
         grad_logits = softmax.clone()
         grad_logits.scatter_(-1, target.unsqueeze(-1), grad_logits.gather(-1, target.unsqueeze(-1)) - 1.0)
-        grad_logits = grad_logits * grad_output.item()
+        
+        factor = l2warp_factor / (B_T * V)
+        maxx, ids = torch.max(logits, -1, keepdim=True)
+        l2warp_grad = torch.zeros_like(logits)
+        l2warp_grad.scatter_(-1, ids, maxx * factor)
+        
+        total_grad_logits = grad_logits + l2warp_grad
+        total_grad_logits = total_grad_logits * grad_output.item()
         
         # Gradient w.r.t hidden_states: grad_logits @ weight
-        grad_hidden = torch.matmul(grad_logits, weight)
+        grad_hidden = torch.matmul(total_grad_logits, weight)
         
         # Gradient w.r.t weight: grad_logits.T @ hidden_states
-        grad_weight = torch.matmul(grad_logits.t(), hidden_states)
-        
-        # L2Warp gradient: encourage logits to be close to 0
-        # gy.scatter_(-1, ids, maxx * factor)
-        factor = l2warp_factor / B_T
-        maxx, ids = logits.max(dim=-1, keepdim=True)
-        l2warp_grad = torch.zeros_like(logits)
-        l2warp_grad.scatter_(-1, ids, maxx * factor * grad_output.item())
-        
-        # Add L2Warp gradient to hidden states gradient
-        grad_hidden = grad_hidden + torch.matmul(l2warp_grad, weight)
-        grad_weight = grad_weight + torch.matmul(l2warp_grad.t(), hidden_states)
+        grad_weight = torch.matmul(total_grad_logits.t(), hidden_states)
         
         # Return gradients
         # hidden_states, weight, target, l2warp_factor

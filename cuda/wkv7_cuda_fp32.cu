@@ -1,9 +1,9 @@
 #include <cuda_bf16.h>
 #include <assert.h>
 
-using bf = __nv_bfloat16;
-__device__ inline float to_float(const bf & u) { return __bfloat162float(u); }
-__device__ inline bf to_bf(const float & u) { return __float2bfloat16_rn(u); }
+using bf = float;
+__device__ inline float to_float(const bf & u) { return u; }
+__device__ inline bf to_bf(const float & u) { return u; }
 
 typedef bf * __restrict__ F_;
 
@@ -89,7 +89,7 @@ __global__ void backward_kernel(int T, int H, F_ w_, F_ q_, F_ k_, F_ v_, F_ a_,
         dq_[ind] = to_bf(dq);
 
         float iwi = 1.0f/wi;
-#pragma unroll
+#pragma unroll        
         for (int j = 0; j < C; j++) {
             stateT[j] = (stateT[j] - ki*v[j] - bi*sa[j]) * iwi;
             dstate[j] += dyi * q[j];
@@ -121,7 +121,7 @@ __global__ void backward_kernel(int T, int H, F_ w_, F_ q_, F_ k_, F_ v_, F_ a_,
         }
         da_[ind] = to_bf(da);
 
-#pragma unroll
+#pragma unroll        
         for (int j = 0; j < C; j++) {
             dstate[j] = dstate[j]*w[j] + dSb * a[j];
             dstateT[j] = dstateT[j]*wi + ai * dSb_shared[j];

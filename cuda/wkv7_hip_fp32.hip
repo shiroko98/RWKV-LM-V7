@@ -1,9 +1,10 @@
-#include <cuda_bf16.h>
+#include "hip/hip_runtime.h"
+#include <hip/hip_bf16.h>
 #include <assert.h>
 
-using bf = __nv_bfloat16;
-__device__ inline float to_float(const bf & u) { return __bfloat162float(u); }
-__device__ inline bf to_bf(const float & u) { return __float2bfloat16_rn(u); }
+using bf = float;
+__device__ inline float to_float(const bf & u) { return u; }
+__device__ inline bf to_bf(const float & u) { return u; }
 
 typedef bf * __restrict__ F_;
 
@@ -89,7 +90,7 @@ __global__ void backward_kernel(int T, int H, F_ w_, F_ q_, F_ k_, F_ v_, F_ a_,
         dq_[ind] = to_bf(dq);
 
         float iwi = 1.0f/wi;
-#pragma unroll
+#pragma unroll        
         for (int j = 0; j < C; j++) {
             stateT[j] = (stateT[j] - ki*v[j] - bi*sa[j]) * iwi;
             dstate[j] += dyi * q[j];
@@ -121,7 +122,7 @@ __global__ void backward_kernel(int T, int H, F_ w_, F_ q_, F_ k_, F_ v_, F_ a_,
         }
         da_[ind] = to_bf(da);
 
-#pragma unroll
+#pragma unroll        
         for (int j = 0; j < C; j++) {
             dstate[j] = dstate[j]*w[j] + dSb * a[j];
             dstateT[j] = dstateT[j]*wi + ai * dSb_shared[j];
@@ -130,9 +131,9 @@ __global__ void backward_kernel(int T, int H, F_ w_, F_ q_, F_ k_, F_ v_, F_ a_,
 }
 
 void cuda_forward(int B, int T, int H, bf*w, bf*q, bf*k, bf*v, bf*z, bf*a, bf*y, float*s, float*sa) {
-    forward_kernel<<<dim3(H,B), dim3(_C_)>>>(T,H,w,q,k,v,z,a,y,s,sa);
+   hipLaunchKernelGGL(( forward_kernel), dim3(dim3(H,B)), dim3(dim3(_C_)), 0, 0, T,H,w,q,k,v,z,a,y,s,sa);
 }
 void cuda_backward(int B, int T, int H, bf*w, bf*q, bf*k, bf*v, bf*z, bf*a, bf*dy, float*s, float*sa, bf*dw, bf*dq, bf*dk, bf*dv, bf*dz, bf*da) {
     assert(T%_CHUNK_LEN_ == 0);
-    backward_kernel<<<dim3(H,B), dim3(_C_)>>>(T,H,w,q,k,v,z,a,dy,s,sa,dw,dq,dk,dv,dz,da);
+   hipLaunchKernelGGL(( backward_kernel), dim3(dim3(H,B)), dim3(dim3(_C_)), 0, 0, T,H,w,q,k,v,z,a,dy,s,sa,dw,dq,dk,dv,dz,da);
 }

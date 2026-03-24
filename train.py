@@ -72,7 +72,13 @@ if __name__ == "__main__":
     parser.add_argument("--my_exit_tokens", default=0, type=int)
     parser.add_argument("--compile", default=1, type=int)
 
-    parser = Trainer.add_argparse_args(parser)
+    parser.add_argument("--strategy", default="deepspeed_stage_2", type=str)
+    parser.add_argument("--precision", default="bf16-mixed", type=str)
+    parser.add_argument("--num_nodes", default=1, type=int)
+    parser.add_argument("--accelerator", default="cpu", type=str)
+    parser.add_argument("--devices", default=1, type=int)
+    parser.add_argument("--enable_progress_bar", default=True, type=bool)
+
     args = parser.parse_args()
 
     ########################################################################################################
@@ -131,9 +137,11 @@ if __name__ == "__main__":
     if not os.path.exists(args.proj_dir):
         os.makedirs(args.proj_dir)
 
+    # fucking pytorch_lightning 2.6 epoch_steps !!! #
     args.epoch_count = args.magic_prime // 40320
-    args.epoch_steps = 40320 // args.real_bsz
-    assert args.epoch_steps * args.real_bsz == 40320
+    args.epoch_steps = 40320 // args.real_bsz * args.devices 
+    assert args.epoch_steps * args.real_bsz  == 40320 * args.devices 
+    # fucking pytorch_lightning 2.6 epoch_steps !!! #
 
     if args.train_stage >= 2:  # find latest saved model
         list_p = []
@@ -158,7 +166,8 @@ if __name__ == "__main__":
                 args.warmup_steps = 10
         args.epoch_begin = max_p + 1
 
-    samples_per_epoch = args.epoch_steps * args.real_bsz
+    epoch_steps = args.epoch_steps // args.devices
+    samples_per_epoch = epoch_steps * args.real_bsz
     tokens_per_epoch = samples_per_epoch * args.ctx_len
     try:
         deepspeed_version = deepspeed.__version__
@@ -178,7 +187,7 @@ if __name__ == "__main__":
             f"# Epoch = {args.epoch_begin} to {args.epoch_begin + args.epoch_count - 1} "
             f"(will continue afterwards), save every {args.epoch_save} epoch\n"
             f"#\n"
-            f'# Each "epoch" = {args.epoch_steps} steps, {samples_per_epoch} samples, {tokens_per_epoch} tokens\n'
+            f'# Each "epoch" = {epoch_steps} steps, {samples_per_epoch} samples, {tokens_per_epoch} tokens\n'
             f"#\n"
             f"# Model = {args.n_layer} n_layer, {args.n_embd} n_embd, {args.ctx_len} ctx_len\n"
             f"#\n"
@@ -287,9 +296,22 @@ if __name__ == "__main__":
                 load_dict[k] = model.state_dict()[k]
     model.load_state_dict(load_dict)
 
-    trainer = Trainer.from_argparse_args(
-        args,
+    trainer = Trainer(
+        accelerator=args.accelerator,
+        strategy=args.strategy,
+        devices=args.devices,
+        num_nodes=args.num_nodes,
+        precision=args.precision,
+        enable_checkpointing=args.enable_checkpointing,
+        logger=args.logger,
+        gradient_clip_val=args.gradient_clip_val,
+        num_sanity_val_steps=args.num_sanity_val_steps,
+        check_val_every_n_epoch=args.check_val_every_n_epoch,
+        log_every_n_steps=args.log_every_n_steps,
+        max_epochs=args.max_epochs,
+        enable_progress_bar=args.enable_progress_bar,
         callbacks=[train_callback(args)],
+        limit_train_batches=args.epoch_steps,
     )
 
     if trainer.global_rank == 0:

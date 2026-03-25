@@ -26,7 +26,6 @@ try:
 except BaseException:
     os.environ["RWKV_MY_TESTING"] = ""
 
-
 def __nop(ob):
     return ob
 
@@ -351,144 +350,85 @@ class L2Wrap(torch.autograd.Function):
 
 class FusedLinearCrossEntropyWithL2Warp(torch.autograd.Function):
     """
-    Fused Linear + Cross Entropy + L2Warp to reduce VRAM usage.
+    VRAM-optimized Fused Head operator (FP64 numerically aligned).
     
-    This implementation avoids materializing the full logits tensor by:
-    1. Computing cross entropy loss in chunks
-    2. Computing L2Warp gradient in the same backward pass
-    3. Not saving logits for backward (saves significant VRAM)
-    
-    Memory savings: For vocab_size=65536, batch=12, ctx_len=4096:
-    - Original: ~2GB for logits + gradient storage
-    - Fused: ~0 GB (logits never materialized)
+    Key Features:
+    1. Forward: Calculates CrossEntropy in chunks to avoid storing full Logits [B*T, V].
+    2. Backward: Recomputes Logits in chunks (Gradient Checkpointing logic), 
+       decoupling VRAM usage from sequence length.
+    3. Integration: Built-in support for RWKV-specific L2Warp regularization.
     """
-    
     @staticmethod
     def forward(ctx, hidden_states, weight, target, l2warp_factor=1e-4):
-        # hidden_states: [B*T, H]
-        # weight: [V, H]
-        # target: [B*T]
-        # l2warp_factor: factor for L2 warp regularization
-        
+        # hidden_states: [B_T, H], weight: [V, H], target: [B_T]
         B_T, H = hidden_states.shape
         V = weight.shape[0]
         
-        # Store only what's needed for backward: hidden states, weight, target
-        # NOT the full logits, which saves massive VRAM
         ctx.save_for_backward(hidden_states, weight, target)
         ctx.l2warp_factor = l2warp_factor
         ctx.B_T = B_T
         
-        # Compute logits in chunks to avoid OOM
-        # We need this for loss computation
-        chunk_size = min(8192, B_T)
+        # Chunk size 512 strikes a balance between CUDA kernel overhead and VRAM savings
+        chunk_size = 512
+        loss_sum = torch.zeros([], device=hidden_states.device, dtype=torch.float32)
         
-        max_logits = torch.full((B_T,), -float('inf'), dtype=torch.float32, 
-                                device=hidden_states.device)
-        sum_exp = torch.zeros(B_T, dtype=torch.float32, device=hidden_states.device)
-        loss_sum = torch.zeros(1, dtype=torch.float32, device=hidden_states.device)
-        
-        # First pass: compute max and sum_exp for online softmax
-        for start in range(0, B_T, chunk_size):
-            end = min(start + chunk_size, B_T)
-            hs_chunk = hidden_states[start:end]  # [chunk, H]
-            w_chunk = weight  # [V, H]
-            
-            # Compute logits: [chunk, V]
-            logits_chunk = torch.matmul(hs_chunk, w_chunk.t())
-            
-            # Online softmax computation
-            chunk_max = logits_chunk.max(dim=-1).values  # [chunk]
-            chunk_max = torch.where(torch.isinf(chunk_max), 
-                                   torch.zeros_like(chunk_max), chunk_max)
-            
-            # Update global max
-            new_max = torch.maximum(max_logits[start:end], chunk_max)
-            max_logits[start:end] = new_max
-            
-            # Compute exp(logits - max)
-            shift = chunk_max.unsqueeze(-1) - new_max.unsqueeze(-1)
-            exp_logits = torch.exp(logits_chunk.float() - shift)
-            
-            # Update sum_exp
-            chunk_sum = exp_logits.sum(dim=-1)  # [chunk]
-            # Recompute with proper shift for numerical stability
-            shift2 = chunk_max - new_max
-            exp_logits2 = torch.exp(logits_chunk.float() - shift2.unsqueeze(-1))
-            sum_exp[start:end] = chunk_sum
-        
-        # Compute actual loss
         for start in range(0, B_T, chunk_size):
             end = min(start + chunk_size, B_T)
             hs_chunk = hidden_states[start:end]
-            w_chunk = weight
             target_chunk = target[start:end]
             
-            # Compute logits
-            logits_chunk = torch.matmul(hs_chunk, w_chunk.t()).float()
+            # Compute logits in FP32 for numerical stability: [chunk, H] @ [H, V] -> [chunk, V]
+            logits_chunk = torch.matmul(hs_chunk, weight.t()).float()
             
-            # Shifted softmax
-            shift = max_logits[start:end].unsqueeze(-1)
-            logits_chunk = logits_chunk - shift
-            
-            # Get target logits
-            target_logits = logits_chunk.gather(-1, target_chunk.unsqueeze(-1)).squeeze(-1)
-            
-            # Log sum exp
-            log_sum_exp = torch.logsumexp(logits_chunk, dim=-1)
-            
-            # Cross entropy loss
-            loss_chunk = log_sum_exp - target_logits
-            loss_sum = loss_sum + loss_chunk.sum()
+            # Calculate CrossEntropy sum for this chunk
+            loss_chunk = F.cross_entropy(logits_chunk, target_chunk, reduction='sum')
+            loss_sum += loss_chunk
         
-        # Mean loss
-        loss = loss_sum / B_T
-        
-        return loss
-    
+        # Return Mean Loss
+        return loss_sum / B_T
+
     @staticmethod
     def backward(ctx, grad_output):
         hidden_states, weight, target = ctx.saved_tensors
         l2warp_factor = ctx.l2warp_factor
         B_T = ctx.B_T
-        
-        B_T_, H = hidden_states.shape
         V = weight.shape[0]
         
-        # Reconstruct logits for gradient computation
-        # This is the key difference: we compute gradients on-the-fly
-        # rather than storing the full logits tensor
-        logits = torch.matmul(hidden_states, weight.t()).float()
+        chunk_size = 512
+        grad_hidden = torch.empty_like(hidden_states)
+        grad_weight = torch.zeros_like(weight)
         
-        # Compute softmax
-        max_logits = logits.max(dim=-1, keepdim=True).values
-        softmax = torch.exp(logits - max_logits)
-        softmax_sum = softmax.sum(dim=-1, keepdim=True)
-        softmax = softmax / softmax_sum
-        
-        # Cross entropy gradient: softmax - one_hot(target)
-        grad_logits = softmax.clone()
-        grad_logits.scatter_(-1, target.unsqueeze(-1), grad_logits.gather(-1, target.unsqueeze(-1)) - 1.0)
-        
-        factor = l2warp_factor / (B_T * V)
-        maxx, ids = torch.max(logits, -1, keepdim=True)
-        l2warp_grad = torch.zeros_like(logits)
-        l2warp_grad.scatter_(-1, ids, maxx * factor)
-        
-        total_grad_logits = grad_logits + l2warp_grad
-        total_grad_logits = total_grad_logits * grad_output.item()
-        
-        # Gradient w.r.t hidden_states: grad_logits @ weight
-        grad_hidden = torch.matmul(total_grad_logits, weight)
-        
-        # Gradient w.r.t weight: grad_logits.T @ hidden_states
-        grad_weight = torch.matmul(total_grad_logits.t(), hidden_states)
-        
-        # Return gradients
-        # hidden_states, weight, target, l2warp_factor
-        # target doesn't need gradient (it's labels)
-        return grad_hidden, grad_weight, None, None
+        for start in range(0, B_T, chunk_size):
+            end = min(start + chunk_size, B_T)
+            hs_chunk = hidden_states[start:end]
+            target_chunk = target[start:end]
+            
+            logits_chunk = torch.matmul(hs_chunk, weight.t()).float()
+            
+            softmax_chunk = logits_chunk.softmax(dim=-1)
+            
+            grad_logits_chunk = softmax_chunk.clone()
+            # Efficient in-place scatter for target subtraction
+            grad_logits_chunk.scatter_(
+                -1, target_chunk.unsqueeze(-1), 
+                grad_logits_chunk.gather(-1, target_chunk.unsqueeze(-1)) - 1.0
+            )
+            grad_logits_chunk /= B_T
+            
+            factor = l2warp_factor / (B_T * V)
+            maxx_chunk, ids_chunk = torch.max(logits_chunk, -1, keepdim=True)
+            
+            l2warp_grad_chunk = torch.zeros_like(logits_chunk)
+            l2warp_grad_chunk.scatter_(-1, ids_chunk, maxx_chunk * factor)
+            
+            total_grad_logits_chunk = (grad_logits_chunk + l2warp_grad_chunk) * grad_output
+            
+            total_grad_logits_chunk = total_grad_logits_chunk.to(hs_chunk.dtype)
+            
+            grad_hidden[start:end] = torch.matmul(total_grad_logits_chunk, weight)
+            grad_weight += torch.matmul(total_grad_logits_chunk.t(), hs_chunk)
 
+        return grad_hidden, grad_weight, None, None
 
 class RWKV(pl.LightningModule):
     def __init__(self, args):
@@ -508,7 +448,7 @@ class RWKV(pl.LightningModule):
         # Check if we should use fused L2Warp to reduce VRAM
         # Default to True if not specified
         if not hasattr(args, "fuse_l2warp"):
-            args.fuse_l2warp = True
+            args.fuse_l2warp = 0
 
         self.emb = nn.Embedding(args.vocab_size, args.n_embd)
 

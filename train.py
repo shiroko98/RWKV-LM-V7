@@ -7,6 +7,7 @@ logging.basicConfig(level=logging.INFO)
 
 if __name__ == "__main__":
     from argparse import ArgumentParser
+    from datetime import timedelta
     from pytorch_lightning import Trainer
     from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
     import pytorch_lightning as pl
@@ -48,9 +49,14 @@ if __name__ == "__main__":
 
     parser.add_argument("--train_stage", default=0, type=int)  # my special pile mode
     parser.add_argument("--ds_bucket_mb", default=200, type=int)  # deepspeed bucket size in MB. 200 seems enough
+    parser.add_argument("--dist_timeout_sec", default=1800, type=int)
 
     parser.add_argument("--head_size", default=64, type=int) # can try larger values for larger models
     parser.add_argument("--head_chunk", default=0, type=int) # 0 = fast, takes more VRAM; 65536 = saves 70% VRAM (when your bsz is large), slower; 4096 = saves 80% VRAM (when your bsz is large), slower
+    parser.add_argument("--d_decay_lora", default=0, type=int)
+    parser.add_argument("--d_aaa_lora", default=0, type=int)
+    parser.add_argument("--d_mv_lora", default=0, type=int)
+    parser.add_argument("--d_gate_lora", default=0, type=int)
     parser.add_argument("--load_partial", default=0, type=int)
     parser.add_argument("--magic_prime", default=0, type=int)
     parser.add_argument("--my_testing", default='x070', type=str)
@@ -239,9 +245,32 @@ if __name__ == "__main__":
                 load_dict[k] = model.state_dict()[k]
     model.load_state_dict(load_dict)
 
+    trainer_strategy = args.strategy
+    if args.strategy == "deepspeed_stage_2":
+        from pytorch_lightning.strategies import DeepSpeedStrategy
+        trainer_strategy = DeepSpeedStrategy(
+            stage=2,
+            timeout=timedelta(seconds=args.dist_timeout_sec),
+        )
+    elif args.strategy == "deepspeed_stage_3":
+        from pytorch_lightning.strategies import DeepSpeedStrategy
+        trainer_strategy = DeepSpeedStrategy(
+            stage=3,
+            timeout=timedelta(seconds=args.dist_timeout_sec),
+        )
+    elif args.strategy == "deepspeed_stage_3_offload":
+        from pytorch_lightning.strategies import DeepSpeedStrategy
+        trainer_strategy = DeepSpeedStrategy(
+            stage=3,
+            offload_optimizer=True,
+            offload_parameters=True,
+            timeout=timedelta(seconds=args.dist_timeout_sec),
+        )
+
     trainer = Trainer.from_argparse_args(
         args,
         callbacks=[train_callback(args)],
+        strategy=trainer_strategy,
     )
 
     if trainer.global_rank == 0:

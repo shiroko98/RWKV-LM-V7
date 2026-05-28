@@ -10,7 +10,6 @@ if __name__ == "__main__":
     import subprocess
     import sys
     from argparse import ArgumentParser
-    from datetime import timedelta
     from pytorch_lightning import Trainer
     from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
     import pytorch_lightning as pl
@@ -105,6 +104,7 @@ if __name__ == "__main__":
     import warnings, math, datetime, time
     import numpy as np
     import torch
+    import torch.distributed as dist
     from torch.utils.data import DataLoader
     if "deepspeed" in args.strategy:
         import deepspeed
@@ -130,6 +130,7 @@ if __name__ == "__main__":
     args.max_epochs = -1  # continue forever
     args.betas = (args.beta1, args.beta2)
     args.real_bsz = int(args.num_nodes) * int(args.devices) * args.micro_bsz
+    os.environ["DEEPSPEED_TIMEOUT"] = str(args.dist_timeout_sec)
     os.environ["RWKV_MY_TESTING"] = args.my_testing
     os.environ["RWKV_KERNEL"] = args.kernel
     os.environ["RWKV_CTXLEN"] = str(args.ctx_len)
@@ -236,6 +237,19 @@ if __name__ == "__main__":
     else:
         args.precision = "bf16"
 
+    if "deepspeed" in args.strategy and dist.is_available() and not dist.is_initialized():
+        local_rank = os.environ.get("LOCAL_RANK")
+        world_size = os.environ.get("WORLD_SIZE")
+        rank = os.environ.get("RANK")
+        if local_rank is not None and world_size is not None and rank is not None:
+            backend = "nccl" if args.accelerator == "gpu" else "gloo"
+            if backend == "nccl":
+                torch.cuda.set_device(int(local_rank))
+            dist.init_process_group(
+                backend=backend,
+                init_method="env://",
+            )
+
     ########################################################################################################
 
     from src.trainer import train_callback, generate_init_weight
@@ -279,32 +293,9 @@ if __name__ == "__main__":
                 load_dict[k] = model.state_dict()[k]
     model.load_state_dict(load_dict)
 
-    trainer_strategy = args.strategy
-    if args.strategy == "deepspeed_stage_2":
-        from pytorch_lightning.strategies import DeepSpeedStrategy
-        trainer_strategy = DeepSpeedStrategy(
-            stage=2,
-            timeout=timedelta(seconds=args.dist_timeout_sec),
-        )
-    elif args.strategy == "deepspeed_stage_3":
-        from pytorch_lightning.strategies import DeepSpeedStrategy
-        trainer_strategy = DeepSpeedStrategy(
-            stage=3,
-            timeout=timedelta(seconds=args.dist_timeout_sec),
-        )
-    elif args.strategy == "deepspeed_stage_3_offload":
-        from pytorch_lightning.strategies import DeepSpeedStrategy
-        trainer_strategy = DeepSpeedStrategy(
-            stage=3,
-            offload_optimizer=True,
-            offload_parameters=True,
-            timeout=timedelta(seconds=args.dist_timeout_sec),
-        )
-
     trainer = Trainer.from_argparse_args(
         args,
         callbacks=[train_callback(args)],
-        strategy=trainer_strategy,
     )
 
     if trainer.global_rank == 0:

@@ -6,6 +6,9 @@ import logging
 logging.basicConfig(level=logging.INFO)
 
 if __name__ == "__main__":
+    import os
+    import subprocess
+    import sys
     from argparse import ArgumentParser
     from datetime import timedelta
     from pytorch_lightning import Trainer
@@ -50,6 +53,7 @@ if __name__ == "__main__":
     parser.add_argument("--train_stage", default=0, type=int)  # my special pile mode
     parser.add_argument("--ds_bucket_mb", default=200, type=int)  # deepspeed bucket size in MB. 200 seems enough
     parser.add_argument("--dist_timeout_sec", default=1800, type=int)
+    parser.add_argument("--master_port", default=29501, type=int)
 
     parser.add_argument("--head_size", default=64, type=int) # can try larger values for larger models
     parser.add_argument("--head_chunk", default=0, type=int) # 0 = fast, takes more VRAM; 65536 = saves 70% VRAM (when your bsz is large), slower; 4096 = saves 80% VRAM (when your bsz is large), slower
@@ -66,9 +70,39 @@ if __name__ == "__main__":
     parser = Trainer.add_argparse_args(parser)
     args = parser.parse_args()
 
+    def _should_auto_torchrun(parsed_args) -> bool:
+        if "deepspeed" not in str(parsed_args.strategy):
+            return False
+        if int(parsed_args.num_nodes) != 1:
+            return False
+        if int(parsed_args.devices) <= 1:
+            return False
+        if os.environ.get("LOCAL_RANK") is not None:
+            return False
+        if os.environ.get("WORLD_SIZE") is not None:
+            return False
+        return True
+
+    if _should_auto_torchrun(args):
+        cmd = [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc_per_node",
+            str(args.devices),
+            "--master_port",
+            str(args.master_port),
+            os.path.abspath(__file__),
+            *sys.argv[1:],
+        ]
+        print(f"########## Re-launching with torchrun: {' '.join(cmd)} ##########")
+        result = subprocess.run(cmd)
+        sys.exit(result.returncode)
+
     ########################################################################################################
 
-    import os, warnings, math, datetime, sys, time
+    import warnings, math, datetime, time
     import numpy as np
     import torch
     from torch.utils.data import DataLoader

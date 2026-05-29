@@ -185,8 +185,8 @@ if os.environ.get("RWKV_JIT_ON") == "1":
     def tmix_mix6_bf16_v5(x, x_r, x_w, x_k, x_v, x_a, x_g):
         return _tmix_mix6_bf16_v5_jit(x, x_r, x_w, x_k, x_v, x_a, x_g)
 else:
-    def tmix_mix6_bf16_v5(x, x_r, x_w, x_k, x_v, x_a, x_g):
-        return tuple(_forward_op(x, x_r, x_w, x_k, x_v, x_a, x_g))
+    def tmix_mix6_bf16_v5(x, x_r, x_w, x_k, x_v, x_a, x_g, _op=_forward_op):
+        return tuple(_op(x, x_r, x_w, x_k, x_v, x_a, x_g))
 
 ########################################################################################################
 if ROCm_flag:
@@ -259,8 +259,8 @@ if os.environ.get("RWKV_JIT_ON") == "1":
     def tmix_kk_pre_bf16_v5(k, k_k, a, k_a):
         return _tmix_kk_pre_bf16_v5_jit(k, k_k, a, k_a)
 else:
-    def tmix_kk_pre_bf16_v5(k, k_k, a, k_a):
-        return tuple(_forward_op(k, k_k, a, k_a))
+    def tmix_kk_pre_bf16_v5(k, k_k, a, k_a, _op=_forward_op):
+        return tuple(_op(k, k_k, a, k_a))
 
 ########################################################################################################
 if ROCm_flag:
@@ -341,8 +341,8 @@ if os.environ.get("RWKV_JIT_ON") == "1":
     def tmix_lnx_rkvres_xg_bf16_v1(x, r, k, v, r_k, weight, bias, g):
         return _tmix_lnx_rkvres_xg_bf16_v1_jit(x, r, k, v, r_k, weight, bias, g)
 else:
-    def tmix_lnx_rkvres_xg_bf16_v1(x, r, k, v, r_k, weight, bias, g):
-        return _forward_op(x, r, k, v, r_k, weight, bias, g)
+    def tmix_lnx_rkvres_xg_bf16_v1(x, r, k, v, r_k, weight, bias, g, _op=_forward_op):
+        return _op(x, r, k, v, r_k, weight, bias, g)
 
 ########################################################################################################
 if ROCm_flag:
@@ -393,8 +393,8 @@ if os.environ.get("RWKV_JIT_ON") == "1":
     def tmix_a_gate_bf16(a0, a12):
         return _tmix_a_gate_bf16_jit(a0, a12)
 else:
-    def tmix_a_gate_bf16(a0, a12):
-        return _forward_op(a0, a12)
+    def tmix_a_gate_bf16(a0, a12, _op=_forward_op):
+        return _op(a0, a12)
 
 ########################################################################################################
 if ROCm_flag:
@@ -455,8 +455,8 @@ if os.environ.get("RWKV_JIT_ON") == "1":
     def tmix_vres_gate_bf16_v1(v, v_first, v0, v12):
         return _tmix_vres_gate_bf16_v1_jit(v, v_first, v0, v12)
 else:
-    def tmix_vres_gate_bf16_v1(v, v_first, v0, v12):
-        return _forward_op(v, v_first, v0, v12)
+    def tmix_vres_gate_bf16_v1(v, v_first, v0, v12, _op=_forward_op):
+        return _op(v, v_first, v0, v12)
 
 ########################################################################################################
 if ROCm_flag:

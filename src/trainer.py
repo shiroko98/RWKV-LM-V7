@@ -1,8 +1,10 @@
-import os, math, time, datetime, subprocess
+import os, math, time, datetime, subprocess, re
 import torch
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
+
+NUMBERED_CKPT_PATTERN = re.compile(r"^rwkv(?:-step)?-(\d+)\.pth$")
 
 def my_save(args, trainer, dd, ff):
     if 'deepspeed_stage_3' in args.strategy:
@@ -10,10 +12,61 @@ def my_save(args, trainer, dd, ff):
     else:
         torch.save(dd, ff)
 
+
+def build_save_dict(args, pl_module):
+    if args.data_type == 'wds_img':
+        raw_dict = pl_module.state_dict()
+        save_dict = {}
+        for k in raw_dict:
+            if k.startswith('encoder.') or k.startswith('decoder.'):
+                save_dict[k] = raw_dict[k]
+        return save_dict
+    return pl_module.state_dict()
+
+
+def prune_old_checkpoints(args):
+    keep_last_n = getattr(args, "keep_last_n_checkpoints", 0)
+    if keep_last_n <= 0:
+        return
+
+    checkpoint_files = []
+    try:
+        for entry in os.scandir(args.proj_dir):
+            if not entry.is_file():
+                continue
+            if not NUMBERED_CKPT_PATTERN.match(entry.name):
+                continue
+            stat = entry.stat()
+            checkpoint_files.append((stat.st_mtime_ns, entry.name, entry.path))
+    except FileNotFoundError:
+        return
+
+    if len(checkpoint_files) <= keep_last_n:
+        return
+
+    checkpoint_files.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    for _, _, path in checkpoint_files[keep_last_n:]:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            print(f"Warning: failed to remove old checkpoint {path}: {e}")
+
+
+def save_train_checkpoint(args, trainer, pl_module, file_name):
+    my_save(
+        args, trainer,
+        build_save_dict(args, pl_module),
+        file_name,
+    )
+    prune_old_checkpoints(args)
+
 class train_callback(pl.Callback):
     def __init__(self, args):
         super().__init__()
         self.args = args
+        self._saved_step_markers = set()
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         args = self.args
@@ -110,12 +163,19 @@ class train_callback(pl.Callback):
         if (trainer.is_global_zero) or ('deepspeed_stage_3' in args.strategy): # save pth
             if args.magic_prime > 0:
                 if int(real_step) == int(args.magic_prime // args.real_bsz) - 1:
-                    to_save_dict = pl_module.state_dict()
-                    my_save(
-                        args, trainer,
-                        to_save_dict,
-                        f"{args.proj_dir}/rwkv-final.pth",
-                    )
+                    save_train_checkpoint(args, trainer, pl_module, f"{args.proj_dir}/rwkv-final.pth")
+
+            if args.save_every_n_steps > 0 and real_step > 0 and int(real_step) % args.save_every_n_steps == 0:
+                step_marker = ("every", int(real_step))
+                if step_marker not in self._saved_step_markers:
+                    save_train_checkpoint(args, trainer, pl_module, f"{args.proj_dir}/rwkv-step-{int(real_step)}.pth")
+                    self._saved_step_markers.add(step_marker)
+
+            if args.save_at_step > 0 and int(real_step) == int(args.save_at_step):
+                step_marker = ("exact", int(real_step))
+                if step_marker not in self._saved_step_markers:
+                    save_train_checkpoint(args, trainer, pl_module, f"{args.proj_dir}/rwkv-step-{int(real_step)}.pth")
+                    self._saved_step_markers.add(step_marker)
                 
 
     def on_train_epoch_start(self, trainer, pl_module):
@@ -129,22 +189,10 @@ class train_callback(pl.Callback):
 
     def on_train_epoch_end(self, trainer, pl_module):
         args = self.args
-        to_save_dict = {}
         if (trainer.is_global_zero) or ('deepspeed_stage_3' in args.strategy):  # save pth
             if (args.epoch_save > 0 and trainer.current_epoch % args.epoch_save == 0) or (trainer.current_epoch == args.epoch_count - 1):
-                if args.data_type == 'wds_img':
-                    raw_dict = pl_module.state_dict()
-                    for k in raw_dict:
-                        if k.startswith('encoder.') or k.startswith('decoder.'):
-                            to_save_dict[k] = raw_dict[k]
-                else:
-                    to_save_dict = pl_module.state_dict()
                 try:
-                    my_save(
-                        args, trainer,
-                        to_save_dict,
-                        f"{args.proj_dir}/rwkv-{args.epoch_begin + trainer.current_epoch}.pth",
-                    )
+                    save_train_checkpoint(args, trainer, pl_module, f"{args.proj_dir}/rwkv-{args.epoch_begin + trainer.current_epoch}.pth")
                 except Exception as e:
                     print('Error\n\n', e, '\n\n')
 

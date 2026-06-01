@@ -32,6 +32,9 @@ if __name__ == "__main__":
     parser.add_argument("--epoch_count", default=500, type=int)  # train for this many "epochs". will continue afterwards with lr = lr_final
     parser.add_argument("--epoch_begin", default=0, type=int)  # if you load a model trained for x "epochs", set epoch_begin = x
     parser.add_argument("--epoch_save", default=5, type=int)  # save the model every [epoch_save] "epochs"
+    parser.add_argument("--save_every_n_steps", default=0, type=int)  # save every N real steps (0 to disable)
+    parser.add_argument("--save_at_step", default=0, type=int)  # save once at this real step (0 to disable)
+    parser.add_argument("--keep_last_n_checkpoints", default=0, type=int)  # keep only the most recent N numbered checkpoints (0 to disable)
 
     parser.add_argument("--micro_bsz", default=12, type=int)  # micro batch size (batch size per GPU)
     parser.add_argument("--n_layer", default=6, type=int)

@@ -6,6 +6,8 @@ data/*
 !data/tokenizer/
 !data/tokenizer/**
 out/*
+outs/
+.torch_extensions/
 *.bin
 *.idx
 *.pyc

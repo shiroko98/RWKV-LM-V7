@@ -209,6 +209,12 @@ class train_callback(pl.Callback):
         dataset.global_rank = trainer.global_rank
         dataset.real_epoch = int(args.epoch_begin + trainer.current_epoch)
         dataset.world_size = trainer.world_size
+        dataset.step_offset = int(trainer.global_step % args.epoch_steps)
+        if trainer.is_global_zero and dataset.step_offset > 0:
+            rank_zero_info(
+                f"########## Resuming dataloader at step offset {dataset.step_offset}/{args.epoch_steps} "
+                f"for epoch {dataset.real_epoch} ##########"
+            )
         # print(f'########## world_size {dataset.world_size} global_rank {dataset.global_rank} real_epoch {dataset.real_epoch} ##########')
 
     def on_train_epoch_end(self, trainer, pl_module):

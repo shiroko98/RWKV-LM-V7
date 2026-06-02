@@ -38,6 +38,7 @@ class MyDataset(Dataset):
         assert self.samples_per_epoch == 40320
         rank_zero_info(f"########## train stage {args.train_stage} ##########")
         dataset_slot = self.data_size // args.ctx_len
+        self.step_offset = 0
 
         assert is_prime(args.magic_prime)
         assert args.magic_prime % 3 == 2
@@ -57,7 +58,8 @@ class MyDataset(Dataset):
         req_len = ctx_len + 1
         magic_prime = args.magic_prime
 
-        ii = 1 + epoch * self.samples_per_epoch + (idx * world_size) + rank
+        logical_idx = idx + self.step_offset * args.micro_bsz
+        ii = 1 + epoch * self.samples_per_epoch + (logical_idx * world_size) + rank
 
         factor = (math.sqrt(5) - 1) / 2
         factor = int(magic_prime * factor)

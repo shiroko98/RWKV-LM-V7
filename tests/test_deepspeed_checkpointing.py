@@ -1,9 +1,11 @@
 import os
 import sys
 import importlib.util
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -12,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import train
+from src import dataset as dataset_mod
 from src import trainer as trainer_mod
 
 _REGRESSION_SCRIPT_PATH = REPO_ROOT / "scripts" / "regression_resume_deepspeed_checkpoint.py"
@@ -214,3 +217,63 @@ def test_train_callback_initializes_logging_state_when_resuming_mid_run(tmp_path
     assert trainer.my_loss_sum == pytest.approx(1.25)
     assert (tmp_path / "train_log.txt").exists()
     trainer.my_log.close()
+
+
+def test_train_callback_sets_dataset_step_offset_from_restored_global_step():
+    callback = trainer_mod.train_callback(
+        SimpleNamespace(
+            epoch_begin=0,
+            epoch_steps=5040,
+        )
+    )
+
+    class MyDataset:
+        pass
+
+    dataset = MyDataset()
+    trainer = SimpleNamespace(
+        global_rank=3,
+        current_epoch=2,
+        world_size=8,
+        global_step=2 * 5040 + 50,
+        is_global_zero=False,
+        train_dataloader=SimpleNamespace(dataset=SimpleNamespace(datasets=dataset)),
+    )
+
+    callback.on_train_epoch_start(trainer, object())
+
+    assert dataset.global_rank == 3
+    assert dataset.real_epoch == 2
+    assert dataset.world_size == 8
+    assert dataset.step_offset == 50
+
+
+def test_dataset_getitem_applies_resume_step_offset():
+    dataset = object.__new__(dataset_mod.MyDataset)
+    dataset.args = SimpleNamespace(ctx_len=4, magic_prime=11, micro_bsz=2)
+    dataset.global_rank = 1
+    dataset.real_epoch = 0
+    dataset.world_size = 8
+    dataset.samples_per_epoch = 40320
+    dataset.step_offset = 5
+
+    class DummyData:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, idx, offset, length):
+            self.calls.append((idx, offset, length))
+            return np.arange(offset, offset + length, dtype=np.int64)
+
+    dataset.data = DummyData()
+
+    x, y = dataset_mod.MyDataset.__getitem__(dataset, 0)
+
+    logical_idx = 0 + dataset.step_offset * dataset.args.micro_bsz
+    ii = 1 + dataset.real_epoch * dataset.samples_per_epoch + (logical_idx * dataset.world_size) + dataset.global_rank
+    factor = int(dataset.args.magic_prime * ((math.sqrt(5) - 1) / 2))
+    expected_offset = ((factor * ii * ii * ii) % dataset.args.magic_prime) * dataset.args.ctx_len
+
+    assert dataset.data.calls == [(0, expected_offset, dataset.args.ctx_len + 1)]
+    assert torch.equal(x, torch.tensor([expected_offset + i for i in range(dataset.args.ctx_len)], dtype=torch.long))
+    assert torch.equal(y, torch.tensor([expected_offset + i for i in range(1, dataset.args.ctx_len + 1)], dtype=torch.long))

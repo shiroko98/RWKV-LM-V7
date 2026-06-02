@@ -1,5 +1,6 @@
 import os
 import sys
+import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +12,12 @@ if str(REPO_ROOT) not in sys.path:
 
 import train
 from src import trainer as trainer_mod
+
+_REGRESSION_SCRIPT_PATH = REPO_ROOT / "scripts" / "regression_resume_deepspeed_checkpoint.py"
+_REGRESSION_SCRIPT_SPEC = importlib.util.spec_from_file_location("regression_resume_deepspeed_checkpoint", _REGRESSION_SCRIPT_PATH)
+assert _REGRESSION_SCRIPT_SPEC is not None and _REGRESSION_SCRIPT_SPEC.loader is not None
+resume_smoke = importlib.util.module_from_spec(_REGRESSION_SCRIPT_SPEC)
+_REGRESSION_SCRIPT_SPEC.loader.exec_module(resume_smoke)
 
 
 def _make_ds_checkpoint_dir(base: Path, name: str, ts: int) -> Path:
@@ -108,7 +115,7 @@ def test_my_save_uses_trainer_save_checkpoint_for_all_deepspeed_strategies(strat
             calls.append((path, weights_only))
 
     trainer_mod.my_save(SimpleNamespace(strategy=strategy), DummyTrainer(), {"x": 1}, "dummy.pth")
-    assert calls == [("dummy.pth", True)]
+    assert calls == [("dummy.pth", False)]
 
 
 def test_my_save_uses_torch_save_for_non_deepspeed(monkeypatch: pytest.MonkeyPatch):
@@ -126,6 +133,7 @@ def test_save_train_checkpoint_prunes_old_deepspeed_directories_and_waits_for_ba
     _make_ds_checkpoint_dir(tmp_path, "rwkv-1.pth", 100)
 
     barrier_calls = []
+    save_calls = []
 
     class DummyStrategy:
         def barrier(self):
@@ -137,6 +145,7 @@ def test_save_train_checkpoint_prunes_old_deepspeed_directories_and_waits_for_ba
             self.is_global_zero = True
 
         def save_checkpoint(self, path, weights_only=True):
+            save_calls.append((path, weights_only))
             ckpt_dir = Path(path)
             ckpt_dir.mkdir()
             (ckpt_dir / "latest").write_text("checkpoint", encoding="utf-8")
@@ -151,5 +160,15 @@ def test_save_train_checkpoint_prunes_old_deepspeed_directories_and_waits_for_ba
 
     trainer_mod.save_train_checkpoint(args, DummyTrainer(), SimpleNamespace(state_dict=lambda: {"x": 1}), str(tmp_path / "rwkv-2.pth"))
 
+    assert save_calls == [(str(tmp_path / "rwkv-2.pth"), False)]
     assert barrier_calls == ["barrier", "barrier"]
     assert sorted(p.name for p in tmp_path.iterdir()) == ["rwkv-2.pth"]
+
+
+def test_resume_smoke_defaults_require_real_restore_and_progress_markers():
+    assert resume_smoke.default_require_patterns() == [
+        "Resuming trainer state from",
+        "Restoring states from the checkpoint path at",
+    ]
+    assert "Epoch " in resume_smoke.default_progress_patterns()
+    assert resume_smoke.line_has_failure_marker("KeyError: missing lr_schedulers")

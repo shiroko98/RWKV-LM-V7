@@ -11,7 +11,7 @@ def is_deepspeed_strategy(strategy: str) -> bool:
 
 def my_save(args, trainer, dd, ff):
     if is_deepspeed_strategy(args.strategy):
-        trainer.save_checkpoint(ff, weights_only=True)
+        trainer.save_checkpoint(ff, weights_only=False)
     else:
         torch.save(dd, ff)
 

@@ -39,6 +39,29 @@ def looks_like_deepspeed_checkpoint_dir(path: Path) -> bool:
     return any(name.endswith("_model_states.pt") or name.endswith("_optim_states.pt") for name in entries)
 
 
+def default_require_patterns() -> list[str]:
+    return [
+        "Resuming trainer state from",
+        "Restoring states from the checkpoint path at",
+    ]
+
+
+def default_progress_patterns() -> list[str]:
+    return ["loss=", "REAL it/s", "Kt/s", "Epoch "]
+
+
+def line_has_failure_marker(line: str) -> bool:
+    failure_markers = (
+        "Traceback (most recent call last):",
+        "ChildFailedError",
+        "KeyError:",
+        "RuntimeError:",
+        "AssertionError:",
+        "[resume-smoke] FAIL",
+    )
+    return any(marker in line for marker in failure_markers)
+
+
 def start_process(command: list[str]) -> subprocess.Popen[str]:
     kwargs = {
         "stdout": subprocess.PIPE,
@@ -119,7 +142,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-path", required=True, help="Path to the DeepSpeed sharded checkpoint directory, usually something like rwkv-40.pth")
     parser.add_argument("--log-file", default="", help="Where to write the captured launcher output. Defaults to ./resume-smoke-<timestamp>.log")
     parser.add_argument("--timeout-seconds", type=int, default=1800, help="Fail if resume has not looked healthy within this many seconds")
-    parser.add_argument("--steady-seconds", type=int, default=120, help="If resume marker appears and the job stays alive this long, treat it as a pass even if no progress-bar line appears yet")
+    parser.add_argument("--steady-seconds", type=int, default=120, help="How long to keep waiting after restore markers appear before timing out. This no longer counts as a pass by itself.")
     parser.add_argument("--interrupt-timeout", type=int, default=30)
     parser.add_argument("--term-timeout", type=int, default=15)
     parser.add_argument("--kill-timeout", type=int, default=5)
@@ -128,7 +151,7 @@ def parse_args() -> argparse.Namespace:
         "--require-pattern",
         action="append",
         default=[],
-        help="Pattern that must appear in the log. Can be passed multiple times. Defaults to ['Resuming trainer state from']",
+        help="Pattern that must appear in the log. Can be passed multiple times. Defaults include both the train.py resume log and Lightning's checkpoint-restore log.",
     )
     parser.add_argument(
         "--progress-pattern",
@@ -153,8 +176,8 @@ def main() -> int:
         print(f"[resume-smoke] checkpoint does not look like a DeepSpeed sharded checkpoint directory: {checkpoint_path}", file=sys.stderr)
         return 2
 
-    require_patterns = args.require_pattern or ["Resuming trainer state from"]
-    progress_patterns = args.progress_pattern or ["loss=", "REAL it/s", "Kt/s", "Epoch "]
+    require_patterns = args.require_pattern or default_require_patterns()
+    progress_patterns = args.progress_pattern or default_progress_patterns()
 
     log_path = Path(args.log_file).expanduser() if args.log_file else Path.cwd() / f"resume-smoke-{int(time.time())}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -192,7 +215,7 @@ def main() -> int:
                         pattern_hits[pattern] = True
                 if any(pattern in line for pattern in progress_patterns):
                     saw_progress = True
-                if "Traceback (most recent call last):" in line or "ChildFailedError" in line:
+                if line_has_failure_marker(line):
                     failure_markers.append(line)
                 if resume_seen_at is None and all(pattern_hits.values()):
                     resume_seen_at = time.monotonic()
@@ -200,13 +223,9 @@ def main() -> int:
             if process.poll() is not None:
                 break
 
-            if all(pattern_hits.values()):
-                if saw_progress:
-                    passed = True
-                    break
-                if resume_seen_at is not None and time.monotonic() - resume_seen_at >= args.steady_seconds:
-                    passed = True
-                    break
+            if all(pattern_hits.values()) and saw_progress:
+                passed = True
+                break
 
             if time.monotonic() - start_time >= args.timeout_seconds:
                 timeout_hit = True

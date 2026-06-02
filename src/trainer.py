@@ -6,8 +6,11 @@ from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
 
 NUMBERED_CKPT_PATTERN = re.compile(r"^rwkv(?:-step)?-(\d+)\.pth$")
 
+def is_deepspeed_strategy(strategy: str) -> bool:
+    return 'deepspeed' in str(strategy)
+
 def my_save(args, trainer, dd, ff):
-    if 'deepspeed_stage_3' in args.strategy:
+    if is_deepspeed_strategy(args.strategy):
         trainer.save_checkpoint(ff, weights_only=True)
     else:
         torch.save(dd, ff)
@@ -63,13 +66,13 @@ def save_train_checkpoint(args, trainer, pl_module, file_name):
         build_save_dict(args, pl_module),
         file_name,
     )
-    if 'deepspeed_stage_3' in args.strategy:
+    if is_deepspeed_strategy(args.strategy):
         trainer.strategy.barrier()
 
     if trainer.is_global_zero:
         prune_old_checkpoints(args)
 
-    if 'deepspeed_stage_3' in args.strategy:
+    if is_deepspeed_strategy(args.strategy):
         trainer.strategy.barrier()
 
 class train_callback(pl.Callback):
@@ -98,7 +101,7 @@ class train_callback(pl.Callback):
             else:
                 lr = (lr + args.lr_init * lr_mult) / 2
             if progress >= 1:
-                if (trainer.is_global_zero) or ('deepspeed_stage_3' in args.strategy):
+                if (trainer.is_global_zero) or is_deepspeed_strategy(args.strategy):
                     my_save(
                         args, trainer,
                         pl_module.state_dict(),
@@ -170,7 +173,7 @@ class train_callback(pl.Callback):
                     lll["kt/s"] = kt_s
                 trainer.my_wandb.log(lll, step=int(real_step))
 
-        if (trainer.is_global_zero) or ('deepspeed_stage_3' in args.strategy): # save pth
+        if (trainer.is_global_zero) or is_deepspeed_strategy(args.strategy): # save pth
             if args.magic_prime > 0:
                 if int(real_step) == int(args.magic_prime // args.real_bsz) - 1:
                     save_train_checkpoint(args, trainer, pl_module, f"{args.proj_dir}/rwkv-final.pth")
@@ -199,7 +202,7 @@ class train_callback(pl.Callback):
 
     def on_train_epoch_end(self, trainer, pl_module):
         args = self.args
-        if (trainer.is_global_zero) or ('deepspeed_stage_3' in args.strategy):  # save pth
+        if (trainer.is_global_zero) or is_deepspeed_strategy(args.strategy):  # save pth
             if (args.epoch_save > 0 and trainer.current_epoch % args.epoch_save == 0) or (trainer.current_epoch == args.epoch_count - 1):
                 try:
                     save_train_checkpoint(args, trainer, pl_module, f"{args.proj_dir}/rwkv-{args.epoch_begin + trainer.current_epoch}.pth")

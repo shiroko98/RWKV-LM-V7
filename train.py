@@ -19,7 +19,11 @@ def parse_epoch_checkpoint_name(name: str):
     return -1 if token == "init" else int(token)
 
 
-def is_deepspeed_zero3_checkpoint_dir(path: str) -> bool:
+def is_deepspeed_strategy(strategy: str) -> bool:
+    return "deepspeed" in str(strategy)
+
+
+def is_deepspeed_checkpoint_dir(path: str) -> bool:
     if not path or not os.path.isdir(path) or not path.endswith(".pth"):
         return False
     try:
@@ -37,11 +41,11 @@ def is_deepspeed_zero3_checkpoint_dir(path: str) -> bool:
 def resolve_resume_checkpoint_path(path: str, strategy: str):
     if not path:
         return None
-    if is_deepspeed_zero3_checkpoint_dir(path):
-        if "deepspeed_stage_3" not in str(strategy):
+    if is_deepspeed_checkpoint_dir(path):
+        if not is_deepspeed_strategy(strategy):
             raise ValueError(
-                f"Checkpoint directory {path} is a DeepSpeed ZeRO-3 sharded checkpoint. "
-                "Please resume it with a deepspeed_stage_3* strategy."
+                f"Checkpoint directory {path} is a DeepSpeed sharded checkpoint. "
+                "Please resume it with a deepspeed strategy."
             )
         return path
     return None
@@ -212,7 +216,7 @@ if __name__ == "__main__":
             args.load_model = f"{args.proj_dir}/rwkv-{max_p}.pth"
             if args.warmup_steps < 0:
                 args.warmup_steps = 10
-        if not is_deepspeed_zero3_checkpoint_dir(args.load_model):
+        if not is_deepspeed_checkpoint_dir(args.load_model):
             args.epoch_begin = max_p + 1
 
     args.resume_ckpt_path = resolve_resume_checkpoint_path(args.load_model, args.strategy)
@@ -316,7 +320,7 @@ if __name__ == "__main__":
     if args.resume_ckpt_path:
         rank_zero_info(f"########## Resuming trainer state from {args.resume_ckpt_path}... ##########")
         if args.load_partial == 1:
-            raise ValueError("load_partial=1 is not supported when resuming from a DeepSpeed ZeRO-3 checkpoint directory.")
+            raise ValueError("load_partial=1 is not supported when resuming from a DeepSpeed checkpoint directory.")
     else:
         rank_zero_info(f"########## Loading {args.load_model}... ##########")
         try:
@@ -334,7 +338,7 @@ if __name__ == "__main__":
                     args.load_model = f"{args.proj_dir}/rwkv-init.pth"
                 else:
                     args.load_model = f"{args.proj_dir}/rwkv-{max_p}.pth"
-                if not is_deepspeed_zero3_checkpoint_dir(args.load_model):
+                if not is_deepspeed_checkpoint_dir(args.load_model):
                     args.epoch_begin = max_p + 1
                 args.resume_ckpt_path = resolve_resume_checkpoint_path(args.load_model, args.strategy)
                 rank_zero_info(f"Trying {args.load_model}")
@@ -348,7 +352,7 @@ if __name__ == "__main__":
         if args.resume_ckpt_path:
             rank_zero_info(f"########## Resuming trainer state from {args.resume_ckpt_path}... ##########")
             if args.load_partial == 1:
-                raise ValueError("load_partial=1 is not supported when resuming from a DeepSpeed ZeRO-3 checkpoint directory.")
+                raise ValueError("load_partial=1 is not supported when resuming from a DeepSpeed checkpoint directory.")
         else:
             if args.load_partial == 1:
                 load_keys = load_dict.keys()

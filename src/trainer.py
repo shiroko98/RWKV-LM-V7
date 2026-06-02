@@ -1,4 +1,4 @@
-import os, math, time, datetime, subprocess, re
+import os, math, time, datetime, subprocess, re, shutil
 import torch
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
@@ -29,25 +29,28 @@ def prune_old_checkpoints(args):
     if keep_last_n <= 0:
         return
 
-    checkpoint_files = []
+    checkpoint_entries = []
     try:
         for entry in os.scandir(args.proj_dir):
-            if not entry.is_file():
+            if not (entry.is_file() or entry.is_dir()):
                 continue
             if not NUMBERED_CKPT_PATTERN.match(entry.name):
                 continue
             stat = entry.stat()
-            checkpoint_files.append((stat.st_mtime_ns, entry.name, entry.path))
+            checkpoint_entries.append((stat.st_mtime_ns, entry.name, entry.path, entry.is_dir()))
     except FileNotFoundError:
         return
 
-    if len(checkpoint_files) <= keep_last_n:
+    if len(checkpoint_entries) <= keep_last_n:
         return
 
-    checkpoint_files.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    for _, _, path in checkpoint_files[keep_last_n:]:
+    checkpoint_entries.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    for _, _, path, is_dir in checkpoint_entries[keep_last_n:]:
         try:
-            os.remove(path)
+            if is_dir:
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
         except FileNotFoundError:
             pass
         except OSError as e:
@@ -60,7 +63,14 @@ def save_train_checkpoint(args, trainer, pl_module, file_name):
         build_save_dict(args, pl_module),
         file_name,
     )
-    prune_old_checkpoints(args)
+    if 'deepspeed_stage_3' in args.strategy:
+        trainer.strategy.barrier()
+
+    if trainer.is_global_zero:
+        prune_old_checkpoints(args)
+
+    if 'deepspeed_stage_3' in args.strategy:
+        trainer.strategy.barrier()
 
 class train_callback(pl.Callback):
     def __init__(self, args):

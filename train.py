@@ -3,7 +3,48 @@
 ########################################################################################################
 
 import logging
+import os
+import re
+
 logging.basicConfig(level=logging.INFO)
+
+EPOCH_CKPT_PATTERN = re.compile(r"^rwkv-(init|\d+)\.pth$")
+
+
+def parse_epoch_checkpoint_name(name: str):
+    match = EPOCH_CKPT_PATTERN.match(name)
+    if not match:
+        return None
+    token = match.group(1)
+    return -1 if token == "init" else int(token)
+
+
+def is_deepspeed_zero3_checkpoint_dir(path: str) -> bool:
+    if not path or not os.path.isdir(path) or not path.endswith(".pth"):
+        return False
+    try:
+        entries = set(os.listdir(path))
+    except OSError:
+        return False
+    if "latest" in entries:
+        return True
+    return any(
+        name.endswith("_model_states.pt") or name.endswith("_optim_states.pt")
+        for name in entries
+    )
+
+
+def resolve_resume_checkpoint_path(path: str, strategy: str):
+    if not path:
+        return None
+    if is_deepspeed_zero3_checkpoint_dir(path):
+        if "deepspeed_stage_3" not in str(strategy):
+            raise ValueError(
+                f"Checkpoint directory {path} is a DeepSpeed ZeRO-3 sharded checkpoint. "
+                "Please resume it with a deepspeed_stage_3* strategy."
+            )
+        return path
+    return None
 
 if __name__ == "__main__":
     import os
@@ -155,14 +196,12 @@ if __name__ == "__main__":
     if args.train_stage >= 2:  # find latest saved model
         list_p = []
         for p in os.listdir(args.proj_dir):
-            if p.startswith("rwkv") and p.endswith(".pth"):
-                p = ((p.split("-"))[1].split("."))[0]
-                if p != "final":
-                    if p == "init":
-                        p = -1
-                    else:
-                        p = int(p)
-                    list_p += [p]
+            slot = parse_epoch_checkpoint_name(p)
+            if slot is None:
+                continue
+            full_path = os.path.join(args.proj_dir, p)
+            if os.path.isfile(full_path) or os.path.isdir(full_path):
+                list_p += [slot]
         list_p.sort()
         max_p = list_p[-1]
         if len(list_p) > 1:
@@ -173,7 +212,12 @@ if __name__ == "__main__":
             args.load_model = f"{args.proj_dir}/rwkv-{max_p}.pth"
             if args.warmup_steps < 0:
                 args.warmup_steps = 10
-        args.epoch_begin = max_p + 1
+        if not is_deepspeed_zero3_checkpoint_dir(args.load_model):
+            args.epoch_begin = max_p + 1
+
+    args.resume_ckpt_path = resolve_resume_checkpoint_path(args.load_model, args.strategy)
+    if args.resume_ckpt_path:
+        args.epoch_begin = 0
 
     samples_per_epoch = args.epoch_steps * args.real_bsz
     tokens_per_epoch = samples_per_epoch * args.ctx_len
@@ -269,32 +313,49 @@ if __name__ == "__main__":
         generate_init_weight(model, init_weight_name)  # save initial weights
         args.load_model = init_weight_name
 
-    rank_zero_info(f"########## Loading {args.load_model}... ##########")
-    try:
-        load_dict = torch.load(args.load_model, map_location="cpu", weights_only=True, mmap=True)
-        load_keys = list(load_dict.keys())
-        for k in load_keys:
-            if k.startswith('_forward_module.'):
-                load_dict[k.replace('_forward_module.','')] = load_dict[k]
-                del load_dict[k]
-    except:
-        rank_zero_info(f"Bad checkpoint {args.load_model}")
-        if args.train_stage >= 2:  # try again using another checkpoint
-            max_p = args.my_pile_prev_p
-            if max_p == -1:
-                args.load_model = f"{args.proj_dir}/rwkv-init.pth"
-            else:
-                args.load_model = f"{args.proj_dir}/rwkv-{max_p}.pth"
-            args.epoch_begin = max_p + 1
-            rank_zero_info(f"Trying {args.load_model}")
+    if args.resume_ckpt_path:
+        rank_zero_info(f"########## Resuming trainer state from {args.resume_ckpt_path}... ##########")
+        if args.load_partial == 1:
+            raise ValueError("load_partial=1 is not supported when resuming from a DeepSpeed ZeRO-3 checkpoint directory.")
+    else:
+        rank_zero_info(f"########## Loading {args.load_model}... ##########")
+        try:
             load_dict = torch.load(args.load_model, map_location="cpu", weights_only=True, mmap=True)
+            load_keys = list(load_dict.keys())
+            for k in load_keys:
+                if k.startswith('_forward_module.'):
+                    load_dict[k.replace('_forward_module.','')] = load_dict[k]
+                    del load_dict[k]
+        except:
+            rank_zero_info(f"Bad checkpoint {args.load_model}")
+            if args.train_stage >= 2:  # try again using another checkpoint
+                max_p = args.my_pile_prev_p
+                if max_p == -1:
+                    args.load_model = f"{args.proj_dir}/rwkv-init.pth"
+                else:
+                    args.load_model = f"{args.proj_dir}/rwkv-{max_p}.pth"
+                if not is_deepspeed_zero3_checkpoint_dir(args.load_model):
+                    args.epoch_begin = max_p + 1
+                args.resume_ckpt_path = resolve_resume_checkpoint_path(args.load_model, args.strategy)
+                rank_zero_info(f"Trying {args.load_model}")
+                if args.resume_ckpt_path:
+                    load_dict = None
+                else:
+                    load_dict = torch.load(args.load_model, map_location="cpu", weights_only=True, mmap=True)
+            else:
+                raise
 
-    if args.load_partial == 1:
-        load_keys = load_dict.keys()
-        for k in model.state_dict():
-            if k not in load_keys:
-                load_dict[k] = model.state_dict()[k]
-    model.load_state_dict(load_dict)
+        if args.resume_ckpt_path:
+            rank_zero_info(f"########## Resuming trainer state from {args.resume_ckpt_path}... ##########")
+            if args.load_partial == 1:
+                raise ValueError("load_partial=1 is not supported when resuming from a DeepSpeed ZeRO-3 checkpoint directory.")
+        else:
+            if args.load_partial == 1:
+                load_keys = load_dict.keys()
+                for k in model.state_dict():
+                    if k not in load_keys:
+                        load_dict[k] = model.state_dict()[k]
+            model.load_state_dict(load_dict)
 
     trainer = Trainer.from_argparse_args(
         args,
@@ -319,4 +380,4 @@ if __name__ == "__main__":
 
     if trainer.global_rank == 0:
         print(f'### Preparing for training (loaded {args.load_model}). Please wait...')
-    trainer.fit(model, data_loader)
+    trainer.fit(model, data_loader, ckpt_path=args.resume_ckpt_path)

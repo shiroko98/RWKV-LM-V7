@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -172,3 +173,44 @@ def test_resume_smoke_defaults_require_real_restore_and_progress_markers():
     ]
     assert "Epoch " in resume_smoke.default_progress_patterns()
     assert resume_smoke.line_has_failure_marker("KeyError: missing lr_schedulers")
+
+
+def test_train_callback_initializes_logging_state_when_resuming_mid_run(tmp_path: Path):
+    callback = trainer_mod.train_callback(
+        SimpleNamespace(
+            strategy="deepspeed_stage_3_offload",
+            proj_dir=str(tmp_path),
+            wandb="",
+            my_timestamp="2026-06-02-17-00-00",
+            run_name="resume-test",
+            epoch_begin=0,
+            epoch_steps=5040,
+            warmup_steps=10,
+            my_exit_tokens=1000,
+            ctx_len=16,
+            real_bsz=8,
+            lr_init=1e-4,
+            lr_final=1e-5,
+            weight_decay=0.01,
+            magic_prime=0,
+            save_every_n_steps=0,
+            save_at_step=0,
+        )
+    )
+    callback.log = lambda *args, **kwargs: None
+
+    trainer = SimpleNamespace(
+        global_step=50,
+        is_global_zero=True,
+        strategy=SimpleNamespace(config={"zero_optimization": {"stage": 3}}),
+        optimizers=[SimpleNamespace(param_groups=[{"weight_decay": 0.01, "my_lr_scale": 1.0}])],
+        my_loss_all=torch.tensor([1.25], dtype=torch.float32),
+    )
+
+    callback.on_train_batch_start(trainer, object(), None, 0)
+    callback.on_train_batch_end(trainer, object(), None, None, 0)
+
+    assert trainer.my_loss_count == 1
+    assert trainer.my_loss_sum == pytest.approx(1.25)
+    assert (tmp_path / "train_log.txt").exists()
+    trainer.my_log.close()

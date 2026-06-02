@@ -81,6 +81,38 @@ class train_callback(pl.Callback):
         self.args = args
         self._saved_step_markers = set()
 
+    def _ensure_run_logging_state(self, trainer):
+        args = self.args
+        if not trainer.is_global_zero:
+            return
+
+        if not hasattr(trainer, "my_loss_sum"):
+            trainer.my_loss_sum = 0
+        if not hasattr(trainer, "my_loss_count"):
+            trainer.my_loss_count = 0
+
+        if not hasattr(trainer, "my_log") or getattr(trainer.my_log, "closed", False):
+            trainer.my_log = open(args.proj_dir + "/train_log.txt", "a")
+            run_kind = "NEW RUN" if trainer.global_step == 0 else f"RESUME RUN @ step {trainer.global_step}"
+            trainer.my_log.write(f"{run_kind} {args.my_timestamp}\n{vars(args)}\n")
+            try:
+                print(f"\n{trainer.strategy.config}\n")
+                trainer.my_log.write(f"{trainer.strategy.config}\n")
+            except:
+                pass
+            trainer.my_log.flush()
+
+        if len(args.wandb) > 0 and not hasattr(trainer, "my_wandb"):
+            print("Login to wandb...")
+            import wandb
+            wandb.init(
+                project=args.wandb,
+                name=args.run_name + " " + args.my_timestamp,
+                config=args,
+                save_code=False,
+            )
+            trainer.my_wandb = wandb
+
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         args = self.args
 
@@ -121,28 +153,7 @@ class train_callback(pl.Callback):
         trainer.my_lr = lr
         trainer.my_wd = wd_now
 
-        if trainer.global_step == 0:
-            if trainer.is_global_zero:  # logging
-                trainer.my_loss_sum = 0
-                trainer.my_loss_count = 0
-                trainer.my_log = open(args.proj_dir + "/train_log.txt", "a")
-                trainer.my_log.write(f"NEW RUN {args.my_timestamp}\n{vars(self.args)}\n")
-                try:
-                    print(f"\n{trainer.strategy.config}\n")
-                    trainer.my_log.write(f"{trainer.strategy.config}\n")
-                except:
-                    pass
-                trainer.my_log.flush()
-                if len(args.wandb) > 0:
-                    print("Login to wandb...")
-                    import wandb
-                    wandb.init(
-                        project=args.wandb,
-                        name=args.run_name + " " + args.my_timestamp,
-                        config=args,
-                        save_code=False,
-                    )
-                    trainer.my_wandb = wandb
+        self._ensure_run_logging_state(trainer)
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         args = self.args

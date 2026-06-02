@@ -49,6 +49,13 @@ def test_parse_epoch_checkpoint_name_only_accepts_epoch_style_names():
     assert train.parse_epoch_checkpoint_name("not-a-checkpoint.pth") is None
 
 
+def test_parse_step_checkpoint_name_only_accepts_step_style_names():
+    assert train.parse_step_checkpoint_name("rwkv-step-7.pth") == 7
+    assert train.parse_step_checkpoint_name("rwkv-7.pth") is None
+    assert train.parse_step_checkpoint_name("rwkv-init.pth") is None
+    assert train.parse_step_checkpoint_name("not-a-checkpoint.pth") is None
+
+
 def test_detects_deepspeed_checkpoint_directories(tmp_path: Path):
     ds_dir = _make_ds_checkpoint_dir(tmp_path, "rwkv-1.pth", 100)
     assert train.is_deepspeed_checkpoint_dir(str(ds_dir))
@@ -277,3 +284,37 @@ def test_dataset_getitem_applies_resume_step_offset():
     assert dataset.data.calls == [(0, expected_offset, dataset.args.ctx_len + 1)]
     assert torch.equal(x, torch.tensor([expected_offset + i for i in range(dataset.args.ctx_len)], dtype=torch.long))
     assert torch.equal(y, torch.tensor([expected_offset + i for i in range(1, dataset.args.ctx_len + 1)], dtype=torch.long))
+
+
+def test_dataset_initializes_resume_position_before_first_epoch(monkeypatch: pytest.MonkeyPatch):
+    class DummyIndex:
+        _dtype_size = 2
+
+    class DummyDataset:
+        def __init__(self, path):
+            self._bin_buffer = bytes(4096)
+            self._index = DummyIndex()
+
+    monkeypatch.setattr(dataset_mod, "MMapIndexedDataset", DummyDataset)
+    monkeypatch.setenv("RANK", "3")
+    monkeypatch.setenv("WORLD_SIZE", "8")
+
+    dataset = dataset_mod.MyDataset(
+        SimpleNamespace(
+            vocab_size=65536,
+            data_file="dummy",
+            epoch_steps=5040,
+            real_bsz=8,
+            train_stage=0,
+            ctx_len=4,
+            magic_prime=509,
+            epoch_begin=0,
+            resume_epoch=2,
+            resume_step_offset=17,
+        )
+    )
+
+    assert dataset.global_rank == 3
+    assert dataset.world_size == 8
+    assert dataset.real_epoch == 2
+    assert dataset.step_offset == 17

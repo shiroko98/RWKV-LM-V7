@@ -9,6 +9,7 @@ import re
 logging.basicConfig(level=logging.INFO)
 
 EPOCH_CKPT_PATTERN = re.compile(r"^rwkv-(init|\d+)\.pth$")
+STEP_CKPT_PATTERN = re.compile(r"^rwkv-step-(\d+)\.pth$")
 
 
 def parse_epoch_checkpoint_name(name: str):
@@ -17,6 +18,13 @@ def parse_epoch_checkpoint_name(name: str):
         return None
     token = match.group(1)
     return -1 if token == "init" else int(token)
+
+
+def parse_step_checkpoint_name(name: str):
+    match = STEP_CKPT_PATTERN.match(name)
+    if not match:
+        return None
+    return int(match.group(1))
 
 
 def is_deepspeed_strategy(strategy: str) -> bool:
@@ -222,6 +230,24 @@ if __name__ == "__main__":
     args.resume_ckpt_path = resolve_resume_checkpoint_path(args.load_model, args.strategy)
     if args.resume_ckpt_path:
         args.epoch_begin = 0
+
+    args.resume_global_step = 0
+    args.resume_epoch = args.epoch_begin
+    args.resume_step_offset = 0
+    step_ckpt = parse_step_checkpoint_name(os.path.basename(args.load_model))
+    epoch_ckpt = parse_epoch_checkpoint_name(os.path.basename(args.load_model))
+    if args.resume_ckpt_path and step_ckpt is not None:
+        args.resume_global_step = step_ckpt
+        args.resume_epoch = step_ckpt // args.epoch_steps
+        args.resume_step_offset = step_ckpt % args.epoch_steps
+    elif args.resume_ckpt_path and epoch_ckpt is not None and epoch_ckpt >= 0:
+        args.resume_epoch = epoch_ckpt
+
+    if args.resume_ckpt_path:
+        rank_zero_info(
+            f"########## Preloading resume position: global_step={args.resume_global_step} "
+            f"epoch={args.resume_epoch} step_offset={args.resume_step_offset}/{args.epoch_steps} ##########"
+        )
 
     samples_per_epoch = args.epoch_steps * args.real_bsz
     tokens_per_epoch = samples_per_epoch * args.ctx_len

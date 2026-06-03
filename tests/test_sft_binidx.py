@@ -1,6 +1,7 @@
 import io
 import json
 import random
+import warnings
 from contextlib import redirect_stdout
 from pathlib import Path
 import sys
@@ -49,11 +50,12 @@ TEMPLATE_PATH = ROOT / "chat_template.jinja"
 TOOLS_JSONL = ROOT / "data" / "SFT" / "tools.jsonl"
 ORIGIN_EXAMPLE = ROOT / "data" / "SFT" / "stf_origin_example.jsonl"
 TEMPLATE_EXAMPLE = ROOT / "data" / "SFT" / "stf_template_example.txt"
+OLD_VOCAB_PATH = ROOT / "data" / "tokenizer" / "rwkv_vocab_v20230424.txt"
 
 
 @pytest.fixture(scope="module")
 def tokenizer():
-    return TRIE_TOKENIZER(str(VOCAB_PATH))
+    return TRIE_TOKENIZER(str(VOCAB_PATH), strict_length=True)
 
 
 @pytest.fixture(scope="module")
@@ -72,9 +74,9 @@ def masked_text(tokenizer: TRIE_TOKENIZER, encoded: EncodedDocument) -> str:
 
 
 def test_parse_vocab_line_accepts_new_vocab_spacing_mismatches():
-    idx, token_bytes, declared_length = parse_vocab_line("19231 ' ' 3")
+    idx, token_bytes, declared_length = parse_vocab_line("19231 '￼' 3")
     assert idx == 19231
-    assert token_bytes == b" "
+    assert token_bytes == "￼".encode("utf-8")
     assert declared_length == 3
 
 
@@ -88,12 +90,24 @@ def test_parse_vocab_line_rejects_non_byte_tokens():
         parse_vocab_line("7 123 3")
 
 
-def test_new_vocab_loads_special_tokens_and_warns_for_len_mismatches():
-    with pytest.warns(RuntimeWarning, match="declared byte lengths"):
-        loaded = TRIE_TOKENIZER(str(VOCAB_PATH))
+def test_new_vocab_loads_special_tokens_without_len_warnings():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        loaded = TRIE_TOKENIZER(str(VOCAB_PATH), strict_length=True)
     assert loaded.token2idx[b"<|im_start|>"] == 65530
     assert loaded.token2idx[b"<|im_end|>"] == 65531
     assert loaded.token2idx[b"<|endoftext|>"] == 65532
+    assert not [
+        warning for warning in caught if "declared byte lengths" in str(warning.message)
+    ]
+
+
+def test_new_vocab_matches_old_vocab_for_fixed_special_tokens():
+    target_ids = [19231, 19232, 23247, 43902, 58648, 64156, 64749]
+    new_tokenizer = TRIE_TOKENIZER(str(VOCAB_PATH), strict_length=True)
+    old_tokenizer = TRIE_TOKENIZER(str(OLD_VOCAB_PATH), strict_length=True)
+    for token_id in target_ids:
+        assert new_tokenizer.idx2token[token_id] == old_tokenizer.idx2token[token_id]
 
 
 def test_tokenizer_encode_decode_and_print_tokens(tokenizer: TRIE_TOKENIZER):
@@ -246,7 +260,7 @@ def test_split_system_and_conversation_and_last_assistant_index():
 def test_build_template_segments_matches_origin_example(example_record):
     segments = build_template_segments(example_record["messages"], tools=example_record["tools"])
     rendered = "".join(segment.text for segment in segments)
-    expected = TEMPLATE_EXAMPLE.read_text(encoding="utf-8")
+    expected = TEMPLATE_EXAMPLE.read_text(encoding="utf-8").rstrip("\n")
     assert rendered == expected
 
     trainable_texts = [segment.text for segment in segments if segment.trainable]
@@ -345,7 +359,7 @@ def test_build_template_segments_without_thinking_prompt_and_unsupported_role():
 
 def test_render_chat_template_ignores_template_text_and_matches_example(example_record, chat_template):
     rendered = render_chat_template(chat_template, example_record["messages"], tools=example_record["tools"])
-    assert rendered == TEMPLATE_EXAMPLE.read_text(encoding="utf-8")
+    assert rendered == TEMPLATE_EXAMPLE.read_text(encoding="utf-8").rstrip("\n")
 
 
 def test_only_last_assistant_content_is_trainable(tokenizer: TRIE_TOKENIZER, chat_template: str):
@@ -376,6 +390,7 @@ def test_origin_example_only_trains_last_assistant_content(
 ):
     encoded = build_document_from_record(example_record, tokenizer=tokenizer, template=chat_template)
     trainable_text = masked_text(tokenizer, encoded)
+    assert tokenizer.decode(encoded.input_ids[:-1]) == TEMPLATE_EXAMPLE.read_text(encoding="utf-8").rstrip("\n")
 
     assert trainable_text == example_record["messages"][-1]["content"] + "<|im_end|><|endoftext|>"
     assert "帮我查一下上海今天的天气" not in trainable_text

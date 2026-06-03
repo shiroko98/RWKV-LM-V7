@@ -448,7 +448,7 @@ def build_binidx_dataset(
     current_location: str | None = None,
 ):
     template = load_chat_template(template_path)
-    tokenizer = TRIE_TOKENIZER(vocab_path)
+    tokenizer = TRIE_TOKENIZER(vocab_path, strict_length=True)
     lines = load_non_empty_lines(input_jsonl)
     rng = random.Random(seed)
     shuffled_lines = shuffled_epoch_lines(lines, n_epoch, rng)

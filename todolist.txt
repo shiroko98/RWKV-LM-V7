@@ -31,6 +31,22 @@ Validation completed
 - Regression suite: `conda run -n model pytest -q`
 - Result after mask-rule update: 71 passed.
 
+2026-06-03 vocab strictness follow-up
+- Compared `rwkv_vocab_v20260603.txt` against `data/tokenizer/rwkv_vocab_v20230424.txt`.
+- The first 65529 lines now match exactly; `v20260603` only adds 5 new tail entries:
+- `65530 '<|im_start|>' 12`
+- `65531 '<|im_end|>' 10`
+- `65532 '<|endoftext|>' 13`
+- `65533 '<|think|>' 9`
+- `65534 '<|tool_call|>' 13`
+- Fixed the 7 corrupted entries that had been accidentally written as plain spaces in `v20260603`.
+- Verified that `v20260603` now has zero declared-length mismatches.
+- Switched the new SFT preprocessing path to load tokenizer vocab with `strict_length=True`.
+- Validation after strict mode switch:
+- `conda run -n model pytest -q tests\test_sft_binidx.py` -> 36 passed
+- `conda run -n model pytest -q tests\test_sft_binidx.py --cov=src.sft_binidx --cov=data.tokenizer.rwkv_tokenizer --cov=data.make_sft_binidx --cov-report=term-missing` -> 99% total coverage
+- `conda run -n model pytest -q` -> 72 passed
+
 Next recommended work
 - Wire the mask sidecar into the training dataloader so SFT can reuse the existing binidx data path.
 - Add masked loss handling in the model/training step while preserving the current pretrain fast path.

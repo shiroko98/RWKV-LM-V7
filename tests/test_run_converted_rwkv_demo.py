@@ -46,3 +46,13 @@ def test_infer_runtime_dtype_prefers_checkpoint_dtype_in_auto_mode():
 
     assert demo_script.infer_runtime_dtype(state_dict, "auto") == torch.bfloat16
     assert demo_script.infer_runtime_dtype(state_dict, "fp32") == torch.float32
+
+
+def test_runtime_block_only_creates_ln0_for_first_layer():
+    args = type("Args", (), {"n_embd": 128, "dim_att": 128, "dim_ffn": 512, "head_size_a": 64, "n_layer": 2})()
+
+    block0 = demo_script.runtime.Block(args, 0)
+    block1 = demo_script.runtime.Block(args, 1)
+
+    assert hasattr(block0, "ln0")
+    assert not hasattr(block1, "ln0")

@@ -240,9 +240,10 @@ class Block(nn.Module):
         self.args = args
         self.layer_id = layer_id
 
-        self.ln0 = nn.LayerNorm(args.n_embd)
         self.ln1 = nn.LayerNorm(args.n_embd)
         self.ln2 = nn.LayerNorm(args.n_embd)
+        if self.layer_id == 0:
+            self.ln0 = nn.LayerNorm(args.n_embd)
 
         self.att = RWKV_Tmix_x070(args, layer_id)
         self.ffn = RWKV_CMix_x070(args, layer_id)

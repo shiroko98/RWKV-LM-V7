@@ -664,6 +664,20 @@ def test_packing_keeps_exactly_one_trainable_eod_between_samples(tokenizer: TRIE
     assert packed[0].loss_mask[6] == 0
 
 
+def test_single_sample_padding_keeps_first_terminal_eod_trainable(tokenizer: TRIE_TOKENIZER):
+    eod_id = eod_token_id(tokenizer)
+    packed = list(
+        pack_encoded_documents(
+            [EncodedDocument(input_ids=[301, 302, eod_id], loss_mask=[1, 1, 1])],
+            pack_length=6,
+            pad_token_id=eod_id,
+        )
+    )
+    assert len(packed) == 1
+    assert packed[0].input_ids == [301, 302, eod_id, eod_id, eod_id, eod_id]
+    assert packed[0].loss_mask == [1, 1, 1, 0, 0, 0]
+
+
 def test_build_binidx_dataset_shuffles_epochs_deterministically(tmp_path):
     input_path = tmp_path / "sample.jsonl"
     records = [

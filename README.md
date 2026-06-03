@@ -60,6 +60,204 @@ sh ./demo-training-prepare.sh
 sh ./demo-training-run.sh
 ```
 
+## 13.3B Workflow
+
+This repository also contains a practical 13.3B / DeepSpeed workflow for long-running training, clean shutdown, resume, checkpoint conversion, and inference.
+
+### Start 13.3B Training
+
+The main launcher script is [run_12b_zero3_offload.sh](/D:/codes/RWKV-LM-V7-12B-train/run_12b_zero3_offload.sh). Edit the model path, dataset path, context length, and the three dataset-dependent values first:
+
+- `VOCAB_SIZE`
+- `MY_EXIT_TOKENS`
+- `MAGIC_PRIME`
+
+Then start training:
+
+```bash
+bash run_12b_zero3_offload.sh
+```
+
+Useful training-side notes:
+
+- This script currently uses `--strategy deepspeed_stage_3_offload`
+- `--save_every_n_steps` and `--keep_last_n_checkpoints` are supported by `train.py`
+- step checkpoints are named like `rwkv-step-200.pth`
+- epoch checkpoints are named like `rwkv-10.pth`
+
+### Stop Training Cleanly
+
+Use [scripts/stop_rwkv_train.sh](/D:/codes/RWKV-LM-V7-12B-train/scripts/stop_rwkv_train.sh) instead of killing random worker PIDs.
+
+Find the launcher PID:
+
+```bash
+pgrep -fo 'python .*train\.py'
+```
+
+Stop it cleanly:
+
+```bash
+bash scripts/stop_rwkv_train.sh "$(pgrep -fo 'python .*train\.py')"
+```
+
+The stop script sends:
+
+1. `SIGINT`
+2. `SIGTERM`
+3. `SIGKILL`
+
+This greatly reduces the noisy NCCL / TCPStore broken-pipe shutdown spam compared with force-killing individual workers.
+
+### Resume Training
+
+For DeepSpeed sharded checkpoints, resume by pointing `--load_model` at the checkpoint directory itself, for example:
+
+```bash
+--load_model /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/12b-zero3-offload/rwkv-step-200.pth
+```
+
+`train.py` now detects DeepSpeed checkpoint directories automatically and passes them into Lightning via `ckpt_path`. This supports:
+
+- `deepspeed_stage_1`
+- `deepspeed_stage_2`
+- `deepspeed_stage_2_offload`
+- `deepspeed_stage_3`
+- `deepspeed_stage_3_offload`
+
+In practice, resuming usually just means:
+
+1. edit `LOAD_MODEL` in [run_12b_zero3_offload.sh](/D:/codes/RWKV-LM-V7-12B-train/run_12b_zero3_offload.sh) to the checkpoint directory you want
+2. run the same script again
+
+Example:
+
+```bash
+bash run_12b_zero3_offload.sh
+```
+
+### Smoke-Test Resume Before a Long Run
+
+If you want to verify that a real ZeRO checkpoint can resume correctly before committing to a long training run, use [scripts/regression_resume_deepspeed_checkpoint.py](/D:/codes/RWKV-LM-V7-12B-train/scripts/regression_resume_deepspeed_checkpoint.py):
+
+```bash
+python scripts/regression_resume_deepspeed_checkpoint.py \
+  --checkpoint-path /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/12b-zero3-offload/rwkv-step-200.pth \
+  --log-file /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/resume-smoke-step200.log \
+  --timeout-seconds 2400 \
+  --steady-seconds 180 \
+  -- \
+  bash run_12b_zero3_offload.sh
+```
+
+This script:
+
+- validates that the checkpoint path looks like a real DeepSpeed sharded checkpoint
+- launches your normal training command
+- waits for both resume markers and actual training progress
+- stops the process group cleanly once resume looks healthy
+
+### Convert a DeepSpeed Checkpoint to a Single `.pth`
+
+Use [scripts/convert_deepspeed_checkpoint_to_pth.py](/D:/codes/RWKV-LM-V7-12B-train/scripts/convert_deepspeed_checkpoint_to_pth.py):
+
+```bash
+python scripts/convert_deepspeed_checkpoint_to_pth.py \
+  --checkpoint-dir /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/12b-zero3-offload/rwkv-step-20.pth \
+  --output-file /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/12b-zero3-offload/rwkv-step-20.bf16.pth \
+  --dtype bf16
+```
+
+Optional summary file:
+
+```bash
+python scripts/convert_deepspeed_checkpoint_to_pth.py \
+  --checkpoint-dir /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/12b-zero3-offload/rwkv-step-20.pth \
+  --output-file /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/12b-zero3-offload/rwkv-step-20.bf16.pth \
+  --dtype bf16 \
+  --summary-file /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/rwkv-step-20-summary.txt
+```
+
+### Verify the Converted `.pth` Matches the ZeRO Checkpoint
+
+Use [scripts/test_converted_checkpoint_equivalence.py](/D:/codes/RWKV-LM-V7-12B-train/scripts/test_converted_checkpoint_equivalence.py) to compare:
+
+- reconstructed state_dict from the original ZeRO checkpoint
+- converted single-file `.pth`
+- forward logits on a real prompt
+
+Important: always compare the same step against itself. Do not mix `rwkv-step-20.pth` with `rwkv-step-200.bf16.pth`.
+
+Example:
+
+```bash
+python scripts/test_converted_checkpoint_equivalence.py \
+  --checkpoint-dir /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/12b-zero3-offload/rwkv-step-20.pth \
+  --converted-file /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/12b-zero3-offload/rwkv-step-20.bf16.pth \
+  --dtype bf16 \
+  --device cuda \
+  --strict-forward \
+  --summary-file /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/rwkv-step-20-equivalence.json
+```
+
+A successful run should end with:
+
+```text
+[equiv] state_dict match: ...
+[equiv] forward check: ...
+[equiv] PASS
+```
+
+If `max_abs_diff=0.0` and `topk_match=True`, the converted checkpoint matches exactly for both parameters and forward behavior.
+
+### Run Inference on a Converted Single-File Checkpoint
+
+Use [scripts/run_converted_rwkv_demo.py](/D:/codes/RWKV-LM-V7-12B-train/scripts/run_converted_rwkv_demo.py):
+
+```bash
+python scripts/run_converted_rwkv_demo.py \
+  --model-path /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/12b-zero3-offload/rwkv-step-20.bf16.pth \
+  --vocab-path /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/data/tokenizer/rwkv_vocab_v20230424.txt \
+  --device cuda \
+  --dtype auto \
+  --prompt "The Eiffel tower is in the city of" \
+  --topk 10 \
+  --max-new-tokens 32
+```
+
+Sampling example:
+
+```bash
+python scripts/run_converted_rwkv_demo.py \
+  --model-path /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/12b-zero3-offload/rwkv-step-20.bf16.pth \
+  --vocab-path /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/data/tokenizer/rwkv_vocab_v20230424.txt \
+  --device cuda \
+  --dtype auto \
+  --prompt "The Eiffel tower is in the city of" \
+  --max-new-tokens 64 \
+  --sample \
+  --temperature 1.0 \
+  --top-p 0.9
+```
+
+This demo automatically infers:
+
+- `n_layer`
+- `n_embd`
+- `head_size`
+- `D_DECAY_LORA`
+- `D_AAA_LORA`
+- `D_MV_LORA`
+- `D_GATE_LORA`
+
+from the checkpoint itself, so you do not need to hardcode 13.3B layout values by hand.
+
+### Legacy `rwkv_v7_demo.py`
+
+There is also a local [rwkv_v7_demo.py](/D:/codes/RWKV-LM-V7-12B-train/rwkv_v7_demo.py) file that was adapted for prompt continuation. It is more manual and keeps its own hardcoded paths and settings.
+
+Use it only if you specifically want that standalone demo style. For practical converted-checkpoint inference, prefer `scripts/run_converted_rwkv_demo.py`.
+
 ## Detailed Explanation
 
 This section contains explanations of model initialization, learning rates, and other details.

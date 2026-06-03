@@ -1,0 +1,33 @@
+2026-06-03 new_sft branch bootstrap
+
+Current status
+- Branch `new_sft` created from `ops-train`.
+- Mainline training path currently only supports pretrain with `binidx` data and full-token loss.
+- Do not use the local `sft` branch as an implementation source because the target design is different.
+- Reference implementation available in `_reference_rwkv_infctx_trainer`.
+
+Current assessment
+- `train.py` asserts `data_type == "binidx"` and wires a fixed-length pretrain dataloader only.
+- `src/dataset.py` only returns `(x, y)` sampled from `MMapIndexedDataset` using the magic-prime pretrain schedule.
+- `src/model.py` training loss is full-token CE via fused CUDA kernels, with no selective mask input.
+- Therefore, this branch is effectively pretrain-only today.
+
+Planned work
+- Add an SFT data preparation path that converts message-style JSONL into token ids + labels + loss mask.
+- Reuse the existing pretrain training loop as much as possible by adding an optional `train_mode`.
+- Keep pretrain behavior unchanged when `train_mode=pretrain`.
+- Add masked loss support for SFT while preserving the current fused loss path for pretrain.
+- Add unit tests and regression tests for new SFT code and unchanged pretrain behavior.
+- Keep changes split into small commits with clear history.
+
+Open decisions / info needed
+- Confirm target SFT source format: ChatML/messages JSONL, prompt-completion JSONL, or prebuilt Arrow.
+- Confirm tokenizer/vocab choice: keep current world vocab v20230424, or add ChatML-compatible special tokens like the reference repo.
+- Confirm masking policy: assistant content only, or also train role prefixes / separators / EOD tokens.
+- Confirm whether SFT resume must support exact mid-epoch continuation, or epoch-level resume is acceptable initially.
+
+Implementation direction
+- Prefer offline preprocessing into an Arrow/HF dataset with `input_ids`, `labels`, `loss_mask`, and `length`.
+- Dataset layer returns `(x, y)` for pretrain and `(x, y, loss_mask)` for SFT.
+- Model `training_step` accepts an optional mask and falls back to standard masked CE only when needed.
+- Design from scratch on `new_sft`, using only the current codebase plus `_reference_rwkv_infctx_trainer` as the behavior reference.

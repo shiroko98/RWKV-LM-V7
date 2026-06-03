@@ -18,7 +18,10 @@ Completed in this round
 - Added `src/sft_binidx.py` to preprocess message-style SFT JSONL into token `binidx` plus a sidecar mask dataset `*.mask.bin` / `*.mask.idx`.
 - Added `data/make_sft_binidx.py` CLI entry for offline preprocessing before training.
 - Updated `data/tokenizer/rwkv_tokenizer.py` to accept `rwkv_vocab_v20260603.txt`, including tolerant parsing for declared-length mismatches in the vocab file.
-- Kept masking policy aligned with the current requirement: only the final assistant message content is trainable; all earlier text, role prefixes, tool schema, tool calls, tool outputs, separators, and EOD are masked out.
+- Updated masking policy to the current rule:
+- system prompt, tool schema, user text, tool outputs, assistant role prefix remain masked.
+- if an assistant message is not the final assistant reply, its `content`, optional newline before `tool_calls`, `tool_calls`, and assistant end marker are preserved in text but fully masked.
+- if an assistant message is the final assistant reply, its `content`, optional newline before `tool_calls`, `tool_calls`, assistant end marker, and trailing `EOD` are trainable.
 - Confirmed the compact sample `data/SFT/stf_origin_example.jsonl` correctly reconstructs `data/SFT/stf_template_example.txt`, so it can be used as the long-term regression sample instead of repeatedly depending on large `tools.jsonl`.
 
 Validation completed
@@ -26,7 +29,7 @@ Validation completed
 - Coverage on modified preprocessing modules: `conda run -n model pytest -q tests\test_sft_binidx.py --cov=src.sft_binidx --cov=data.tokenizer.rwkv_tokenizer --cov=data.make_sft_binidx --cov-report=term-missing`
 - Result: `src/sft_binidx.py` 100%, `data/tokenizer/rwkv_tokenizer.py` 100%, `data/make_sft_binidx.py` 96%, total modified-surface coverage 99%.
 - Regression suite: `conda run -n model pytest -q`
-- Result: 67 passed.
+- Result after mask-rule update: 71 passed.
 
 Next recommended work
 - Wire the mask sidecar into the training dataloader so SFT can reuse the existing binidx data path.

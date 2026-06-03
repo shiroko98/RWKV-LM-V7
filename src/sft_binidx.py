@@ -266,9 +266,9 @@ def build_template_segments(
                 segments.append(Segment(content, trainable))
             if message.get("tool_calls"):
                 if not content or not content.endswith("\n"):
-                    segments.append(Segment("\n", False))
-                segments.append(Segment(render_tool_calls(message["tool_calls"]), False))
-            segments.append(Segment(f"{IM_END_TOKEN}{suffix}", False))
+                    segments.append(Segment("\n", trainable))
+                segments.append(Segment(render_tool_calls(message["tool_calls"]), trainable))
+            segments.append(Segment(f"{IM_END_TOKEN}{suffix}", trainable))
             continue
 
         if role == "tool":
@@ -328,6 +328,7 @@ def encode_segments(
     segments: Sequence[Segment],
     *,
     append_eod: bool = True,
+    eod_trainable: bool = False,
 ) -> EncodedDocument:
     input_ids: list[int] = []
     loss_mask: list[int] = []
@@ -339,7 +340,7 @@ def encode_segments(
     if append_eod:
         eod_ids = tokenizer.encode(EOD_TOKEN)
         input_ids.extend(eod_ids)
-        loss_mask.extend([0] * len(eod_ids))
+        loss_mask.extend([1 if eod_trainable else 0] * len(eod_ids))
 
     return EncodedDocument(input_ids=input_ids, loss_mask=loss_mask)
 
@@ -357,6 +358,7 @@ def build_document_from_record(
     del template
     messages = record["messages"]
     tools = record.get("tools")
+    last_assistant_idx = last_assistant_content_index(messages)
     segments = build_template_segments(
         messages,
         tools=tools,
@@ -365,7 +367,11 @@ def build_document_from_record(
         add_generation_prompt=add_generation_prompt,
         enable_thinking=enable_thinking,
     )
-    return encode_segments(tokenizer, segments)
+    return encode_segments(
+        tokenizer,
+        segments,
+        eod_trainable=last_assistant_idx is not None,
+    )
 
 
 def load_chat_template(template_path: str):

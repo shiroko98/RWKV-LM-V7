@@ -67,11 +67,7 @@ def example_record():
 
 
 def masked_text(tokenizer: TRIE_TOKENIZER, encoded: EncodedDocument) -> str:
-    kept = [
-        token_id
-        for token_id, mask in zip(encoded.input_ids[:-1], encoded.loss_mask[:-1])
-        if mask == 1
-    ]
+    kept = [token_id for token_id, mask in zip(encoded.input_ids, encoded.loss_mask) if mask == 1]
     return tokenizer.decode(kept)
 
 
@@ -255,7 +251,8 @@ def test_build_template_segments_matches_origin_example(example_record):
 
     trainable_texts = [segment.text for segment in segments if segment.trainable]
     assert trainable_texts == [
-        "上海今天多云，约 28°C，湿度 72%，东南风 3 级；空气质量为优，AQI 45。整体适合晚上跑步，建议避开闷热时段，控制强度并注意补水。"
+        "上海今天多云，约 28°C，湿度 72%，东南风 3 级；空气质量为优，AQI 45。整体适合晚上跑步，建议避开闷热时段，控制强度并注意补水。",
+        "<|im_end|>",
     ]
 
 
@@ -267,7 +264,47 @@ def test_build_template_segments_marks_only_last_assistant_content():
             {"role": "assistant", "content": "a2"},
         ]
     )
-    assert [segment.text for segment in segments if segment.trainable] == ["a2"]
+    assert [segment.text for segment in segments if segment.trainable] == ["a2", "<|im_end|>"]
+
+
+def test_build_template_segments_trains_last_assistant_tool_calls_and_end():
+    segments = build_template_segments(
+        [
+            {"role": "user", "content": "u"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"function": {"name": "demo", "arguments": {"city": "上海"}}}],
+            },
+        ]
+    )
+    trainable_texts = [segment.text for segment in segments if segment.trainable]
+    assert trainable_texts == [
+        "\n",
+        "<tool_call>\n<invoke name=\"demo\"><parameter name=\"city\">上海</parameter></invoke>\n</tool_call>",
+        "<|im_end|>",
+    ]
+
+
+def test_build_template_segments_masks_non_final_assistant_tool_calls():
+    segments = build_template_segments(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"function": {"name": "demo", "arguments": {"city": "上海"}}}],
+            },
+            {"role": "assistant", "content": "final"},
+        ]
+    )
+    assert "<tool_call>\n<invoke name=\"demo\"><parameter name=\"city\">上海</parameter></invoke>\n</tool_call>" in [
+        segment.text for segment in segments
+    ]
+    assert all(
+        not segment.trainable
+        for segment in segments
+        if "demo" in segment.text or segment.text == "\n"
+    )
 
 
 def test_build_template_segments_supports_generation_prompt_and_tool_runs():
@@ -326,10 +363,10 @@ def test_only_last_assistant_content_is_trainable(tokenizer: TRIE_TOKENIZER, cha
     assert tokenizer.decode(encoded.input_ids[:-1]) == rendered
 
     trainable_text = masked_text(tokenizer, encoded)
-    assert trainable_text == "最后答案"
+    assert trainable_text == "最后答案<|im_end|><|endoftext|>"
     assert "<|im_start|>Assistant: " not in trainable_text
     assert "<tool_call>" not in trainable_text
-    assert encoded.loss_mask[-1] == 0
+    assert encoded.loss_mask[-1] == 1
 
 
 def test_origin_example_only_trains_last_assistant_content(
@@ -340,16 +377,51 @@ def test_origin_example_only_trains_last_assistant_content(
     encoded = build_document_from_record(example_record, tokenizer=tokenizer, template=chat_template)
     trainable_text = masked_text(tokenizer, encoded)
 
-    assert trainable_text == example_record["messages"][-1]["content"]
+    assert trainable_text == example_record["messages"][-1]["content"] + "<|im_end|><|endoftext|>"
     assert "帮我查一下上海今天的天气" not in trainable_text
     assert "get_weather" not in trainable_text
-    assert EOD_TOKEN not in trainable_text
+    assert EOD_TOKEN in trainable_text
+
+
+def test_last_assistant_tool_calls_are_trainable_even_with_empty_content(
+    tokenizer: TRIE_TOKENIZER,
+    chat_template: str,
+):
+    record = {
+        "messages": [
+            {"role": "user", "content": "查天气"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": {"city": "上海"},
+                        }
+                    }
+                ],
+            },
+        ]
+    }
+    encoded = build_document_from_record(record, tokenizer=tokenizer, template=chat_template)
+    trainable_text = masked_text(tokenizer, encoded)
+    assert trainable_text == (
+        "\n"
+        "<tool_call>\n"
+        "<invoke name=\"get_weather\"><parameter name=\"city\">上海</parameter></invoke>\n"
+        "</tool_call><|im_end|><|endoftext|>"
+    )
 
 
 def test_encode_segments_appends_eod_and_can_skip_it(tokenizer: TRIE_TOKENIZER):
     encoded = encode_segments(tokenizer, [Segment("abc", True), Segment("def", False)])
     assert tokenizer.decode(encoded.input_ids[:-1]) == "abcdef"
     assert encoded.loss_mask[-1] == 0
+
+    encoded_with_trainable_eod = encode_segments(tokenizer, [Segment("abc", True)], eod_trainable=True)
+    assert tokenizer.decode(encoded_with_trainable_eod.input_ids) == "abc<|endoftext|>"
+    assert encoded_with_trainable_eod.loss_mask[-1] == 1
 
     no_eod = encode_segments(tokenizer, [Segment("abc", True)], append_eod=False)
     assert tokenizer.decode(no_eod.input_ids) == "abc"
@@ -359,7 +431,13 @@ def test_encode_segments_appends_eod_and_can_skip_it(tokenizer: TRIE_TOKENIZER):
 def test_build_document_from_record_ignores_template_text(tokenizer: TRIE_TOKENIZER):
     record = {"messages": [{"role": "assistant", "content": "answer"}]}
     encoded = build_document_from_record(record, tokenizer=tokenizer, template="manually different")
-    assert masked_text(tokenizer, encoded) == "answer"
+    assert masked_text(tokenizer, encoded) == "answer<|im_end|><|endoftext|>"
+
+
+def test_build_document_from_record_without_assistant_keeps_eod_masked(tokenizer: TRIE_TOKENIZER):
+    record = {"messages": [{"role": "user", "content": "question"}]}
+    encoded = build_document_from_record(record, tokenizer=tokenizer, template="unused")
+    assert encoded.loss_mask[-1] == 0
 
 
 def test_load_helpers_and_shuffle(tmp_path):
@@ -448,7 +526,7 @@ def test_build_binidx_dataset_writes_token_and_mask_sidecar(tmp_path):
     assert len(tokens) == len(mask)
     assert sum(mask) > 0
     assert tokens[-1] == 65532
-    assert mask[-1] == 0
+    assert mask[-1] == 1
 
 
 def test_build_binidx_dataset_shuffles_epochs_deterministically(tmp_path):
@@ -578,4 +656,5 @@ def test_tools_jsonl_smoke_still_only_trains_last_assistant_if_available(
         for message in reversed(record["messages"])
         if message["role"] == "assistant"
     )
-    assert trainable_text == last_assistant
+    assert trainable_text.startswith(last_assistant)
+    assert trainable_text.endswith("<|im_end|><|endoftext|>")

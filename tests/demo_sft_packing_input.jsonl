@@ -1,0 +1,2 @@
+{"messages":[{"role":"user","content":"请回答 1+1"},{"role":"assistant","content":"1+1=2。"}]}
+{"messages":[{"role":"user","content":"请回答 2+2"},{"role":"assistant","content":"2+2=4。"}]}

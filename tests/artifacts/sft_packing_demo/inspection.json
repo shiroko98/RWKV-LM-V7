@@ -1,0 +1,33 @@
+{
+  "length": 128,
+  "trainable_count": 16,
+  "decoded_prefix": "<|im_start|>System: You are a helpful assistant. Your name is xiaoke and is built by CETC.<|im_end|>\n<|im_start|>User: 请回答 1+1<|im_end|>\n<|im_start|>Assistant: 1+1=2。<|im_end|><|endoftext|><|im_start|>System: You are a helpful assistant. Your name is xiaoke and is built by CETC.<|im_end|>\n<|im_start",
+  "trainable_text": "1+1=2。<|im_end|><|endoftext|>2+2=4。<|im_end|><|endoftext|>",
+  "learned_eod_positions": [
+    49,
+    99
+  ],
+  "padded_eod_positions_head": [
+    100,
+    101,
+    102,
+    103,
+    104,
+    105,
+    106,
+    107,
+    108,
+    109,
+    110,
+    111,
+    112,
+    113,
+    114,
+    115,
+    116,
+    117,
+    118,
+    119
+  ],
+  "padded_eod_count": 28
+}

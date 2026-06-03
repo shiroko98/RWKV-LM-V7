@@ -641,6 +641,29 @@ def test_build_binidx_dataset_packs_to_fixed_length_and_masks_padding_eod(tmp_pa
     assert len(padded_eod_positions) >= 1
 
 
+def test_packing_keeps_exactly_one_trainable_eod_between_samples(tokenizer: TRIE_TOKENIZER):
+    eod_id = eod_token_id(tokenizer)
+    packed = list(
+        pack_encoded_documents(
+            [
+                EncodedDocument(input_ids=[101, 102, eod_id], loss_mask=[1, 1, 1]),
+                EncodedDocument(input_ids=[201, 202, eod_id], loss_mask=[1, 1, 1]),
+            ],
+            pack_length=7,
+            pad_token_id=eod_id,
+        )
+    )
+    assert len(packed) == 1
+    assert packed[0].input_ids == [101, 102, eod_id, 201, 202, eod_id, eod_id]
+    assert packed[0].loss_mask == [1, 1, 1, 1, 1, 1, 0]
+    assert packed[0].input_ids[2] == eod_id
+    assert packed[0].input_ids[5] == eod_id
+    assert packed[0].input_ids[6] == eod_id
+    assert packed[0].loss_mask[2] == 1
+    assert packed[0].loss_mask[5] == 1
+    assert packed[0].loss_mask[6] == 0
+
+
 def test_build_binidx_dataset_shuffles_epochs_deterministically(tmp_path):
     input_path = tmp_path / "sample.jsonl"
     records = [

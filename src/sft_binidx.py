@@ -68,6 +68,13 @@ class EncodedDocument:
     loss_mask: list[int]
 
 
+def eod_token_id(tokenizer: TRIE_TOKENIZER) -> int:
+    token_ids = tokenizer.encode(EOD_TOKEN)
+    if len(token_ids) != 1:
+        raise ValueError(f"{EOD_TOKEN} must encode to exactly one token for packing.")
+    return token_ids[0]
+
+
 def default_system_message() -> str:
     return "You are a helpful assistant. Your name is xiaoke and is built by CETC."
 
@@ -374,6 +381,43 @@ def build_document_from_record(
     )
 
 
+def pack_encoded_documents(
+    documents: Iterable[EncodedDocument],
+    *,
+    pack_length: int,
+    pad_token_id: int,
+) -> Iterable[EncodedDocument]:
+    if pack_length <= 0:
+        raise ValueError("pack_length must be a positive integer.")
+
+    packed_ids: list[int] = []
+    packed_mask: list[int] = []
+
+    for document in documents:
+        if len(document.input_ids) != len(document.loss_mask):
+            raise ValueError("Token ids and loss mask must have identical lengths.")
+
+        offset = 0
+        while offset < len(document.input_ids):
+            remaining = pack_length - len(packed_ids)
+            take = min(remaining, len(document.input_ids) - offset)
+            next_offset = offset + take
+            packed_ids.extend(document.input_ids[offset:next_offset])
+            packed_mask.extend(document.loss_mask[offset:next_offset])
+            offset = next_offset
+
+            if len(packed_ids) == pack_length:
+                yield EncodedDocument(input_ids=packed_ids, loss_mask=packed_mask)
+                packed_ids = []
+                packed_mask = []
+
+    if packed_ids:
+        padding = pack_length - len(packed_ids)
+        packed_ids.extend([pad_token_id] * padding)
+        packed_mask.extend([0] * padding)
+        yield EncodedDocument(input_ids=packed_ids, loss_mask=packed_mask)
+
+
 def load_chat_template(template_path: str):
     return Path(template_path).read_text(encoding="utf-8")
 
@@ -442,6 +486,7 @@ def build_binidx_dataset(
     template_path: str,
     n_epoch: int,
     seed: int,
+    pack_length: int | None = None,
     add_generation_prompt: bool = False,
     enable_thinking: bool = False,
     current_date: str | None = None,
@@ -454,23 +499,29 @@ def build_binidx_dataset(
     shuffled_lines = shuffled_epoch_lines(lines, n_epoch, rng)
     prefix = output_prefix or default_output_prefix(input_jsonl)
 
-    documents: list[EncodedDocument] = []
-    for line in shuffled_lines:
-        record = json.loads(line)
-        documents.append(
-            build_document_from_record(
-                record,
-                tokenizer=tokenizer,
-                template=template,
-                add_generation_prompt=add_generation_prompt,
-                enable_thinking=enable_thinking,
-                current_date=current_date,
-                current_location=current_location,
-            )
+    documents = (
+        build_document_from_record(
+            json.loads(line),
+            tokenizer=tokenizer,
+            template=template,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+            current_date=current_date,
+            current_location=current_location,
+        )
+        for line in shuffled_lines
+    )
+    if pack_length is not None:
+        documents = pack_encoded_documents(
+            documents,
+            pack_length=pack_length,
+            pad_token_id=eod_token_id(tokenizer),
         )
 
     stats = write_documents(prefix, documents)
     stats["output_prefix"] = prefix
     stats["source_lines"] = len(lines)
+    stats["source_documents"] = len(shuffled_lines)
     stats["epochs"] = n_epoch
+    stats["pack_length"] = pack_length
     return stats

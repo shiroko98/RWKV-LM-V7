@@ -47,6 +47,20 @@ Validation completed
 - `conda run -n model pytest -q tests\test_sft_binidx.py --cov=src.sft_binidx --cov=data.tokenizer.rwkv_tokenizer --cov=data.make_sft_binidx --cov-report=term-missing` -> 99% total coverage
 - `conda run -n model pytest -q` -> 72 passed
 
+2026-06-03 packing and padding follow-up
+- Extended SFT preprocessing to support fixed-length packing at data-build time.
+- Added `--pack-length` to `data/make_sft_binidx.py`.
+- Packing behavior:
+- each source sample is still rendered independently and ends with one appended `EOD` from preprocessing, and that `EOD` is trainable.
+- packed sequences are formed by concatenating encoded samples into fixed-length chunks.
+- if the final packed chunk is shorter than `pack_length`, it is padded using `EOD` token ids.
+- padding `EOD` tokens always have loss mask `0`, so only the first `EOD` that terminates a real sample is trained.
+- Updated `data/SFT/stf_template_example.txt` to include the sample-final `EOD`, reflecting the new data-processing-stage append rule instead of putting it in `chat_template.jinja`.
+- Validation after packing support:
+- `conda run -n model pytest -q tests\test_sft_binidx.py` -> 40 passed
+- `conda run -n model pytest -q tests\test_sft_binidx.py --cov=src.sft_binidx --cov=data.tokenizer.rwkv_tokenizer --cov=data.make_sft_binidx --cov-report=term-missing` -> 99% total coverage
+- `conda run -n model pytest -q` -> 76 passed
+
 Next recommended work
 - Wire the mask sidecar into the training dataloader so SFT can reuse the existing binidx data path.
 - Add masked loss handling in the model/training step while preserving the current pretrain fast path.

@@ -29,4 +29,4 @@ When making tool calls, use XML format to invoke tools and pass parameters:
 <|im_start|>Tool: 
 <response name="get_weather">{"city":"上海","date":"2026-06-03","weather":"多云","temperature_c":28,"humidity":72,"wind":"东南风 3 级"}</response>
 <response name="get_air_quality">{"city":"上海","date":"2026-06-03","aqi":45,"level":"优","main_pollutant":"无"}</response><|im_end|>
-<|im_start|>Assistant: 上海今天多云，约 28°C，湿度 72%，东南风 3 级；空气质量为优，AQI 45。整体适合晚上跑步，建议避开闷热时段，控制强度并注意补水。<|im_end|>
+<|im_start|>Assistant: 上海今天多云，约 28°C，湿度 72%，东南风 3 级；空气质量为优，AQI 45。整体适合晚上跑步，建议避开闷热时段，控制强度并注意补水。<|im_end|><|endoftext|>

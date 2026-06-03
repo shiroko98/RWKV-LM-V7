@@ -26,6 +26,7 @@ from src.sft_binidx import (
     build_template_segments,
     data_file_path,
     default_output_prefix,
+    eod_token_id,
     encode_segments,
     index_file_path,
     last_assistant_content_index,
@@ -33,6 +34,7 @@ from src.sft_binidx import (
     load_non_empty_lines,
     mask_file_path,
     mask_prefix_path,
+    pack_encoded_documents,
     parse_tool_arguments,
     render_chat_template,
     render_tool_calls,
@@ -261,7 +263,7 @@ def test_build_template_segments_matches_origin_example(example_record):
     segments = build_template_segments(example_record["messages"], tools=example_record["tools"])
     rendered = "".join(segment.text for segment in segments)
     expected = TEMPLATE_EXAMPLE.read_text(encoding="utf-8").rstrip("\n")
-    assert rendered == expected
+    assert rendered + EOD_TOKEN == expected
 
     trainable_texts = [segment.text for segment in segments if segment.trainable]
     assert trainable_texts == [
@@ -359,7 +361,7 @@ def test_build_template_segments_without_thinking_prompt_and_unsupported_role():
 
 def test_render_chat_template_ignores_template_text_and_matches_example(example_record, chat_template):
     rendered = render_chat_template(chat_template, example_record["messages"], tools=example_record["tools"])
-    assert rendered == TEMPLATE_EXAMPLE.read_text(encoding="utf-8").rstrip("\n")
+    assert rendered + EOD_TOKEN == TEMPLATE_EXAMPLE.read_text(encoding="utf-8").rstrip("\n")
 
 
 def test_only_last_assistant_content_is_trainable(tokenizer: TRIE_TOKENIZER, chat_template: str):
@@ -390,7 +392,7 @@ def test_origin_example_only_trains_last_assistant_content(
 ):
     encoded = build_document_from_record(example_record, tokenizer=tokenizer, template=chat_template)
     trainable_text = masked_text(tokenizer, encoded)
-    assert tokenizer.decode(encoded.input_ids[:-1]) == TEMPLATE_EXAMPLE.read_text(encoding="utf-8").rstrip("\n")
+    assert tokenizer.decode(encoded.input_ids) == TEMPLATE_EXAMPLE.read_text(encoding="utf-8").rstrip("\n")
 
     assert trainable_text == example_record["messages"][-1]["content"] + "<|im_end|><|endoftext|>"
     assert "帮我查一下上海今天的天气" not in trainable_text
@@ -441,6 +443,52 @@ def test_encode_segments_appends_eod_and_can_skip_it(tokenizer: TRIE_TOKENIZER):
     no_eod = encode_segments(tokenizer, [Segment("abc", True)], append_eod=False)
     assert tokenizer.decode(no_eod.input_ids) == "abc"
     assert no_eod.loss_mask == [1] * len(no_eod.input_ids)
+
+
+def test_eod_token_id_returns_single_endoftext_token(tokenizer: TRIE_TOKENIZER):
+    assert eod_token_id(tokenizer) == tokenizer.token2idx[b"<|endoftext|>"]
+
+
+def test_pack_encoded_documents_pads_with_masked_eod(tokenizer: TRIE_TOKENIZER):
+    eod_id = eod_token_id(tokenizer)
+    packed = list(
+        pack_encoded_documents(
+            [
+                EncodedDocument(input_ids=[10, eod_id], loss_mask=[1, 1]),
+                EncodedDocument(input_ids=[11, eod_id], loss_mask=[1, 1]),
+            ],
+            pack_length=5,
+            pad_token_id=eod_id,
+        )
+    )
+    assert len(packed) == 1
+    assert packed[0].input_ids == [10, eod_id, 11, eod_id, eod_id]
+    assert packed[0].loss_mask == [1, 1, 1, 1, 0]
+
+
+def test_pack_encoded_documents_splits_long_stream_and_validates_lengths(tokenizer: TRIE_TOKENIZER):
+    eod_id = eod_token_id(tokenizer)
+    packed = list(
+        pack_encoded_documents(
+            [EncodedDocument(input_ids=[1, 2, 3, 4, eod_id], loss_mask=[1, 1, 1, 1, 1])],
+            pack_length=3,
+            pad_token_id=eod_id,
+        )
+    )
+    assert [doc.input_ids for doc in packed] == [[1, 2, 3], [4, eod_id, eod_id]]
+    assert [doc.loss_mask for doc in packed] == [[1, 1, 1], [1, 1, 0]]
+
+    with pytest.raises(ValueError, match="positive integer"):
+        list(pack_encoded_documents([], pack_length=0, pad_token_id=eod_id))
+
+    with pytest.raises(ValueError, match="identical lengths"):
+        list(
+            pack_encoded_documents(
+                [EncodedDocument(input_ids=[1, 2], loss_mask=[1])],
+                pack_length=2,
+                pad_token_id=eod_id,
+            )
+        )
 
 
 def test_build_document_from_record_ignores_template_text(tokenizer: TRIE_TOKENIZER):
@@ -536,12 +584,61 @@ def test_build_binidx_dataset_writes_token_and_mask_sidecar(tmp_path):
     mask = mask_ds[0].astype(int).tolist()
 
     assert stats["documents"] == 1
+    assert stats["source_documents"] == 1
     assert stats["source_lines"] == 1
     assert stats["epochs"] == 1
+    assert stats["pack_length"] is None
     assert len(tokens) == len(mask)
     assert sum(mask) > 0
     assert tokens[-1] == 65532
     assert mask[-1] == 1
+
+
+def test_build_binidx_dataset_packs_to_fixed_length_and_masks_padding_eod(tmp_path):
+    tokenizer = TRIE_TOKENIZER(str(VOCAB_PATH), strict_length=True)
+    input_path = tmp_path / "packed.jsonl"
+    records = [
+        {"messages": [{"role": "assistant", "content": "甲"}]},
+        {"messages": [{"role": "assistant", "content": "乙"}]},
+    ]
+    input_path.write_text(
+        "\n".join(
+            [json.dumps(record, ensure_ascii=False) for record in records]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output_prefix = str(tmp_path / "packed_fixed")
+    eod_id = eod_token_id(tokenizer)
+    source_documents = [
+        build_document_from_record(record, tokenizer=tokenizer, template=TEMPLATE_PATH.read_text(encoding="utf-8"))
+        for record in records
+    ]
+    pack_length = sum(len(document.input_ids) for document in source_documents) + 1
+
+    stats = build_binidx_dataset(
+        str(input_path),
+        output_prefix=output_prefix,
+        vocab_path=str(VOCAB_PATH),
+        template_path=str(TEMPLATE_PATH),
+        n_epoch=1,
+        seed=7,
+        pack_length=pack_length,
+    )
+
+    token_ds = MMapIndexedDataset(output_prefix)
+    mask_ds = MMapIndexedDataset(output_prefix + ".mask")
+    tokens = token_ds[0].astype(int).tolist()
+    mask = mask_ds[0].astype(int).tolist()
+    assert len(tokens) == pack_length
+    assert len(mask) == pack_length
+    assert stats["documents"] == 1
+    assert stats["source_documents"] == 2
+    assert stats["pack_length"] == pack_length
+    learned_eod_positions = [i for i, (token, keep) in enumerate(zip(tokens, mask)) if token == eod_id and keep == 1]
+    padded_eod_positions = [i for i, (token, keep) in enumerate(zip(tokens, mask)) if token == eod_id and keep == 0]
+    assert len(learned_eod_positions) == 2
+    assert len(padded_eod_positions) >= 1
 
 
 def test_build_binidx_dataset_shuffles_epochs_deterministically(tmp_path):
@@ -610,6 +707,8 @@ def test_cli_main_builds_dataset_and_accepts_flags(tmp_path):
                 "2026-06-03",
                 "--current-location",
                 "Shanghai, China",
+                "--pack-length",
+                "64",
                 "--add-generation-prompt",
                 "--enable-thinking",
             ]
@@ -640,6 +739,8 @@ def test_arg_parser_defaults_and_overrides():
             "2026-06-03",
             "--current-location",
             "Shanghai",
+            "--pack-length",
+            "64",
             "--add-generation-prompt",
             "--enable-thinking",
             "--n-epoch",
@@ -651,6 +752,7 @@ def test_arg_parser_defaults_and_overrides():
     assert overridden.out_prefix == "out"
     assert overridden.current_date == "2026-06-03"
     assert overridden.current_location == "Shanghai"
+    assert overridden.pack_length == 64
     assert overridden.add_generation_prompt is True
     assert overridden.enable_thinking is True
     assert overridden.n_epoch == 2

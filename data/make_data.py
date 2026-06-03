@@ -8,7 +8,10 @@ import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from tokenizer.rwkv_tokenizer import TRIE_TOKENIZER  # noqa: E402
+try:
+    from tokenizer.rwkv_tokenizer import TRIE_TOKENIZER  # noqa: E402
+except ModuleNotFoundError:
+    from data.tokenizer.rwkv_tokenizer import TRIE_TOKENIZER  # noqa: E402
 
 from src.binidx import MMapIndexedDataset  # noqa: E402
 

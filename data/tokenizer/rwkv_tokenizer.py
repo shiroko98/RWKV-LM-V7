@@ -2,6 +2,11 @@
 # The RWKV Language Model - https://github.com/BlinkDL/RWKV-LM
 ########################################################################################################
 
+from __future__ import annotations
+
+import ast
+import warnings
+
 class TRIE:
     __slots__ = tuple("ch,to,values,front".split(","))
     to: list
@@ -48,20 +53,51 @@ class TRIE:
         return ret
 
 
+def parse_vocab_line(line: str, *, strict_length: bool = False):
+    line = line.rstrip("\r\n")
+    first_space = line.index(" ")
+    last_space = line.rindex(" ")
+
+    idx = int(line[:first_space])
+    token_value = ast.literal_eval(line[first_space:last_space])
+    token_bytes = token_value.encode("utf-8") if isinstance(token_value, str) else token_value
+    if not isinstance(token_bytes, bytes):
+        raise TypeError(f"Unsupported token value type {type(token_bytes)!r} for vocab line: {line!r}")
+
+    declared_length = int(line[last_space + 1:].strip())
+    if strict_length and len(token_bytes) != declared_length:
+        raise ValueError(
+            f"Token length mismatch for vocab index {idx}: "
+            f"declared={declared_length}, actual={len(token_bytes)}, line={line!r}"
+        )
+
+    return idx, token_bytes, declared_length
+
+
 class TRIE_TOKENIZER():
-    def __init__(self, file_name):
+    def __init__(self, file_name, *, strict_length: bool = False):
         self.idx2token = {}
         sorted = []  # must be already sorted
+        mismatch_count = 0
         with open(file_name, "r", encoding="utf-8") as f:
             lines = f.readlines()
         for line in lines:
-            idx = int(line[:line.index(' ')])
-            x = eval(line[line.index(' '):line.rindex(' ')])
-            x = x.encode("utf-8") if isinstance(x, str) else x
-            assert isinstance(x, bytes)
-            assert len(x) == int(line[line.rindex(' '):])
-            sorted += [x]
-            self.idx2token[idx] = x
+            idx, token_bytes, declared_length = parse_vocab_line(
+                line,
+                strict_length=strict_length,
+            )
+            if len(token_bytes) != declared_length:
+                mismatch_count += 1
+            sorted += [token_bytes]
+            self.idx2token[idx] = token_bytes
+
+        if mismatch_count > 0:
+            warnings.warn(
+                f"Loaded {mismatch_count} vocab entries whose declared byte lengths did not "
+                "match the parsed token bytes. Continuing because strict_length=False.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         self.token2idx = {}
         for k, v in self.idx2token.items():

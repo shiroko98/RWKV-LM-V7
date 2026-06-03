@@ -5,8 +5,8 @@ This script compares:
 1. The reconstructed state_dict from the original DeepSpeed checkpoint directory
 2. The converted single-file `.pth` checkpoint
 
-It can also run a real forward pass using the model definition from `rwkv_v7_demo.py`
-to verify that both checkpoints produce numerically identical logits for the same prompt.
+It can also run a real forward pass using a demo-derived runtime module to
+verify that both checkpoints produce numerically identical logits for the same prompt.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
-import os
 import sys
 import types
 from collections import OrderedDict
@@ -48,8 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Device for the forward equivalence check")
     parser.add_argument("--max-abs-tol", type=float, default=0.0, help="Maximum allowed absolute difference for tensor equality")
     parser.add_argument("--max-rel-tol", type=float, default=0.0, help="Maximum allowed relative difference for tensor equality")
-    parser.add_argument("--demo-model-path", default="", help="Optional model path override for rwkv_v7_demo.py")
-    parser.add_argument("--demo-vocab-path", default="", help="Optional tokenizer vocab path override for rwkv_v7_demo.py")
+    parser.add_argument("--demo-model-path", default="", help="Deprecated compatibility flag. Ignored.")
+    parser.add_argument("--demo-vocab-path", default="", help="Optional tokenizer vocab path override for the demo-derived runtime")
     return parser.parse_args()
 
 
@@ -126,14 +125,11 @@ def compare_state_dicts(
 
 
 def load_demo_module():
-    demo_path = REPO_ROOT / "rwkv_v7_demo.py"
-    source = demo_path.read_text(encoding="utf-8")
-    source = source.replace('tokenizer = RWKV_TOKENIZER("rwkv_vocab_v20230424.txt")', "tokenizer = None")
-    source = source.replace("model_params = torch.load(MODEL_PATH, map_location=\"cpu\")", "model_params = None")
-    source = source.replace("with torch.no_grad():", "if False:")
-    module = types.ModuleType("rwkv_v7_demo_runtime")
-    module.__file__ = str(demo_path)
-    exec(compile(source, str(demo_path), "exec"), module.__dict__)
+    runtime_path = REPO_ROOT / "src" / "rwkv_v7_demo_runtime.py"
+    spec = importlib.util.spec_from_file_location("rwkv_v7_demo_runtime", runtime_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
     return module
 
 
@@ -158,11 +154,14 @@ def infer_demo_dims_from_state_dict(state_dict: "OrderedDict[str, torch.Tensor]"
 
 def build_demo_model(module, state_dict: "OrderedDict[str, torch.Tensor]", device: str, dtype: torch.dtype):
     dims = infer_demo_dims_from_state_dict(state_dict)
-    module.D_DECAY_LORA = dims["d_decay_lora"]
-    module.D_AAA_LORA = dims["d_aaa_lora"]
-    module.D_MV_LORA = dims["d_mv_lora"]
-    module.D_GATE_LORA = dims["d_gate_lora"]
-    module.DTYPE = dtype
+    module.configure_runtime(
+        dtype=dtype,
+        head_size=64,
+        d_decay_lora=dims["d_decay_lora"],
+        d_aaa_lora=dims["d_aaa_lora"],
+        d_mv_lora=dims["d_mv_lora"],
+        d_gate_lora=dims["d_gate_lora"],
+    )
 
     args = types.SimpleNamespace()
     args.n_layer = dims["n_layer"]

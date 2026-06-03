@@ -74,3 +74,13 @@ def test_compare_state_dicts_rejects_key_mismatch():
 
     with pytest.raises(ValueError, match="State dict keys differ"):
         equiv_script.compare_state_dicts(lhs, rhs, max_abs_tol=0.0, max_rel_tol=0.0)
+
+
+def test_load_demo_module_uses_repo_runtime_module():
+    module = equiv_script.load_demo_module()
+
+    assert module.__name__ == "rwkv_v7_demo_runtime"
+    assert Path(module.__file__).name == "rwkv_v7_demo_runtime.py"
+    assert hasattr(module, "configure_runtime")
+    assert hasattr(module, "RWKV")
+    assert hasattr(module, "RWKV_TOKENIZER")

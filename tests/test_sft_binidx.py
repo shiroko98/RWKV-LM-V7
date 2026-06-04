@@ -68,7 +68,6 @@ from src.sft_binidx import (
 
 VOCAB_PATH = ROOT / "rwkv_vocab_v20260603.txt"
 TEMPLATE_PATH = ROOT / "data" / "SFT" / "sample" / "chat_template.jinja"
-OLD_TEMPLATE_PATH = ROOT / "chat_template.jinja"
 TOOLS_JSONL = ROOT / "data" / "SFT" / "tools.jsonl"
 MY_SAMPLE_PATH = ROOT / "data" / "SFT" / "sample" / "my_sample.jsonl"
 MY_SAMPLE_OUTPUT = ROOT / "data" / "SFT" / "sample" / "my_sample_outs.txt"
@@ -1055,9 +1054,3 @@ def test_tools_jsonl_smoke_still_only_trains_last_assistant_if_available(
         assert last_assistant.strip() in trainable_text
     else:
         assert "<tool_call>" in trainable_text
-
-
-def test_root_template_is_synced_with_authoritative_sample_template():
-    old_template = OLD_TEMPLATE_PATH.read_text(encoding="utf-8")
-    new_template = TEMPLATE_PATH.read_text(encoding="utf-8")
-    assert old_template == new_template

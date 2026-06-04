@@ -174,7 +174,7 @@ Checkpoint before coding
 
 2026-06-04 template-aligned SFT preprocessing checkpoint
 - Rewrote `src/sft_binidx.py` around real Jinja rendering from `data/SFT/sample/chat_template.jinja`.
-- Synced the root chat template to the authoritative sample template and pointed the CLI default at that template path.
+- Left the root chat template unchanged and pointed the CLI default at the authoritative sample template path.
 - Added final-assistant think normalization, render-twice mask derivation, token-level mask projection, packed-sample separator handling, and masked tail padding.
 - Kept the existing token dataset plus mask sidecar file format so the next step can wire SFT into the current binidx training path.
 - Validation completed:

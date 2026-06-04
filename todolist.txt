@@ -171,3 +171,14 @@ Checkpoint before coding
 - The final assistant terminator of each real sample must be fully trainable:
 - `<|im_end|>\n<|endoftext|>`
 - That means the last assistant closing `IM_END` and the sample-final `EOD` are both `mask=1`.
+
+2026-06-04 template-aligned SFT preprocessing checkpoint
+- Rewrote `src/sft_binidx.py` around real Jinja rendering from `data/SFT/sample/chat_template.jinja`.
+- Synced the root chat template to the authoritative sample template and pointed the CLI default at that template path.
+- Added final-assistant think normalization, render-twice mask derivation, token-level mask projection, packed-sample separator handling, and masked tail padding.
+- Kept the existing token dataset plus mask sidecar file format so the next step can wire SFT into the current binidx training path.
+- Validation completed:
+- `conda run -n model pytest -q tests\test_sft_binidx.py --tb=short` -> 50 passed before coverage-only branch tests were added.
+- `conda run -n model pytest -q tests\test_sft_binidx.py --cov=src.sft_binidx --cov=data.make_sft_binidx --cov-report=term-missing --tb=short` -> 56 passed, modified preprocessing surface 99% total coverage.
+- `conda run -n model pytest -q --tb=short` -> 92 passed.
+- Next recommended work remains training-side integration: dataset mask loading, optional SFT mode, and masked loss while preserving the pretrain fast path.

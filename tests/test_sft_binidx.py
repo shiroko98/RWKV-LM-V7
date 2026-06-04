@@ -1,4 +1,5 @@
 import io
+import copy
 import json
 import random
 import warnings
@@ -17,23 +18,41 @@ from data.make_sft_binidx import build_arg_parser, main as make_sft_binidx_main
 from data.tokenizer.rwkv_tokenizer import TRIE, TRIE_TOKENIZER, parse_vocab_line
 from src.binidx import MMapIndexedDataset
 from src.sft_binidx import (
+    ASSISTANT_PREFIX,
     EOD_TOKEN,
     EncodedDocument,
+    IM_START_TOKEN,
+    NO_THINKING_PREFIX,
     Segment,
+    _assistant_has_existing_think,
+    _build_jinja_env,
+    _char_mask_from_span,
+    _compute_trainable_span,
+    _encode_separator,
+    _loss_mask_from_char_mask,
+    _messages_before_last_assistant,
+    _messages_with_normalized_final_assistant,
+    _prepare_render_inputs,
+    _render_prefix_and_full,
+    _tokenize_with_char_spans,
     build_binidx_dataset,
     build_document_from_record,
     build_system_text,
     build_template_segments,
+    compile_chat_template,
     data_file_path,
     default_output_prefix,
     eod_token_id,
     encode_segments,
     index_file_path,
     last_assistant_content_index,
+    last_assistant_message,
     load_chat_template,
     load_non_empty_lines,
     mask_file_path,
     mask_prefix_path,
+    normalize_tool_calls,
+    normalize_record,
     pack_encoded_documents,
     parse_tool_arguments,
     render_chat_template,
@@ -48,11 +67,45 @@ from src.sft_binidx import (
 
 
 VOCAB_PATH = ROOT / "rwkv_vocab_v20260603.txt"
-TEMPLATE_PATH = ROOT / "chat_template.jinja"
+TEMPLATE_PATH = ROOT / "data" / "SFT" / "sample" / "chat_template.jinja"
+OLD_TEMPLATE_PATH = ROOT / "chat_template.jinja"
 TOOLS_JSONL = ROOT / "data" / "SFT" / "tools.jsonl"
-ORIGIN_EXAMPLE = ROOT / "data" / "SFT" / "stf_origin_example.jsonl"
-TEMPLATE_EXAMPLE = ROOT / "data" / "SFT" / "stf_template_example.txt"
+MY_SAMPLE_PATH = ROOT / "data" / "SFT" / "sample" / "my_sample.jsonl"
+MY_SAMPLE_OUTPUT = ROOT / "data" / "SFT" / "sample" / "my_sample_outs.txt"
+THINK_SAMPLE_PATH = ROOT / "data" / "SFT" / "sample" / "think.jsonl"
+THINK_SAMPLE_OUTPUT = ROOT / "data" / "SFT" / "sample" / "think_out.txt"
+FINAL_PATTERN_PATH = ROOT / "data" / "SFT" / "sample" / "final_pattern.txt"
 OLD_VOCAB_PATH = ROOT / "data" / "tokenizer" / "rwkv_vocab_v20230424.txt"
+
+
+def read_text_auto(path: Path) -> str:
+    raw = path.read_bytes()
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        text = raw.decode("utf-16")
+    else:
+        text = raw.decode("utf-8")
+    return text.replace("\r\n", "\n")
+
+
+def final_pattern_chunks() -> tuple[str, str, int]:
+    text = read_text_auto(FINAL_PATTERN_PATH)
+    pad_marker = EOD_TOKEN
+    pad_count = 0
+    while text.endswith(pad_marker):
+        pad_count += 1
+        text = text[: -len(pad_marker)]
+
+    boundary = EOD_TOKEN + "\n"
+    first, second = text.split(boundary, 1)
+    return first + EOD_TOKEN, second, pad_count
+
+
+def final_pattern_records() -> tuple[dict, dict]:
+    no_think_record = json.loads(MY_SAMPLE_PATH.read_text(encoding="utf-8").splitlines()[0])
+    think_source = json.loads(THINK_SAMPLE_PATH.read_text(encoding="utf-8").splitlines()[0])
+    think_record = copy.deepcopy(no_think_record)
+    think_record["messages"][-1]["content"] = think_source["messages"][-1]["content"]
+    return think_record, no_think_record
 
 
 @pytest.fixture(scope="module")
@@ -62,12 +115,17 @@ def tokenizer():
 
 @pytest.fixture(scope="module")
 def chat_template():
-    return TEMPLATE_PATH.read_text(encoding="utf-8")
+    return load_chat_template(str(TEMPLATE_PATH))
 
 
 @pytest.fixture(scope="module")
-def example_record():
-    return json.loads(ORIGIN_EXAMPLE.read_text(encoding="utf-8"))
+def my_sample_record():
+    return json.loads(MY_SAMPLE_PATH.read_text(encoding="utf-8").splitlines()[0])
+
+
+@pytest.fixture(scope="module")
+def think_sample_record():
+    return json.loads(THINK_SAMPLE_PATH.read_text(encoding="utf-8").splitlines()[0])
 
 
 def masked_text(tokenizer: TRIE_TOKENIZER, encoded: EncodedDocument) -> str:
@@ -185,6 +243,26 @@ def test_parse_tool_arguments_supports_json_xml_empty_and_passthrough():
     assert parse_tool_arguments(None) == {}
 
 
+def test_normalize_tool_calls_accepts_empty_input():
+    assert normalize_tool_calls(None) is None
+    assert normalize_tool_calls([]) == []
+
+
+def test_normalize_record_converts_json_tool_call_arguments():
+    record = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"function": {"name": "demo", "arguments": '{"city":"上海"}'}}],
+            }
+        ]
+    }
+    normalized = normalize_record(record)
+    assert normalized["messages"][0]["tool_calls"][0]["function"]["arguments"] == {"city": "上海"}
+    assert record["messages"][0]["tool_calls"][0]["function"]["arguments"] == '{"city":"上海"}'
+
+
 def test_render_tool_schema_and_calls_match_expected_xml_shape():
     tools = [
         {
@@ -197,7 +275,7 @@ def test_render_tool_schema_and_calls_match_expected_xml_shape():
     ]
     schema = render_tool_schema(tools)
     assert schema.startswith("<tools>\n<tool>{")
-    assert '"name":"get_weather"' in schema
+    assert '"name": "get_weather"' in schema
     assert schema.endswith("</tools>")
 
     tool_calls = [
@@ -257,22 +335,62 @@ def test_split_system_and_conversation_and_last_assistant_index():
     ]
     assert last_assistant_content_index(rest) == 1
     assert last_assistant_content_index([{"role": "user", "content": "u"}]) is None
+    assert last_assistant_message(rest) == {"role": "assistant", "content": "a"}
 
 
-def test_build_template_segments_matches_origin_example(example_record):
-    segments = build_template_segments(example_record["messages"], tools=example_record["tools"])
-    rendered = "".join(segment.text for segment in segments)
-    expected = TEMPLATE_EXAMPLE.read_text(encoding="utf-8").rstrip("\n")
-    assert rendered + EOD_TOKEN == expected
-
-    trainable_texts = [segment.text for segment in segments if segment.trainable]
-    assert trainable_texts == [
-        "上海今天多云，约 28°C，湿度 72%，东南风 3 级；空气质量为优，AQI 45。整体适合晚上跑步，建议避开闷热时段，控制强度并注意补水。",
-        "<|im_end|>",
+def test_helper_functions_for_think_detection_and_message_slicing():
+    messages = [
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "final"},
     ]
+    assert _assistant_has_existing_think("<think>\nfoo\n</think>\nbar") is True
+    assert _assistant_has_existing_think("only </think>") is True
+    assert _assistant_has_existing_think("plain") is False
+    assert _messages_before_last_assistant(messages) == messages[:-1]
+    no_assistant = [{"role": "user", "content": "u"}]
+    assert _messages_before_last_assistant(no_assistant) == no_assistant
+    assert _messages_with_normalized_final_assistant(no_assistant) == no_assistant
+    assert last_assistant_message(no_assistant) is None
+
+    normalized = _messages_with_normalized_final_assistant(messages)
+    assert normalized[-1]["content"] == NO_THINKING_PREFIX + "final"
+
+    keep_existing = _messages_with_normalized_final_assistant(
+        [{"role": "assistant", "content": "<think>\nfoo\n</think>\nbar"}]
+    )
+    assert keep_existing[0]["content"] == "<think>\nfoo\n</think>\nbar"
 
 
-def test_build_template_segments_marks_only_last_assistant_content():
+def test_prepare_render_inputs_injects_system_message_when_overrides_provided():
+    messages, tools = _prepare_render_inputs(
+        {"messages": [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]},
+        current_date="2026-06-03",
+        current_location="Shanghai, China",
+    )
+    assert tools is None
+    assert messages[0]["role"] == "system"
+    assert messages[0]["current_date"] == "2026-06-03"
+    assert messages[0]["current_location"] == "Shanghai, China"
+
+
+def test_prepare_render_inputs_overrides_existing_system_message():
+    messages, _ = _prepare_render_inputs(
+        {
+            "messages": [
+                {"role": "system", "content": "base"},
+                {"role": "assistant", "content": "a"},
+            ]
+        },
+        current_date="2026-06-04",
+    )
+    assert messages[0]["role"] == "system"
+    assert messages[0]["content"] == "base"
+    assert messages[0]["current_date"] == "2026-06-04"
+
+
+def test_build_template_segments_keeps_legacy_segment_shape_for_unit_checks():
     segments = build_template_segments(
         [
             {"role": "user", "content": "u"},
@@ -282,9 +400,7 @@ def test_build_template_segments_marks_only_last_assistant_content():
     )
     assert [segment.text for segment in segments if segment.trainable] == ["a2", "<|im_end|>"]
 
-
-def test_build_template_segments_trains_last_assistant_tool_calls_and_end():
-    segments = build_template_segments(
+    tool_segments = build_template_segments(
         [
             {"role": "user", "content": "u"},
             {
@@ -294,141 +410,182 @@ def test_build_template_segments_trains_last_assistant_tool_calls_and_end():
             },
         ]
     )
-    trainable_texts = [segment.text for segment in segments if segment.trainable]
-    assert trainable_texts == [
+    assert [segment.text for segment in tool_segments if segment.trainable] == [
         "\n",
         "<tool_call>\n<invoke name=\"demo\"><parameter name=\"city\">上海</parameter></invoke>\n</tool_call>",
         "<|im_end|>",
     ]
 
 
-def test_build_template_segments_masks_non_final_assistant_tool_calls():
+def test_build_template_segments_covers_tools_dates_and_tool_result_branch():
     segments = build_template_segments(
         [
+            {"role": "system", "content": "base"},
+            {"role": "user", "content": "u"},
+            {"role": "tool", "name": "demo", "content": "result"},
+            {"role": "assistant", "content": "a\n"},
             {
                 "role": "assistant",
-                "content": "",
-                "tool_calls": [{"function": {"name": "demo", "arguments": {"city": "上海"}}}],
+                "content": "calls\n",
+                "tool_calls": [{"function": {"name": "demo", "arguments": {"x": 1}}}],
             },
-            {"role": "assistant", "content": "final"},
-        ]
-    )
-    assert "<tool_call>\n<invoke name=\"demo\"><parameter name=\"city\">上海</parameter></invoke>\n</tool_call>" in [
-        segment.text for segment in segments
-    ]
-    assert all(
-        not segment.trainable
-        for segment in segments
-        if "demo" in segment.text or segment.text == "\n"
-    )
-
-
-def test_build_template_segments_supports_generation_prompt_and_tool_runs():
-    segments = build_template_segments(
-        [
-            {"role": "user", "content": "question"},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{"function": {"name": "demo", "arguments": {"city": "上海"}}}],
-            },
-            {"role": "tool", "name": "demo", "content": [{"type": "text", "text": "tool output"}]},
         ],
         tools=[{"function": {"name": "demo", "parameters": {"type": "object"}}}],
+        current_date="2026-06-04",
+        current_location="Beijing, China",
+    )
+    rendered = "".join(segment.text for segment in segments)
+    assert "Current date: 2026-06-04" in rendered
+    assert "Current location: Beijing, China" in rendered
+    assert "<tools>" in rendered
+    assert "<response name=\"demo\">" in rendered
+    assert "calls\n<tool_call>" in rendered
+
+
+def test_build_template_segments_supports_generation_prompt_and_errors():
+    segments = build_template_segments(
+        [{"role": "user", "content": "q"}],
+        add_generation_prompt=True,
+        enable_thinking=False,
+        no_add_thinking=False,
+    )
+    assert "".join(segment.text for segment in segments).endswith(
+        f"{IM_START_TOKEN}Assistant: {NO_THINKING_PREFIX}"
+    )
+
+    segments_no_think = build_template_segments(
+        [{"role": "user", "content": "q"}],
+        add_generation_prompt=True,
+        no_add_thinking=True,
+    )
+    assert "".join(segment.text for segment in segments_no_think).endswith(f"{IM_START_TOKEN}Assistant: ")
+
+    segments_open_think = build_template_segments(
+        [{"role": "user", "content": "q"}],
         add_generation_prompt=True,
         enable_thinking=True,
     )
-    rendered = "".join(segment.text for segment in segments)
-    assert rendered.endswith("<|im_start|>Assistant: <think>")
-    assert "<|im_start|>Tool: " in rendered
-    assert "<response name=\"demo\">tool output\n</response><|im_end|>\n" in rendered
-
-
-def test_build_template_segments_without_thinking_prompt_and_unsupported_role():
-    rendered = "".join(
-        segment.text
-        for segment in build_template_segments(
-            [{"role": "user", "content": "q"}],
-            add_generation_prompt=True,
-            enable_thinking=False,
-        )
-    )
-    assert rendered.endswith("<|im_start|>Assistant: <think>\n</think>")
+    assert "".join(segment.text for segment in segments_open_think).endswith(f"{IM_START_TOKEN}Assistant: <think>\n")
 
     with pytest.raises(ValueError, match="Unsupported role"):
         build_template_segments([{"role": "developer", "content": "x"}])
 
 
-def test_render_chat_template_ignores_template_text_and_matches_example(example_record, chat_template):
-    rendered = render_chat_template(chat_template, example_record["messages"], tools=example_record["tools"])
-    assert rendered + EOD_TOKEN == TEMPLATE_EXAMPLE.read_text(encoding="utf-8").rstrip("\n")
-
-
-def test_only_last_assistant_content_is_trainable(tokenizer: TRIE_TOKENIZER, chat_template: str):
-    record = {
-        "messages": [
-            {"role": "user", "content": "第一问"},
-            {"role": "assistant", "content": "第一答"},
-            {"role": "tool", "content": "{\"ok\":true}", "name": "demo_tool"},
-            {"role": "assistant", "content": "最后答案"},
-        ]
-    }
-
-    rendered = render_chat_template(chat_template, record["messages"])
-    encoded = build_document_from_record(record, tokenizer=tokenizer, template=chat_template)
-    assert tokenizer.decode(encoded.input_ids[:-1]) == rendered
-
-    trainable_text = masked_text(tokenizer, encoded)
-    assert trainable_text == "最后答案<|im_end|><|endoftext|>"
-    assert "<|im_start|>Assistant: " not in trainable_text
-    assert "<tool_call>" not in trainable_text
-    assert encoded.loss_mask[-1] == 1
-
-
-def test_origin_example_only_trains_last_assistant_content(
-    tokenizer: TRIE_TOKENIZER,
-    chat_template: str,
-    example_record: dict,
-):
-    encoded = build_document_from_record(example_record, tokenizer=tokenizer, template=chat_template)
-    trainable_text = masked_text(tokenizer, encoded)
-    assert tokenizer.decode(encoded.input_ids) == TEMPLATE_EXAMPLE.read_text(encoding="utf-8").rstrip("\n")
-
-    assert trainable_text == example_record["messages"][-1]["content"] + "<|im_end|><|endoftext|>"
-    assert "帮我查一下上海今天的天气" not in trainable_text
-    assert "get_weather" not in trainable_text
-    assert EOD_TOKEN in trainable_text
-
-
-def test_last_assistant_tool_calls_are_trainable_even_with_empty_content(
-    tokenizer: TRIE_TOKENIZER,
-    chat_template: str,
-):
-    record = {
-        "messages": [
-            {"role": "user", "content": "查天气"},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "function": {
-                            "name": "get_weather",
-                            "arguments": {"city": "上海"},
-                        }
-                    }
-                ],
-            },
-        ]
-    }
-    encoded = build_document_from_record(record, tokenizer=tokenizer, template=chat_template)
-    trainable_text = masked_text(tokenizer, encoded)
-    assert trainable_text == (
-        "\n"
-        "<tool_call>\n"
-        "<invoke name=\"get_weather\"><parameter name=\"city\">上海</parameter></invoke>\n"
-        "</tool_call><|im_end|><|endoftext|>"
+def test_render_chat_template_matches_my_sample_golden(chat_template, my_sample_record):
+    rendered = render_chat_template(
+        chat_template,
+        normalize_record(my_sample_record)["messages"],
+        tools=my_sample_record["tools"],
+        no_add_thinking=False,
     )
+    assert rendered == read_text_auto(MY_SAMPLE_OUTPUT)
+
+
+def test_render_chat_template_matches_think_golden(chat_template, think_sample_record):
+    rendered = render_chat_template(
+        chat_template,
+        normalize_record(think_sample_record)["messages"],
+        tools=think_sample_record.get("tools"),
+        no_add_thinking=True,
+    )
+    assert rendered == read_text_auto(THINK_SAMPLE_OUTPUT)
+
+
+def test_render_chat_template_supports_generation_prompt_variants(chat_template):
+    rendered_with_added_think = render_chat_template(
+        chat_template,
+        [{"role": "user", "content": "q"}],
+        add_generation_prompt=True,
+        enable_thinking=False,
+        no_add_thinking=False,
+    )
+    assert rendered_with_added_think.endswith(f"{IM_START_TOKEN}Assistant: {NO_THINKING_PREFIX}")
+
+    rendered_without_added_think = render_chat_template(
+        chat_template,
+        [{"role": "user", "content": "q"}],
+        add_generation_prompt=True,
+        enable_thinking=False,
+        no_add_thinking=True,
+    )
+    assert rendered_without_added_think.endswith(f"{IM_START_TOKEN}Assistant: ")
+
+    rendered_with_open_think = render_chat_template(
+        chat_template,
+        [{"role": "user", "content": "q"}],
+        add_generation_prompt=True,
+        enable_thinking=True,
+    )
+    assert rendered_with_open_think.endswith(f"{IM_START_TOKEN}Assistant: <think>\n")
+
+
+def test_render_prefix_and_full_no_think_sample(chat_template, my_sample_record):
+    prefix_text, full_text = _render_prefix_and_full(my_sample_record, template=chat_template)
+    _, expected_no_think_text, _ = final_pattern_chunks()
+    assert prefix_text.endswith(f"{IM_START_TOKEN}Assistant: {NO_THINKING_PREFIX}")
+    assert full_text == expected_no_think_text.removesuffix(EOD_TOKEN)
+    assert full_text.startswith(prefix_text)
+
+
+def test_render_prefix_and_full_existing_think_sample(chat_template, think_sample_record):
+    prefix_text, full_text = _render_prefix_and_full(think_sample_record, template=chat_template)
+    assert prefix_text.endswith(f"{IM_START_TOKEN}Assistant: ")
+    assert full_text == read_text_auto(THINK_SAMPLE_OUTPUT)
+    assert full_text.startswith(prefix_text)
+
+
+def test_render_prefix_and_full_handles_malformed_closing_think(chat_template):
+    record = {
+        "messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "</think>\n答案"},
+        ]
+    }
+    prefix_text, full_text = _render_prefix_and_full(record, template=chat_template)
+    assert prefix_text.endswith(f"{IM_START_TOKEN}Assistant: ")
+    assert f"{NO_THINKING_PREFIX}答案<|im_end|>\n" in full_text
+
+
+def test_compute_trainable_span_and_char_mask(chat_template, my_sample_record):
+    prefix_text, full_text = _render_prefix_and_full(my_sample_record, template=chat_template)
+    start, end = _compute_trainable_span(full_text, prefix_text)
+    assert start == len(prefix_text) - len(NO_THINKING_PREFIX)
+    assert end == len(full_text)
+    assert full_text[start : start + len(NO_THINKING_PREFIX)] == NO_THINKING_PREFIX
+
+    char_mask = _char_mask_from_span(full_text, start, end)
+    assert sum(char_mask[:start]) == 0
+    assert all(char_mask[pos] == 1 for pos in range(start, end))
+
+
+def test_compute_trainable_span_rejects_non_matching_prefix():
+    with pytest.raises(ValueError, match="rendered prefix"):
+        _compute_trainable_span("full", "prefix")
+
+
+def test_render_prefix_and_full_requires_assistant(chat_template):
+    with pytest.raises(ValueError, match="assistant message"):
+        _render_prefix_and_full({"messages": [{"role": "user", "content": "q"}]}, template=chat_template)
+
+
+def test_eod_token_id_requires_single_token():
+    class FakeTokenizer:
+        def encode(self, text):
+            return [1, 2]
+
+    with pytest.raises(ValueError, match="exactly one token"):
+        eod_token_id(FakeTokenizer())
+
+
+def test_tokenize_with_char_spans_and_mask_projection(tokenizer: TRIE_TOKENIZER):
+    text = "甲乙<|im_end|>"
+    char_mask = [0, 1] + [1] * (len(text) - 2)
+    token_ids, char_spans = _tokenize_with_char_spans(tokenizer, text)
+    projected = _loss_mask_from_char_mask(char_mask, char_spans)
+
+    assert tokenizer.decode(token_ids) == text
+    assert len(token_ids) == len(char_spans) == len(projected)
+    assert sum(projected) >= 1
 
 
 def test_encode_segments_appends_eod_and_can_skip_it(tokenizer: TRIE_TOKENIZER):
@@ -449,21 +606,136 @@ def test_eod_token_id_returns_single_endoftext_token(tokenizer: TRIE_TOKENIZER):
     assert eod_token_id(tokenizer) == tokenizer.token2idx[b"<|endoftext|>"]
 
 
-def test_pack_encoded_documents_pads_with_masked_eod(tokenizer: TRIE_TOKENIZER):
+def test_encode_separator_produces_masked_newline(tokenizer: TRIE_TOKENIZER):
+    separator = _encode_separator(tokenizer)
+    assert tokenizer.decode(separator.input_ids) == "\n"
+    assert separator.loss_mask == [0] * len(separator.input_ids)
+
+
+def test_build_document_from_record_trains_only_final_assistant_with_added_think(
+    tokenizer: TRIE_TOKENIZER,
+    chat_template,
+    my_sample_record: dict,
+):
+    encoded = build_document_from_record(my_sample_record, tokenizer=tokenizer, template=chat_template)
+    full_text = tokenizer.decode(encoded.input_ids[:-1])
+    trainable_text = masked_text(tokenizer, encoded)
+    _, expected_no_think_text, _ = final_pattern_chunks()
+
+    assert full_text == expected_no_think_text.removesuffix(EOD_TOKEN)
+    assert trainable_text.lstrip(" ") == (
+        NO_THINKING_PREFIX
+        + "上海今天多云，约 28°C，湿度 72%，东南风 3 级；空气质量为优，AQI 45。整体适合晚上跑步，建议避开闷热时段，控制强度并注意补水。"
+        + "<|im_end|>\n<|endoftext|>"
+    )
+    assert ASSISTANT_PREFIX not in trainable_text
+    assert "<tool_call>" not in trainable_text
+    assert encoded.loss_mask[-1] == 1
+
+
+def test_build_document_from_record_trains_existing_think_sample(
+    tokenizer: TRIE_TOKENIZER,
+    chat_template,
+    think_sample_record: dict,
+):
+    encoded = build_document_from_record(think_sample_record, tokenizer=tokenizer, template=chat_template)
+    full_text = tokenizer.decode(encoded.input_ids[:-1])
+    trainable_text = masked_text(tokenizer, encoded)
+
+    assert full_text == read_text_auto(THINK_SAMPLE_OUTPUT)
+    assert trainable_text.lstrip(" ") == "<think>\n刚才的结果是 180。\n180 / 4 = 45。\n</think>\n\n结果是 45。<|im_end|>\n<|endoftext|>"
+    assert ASSISTANT_PREFIX not in trainable_text
+
+
+def test_build_document_from_record_handles_malformed_closing_think_only(
+    tokenizer: TRIE_TOKENIZER,
+    chat_template,
+):
+    record = {
+        "messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "</think>\n答案"},
+        ]
+    }
+    encoded = build_document_from_record(record, tokenizer=tokenizer, template=chat_template)
+    assert masked_text(tokenizer, encoded).lstrip(" ") == f"{NO_THINKING_PREFIX}答案<|im_end|>\n<|endoftext|>"
+
+
+def test_build_document_from_record_trains_final_tool_calls_when_content_empty(
+    tokenizer: TRIE_TOKENIZER,
+    chat_template,
+):
+    record = {
+        "messages": [
+            {"role": "user", "content": "查天气"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": {"city": "上海"},
+                        }
+                    }
+                ],
+            },
+        ]
+    }
+    encoded = build_document_from_record(record, tokenizer=tokenizer, template=chat_template)
+    trainable_text = masked_text(tokenizer, encoded)
+    assert trainable_text.lstrip(" ") == (
+        NO_THINKING_PREFIX
+        + "\n"
+        + "<tool_call>\n"
+        + "<invoke name=\"get_weather\">\n"
+        + "<parameter name=\"city\">上海</parameter>\n"
+        + "</invoke>\n"
+        + "</tool_call><|im_end|>\n<|endoftext|>"
+    )
+
+
+def test_build_document_from_record_uses_override_date_and_location(
+    tokenizer: TRIE_TOKENIZER,
+    chat_template,
+):
+    record = {
+        "messages": [
+            {"role": "assistant", "content": "答案"},
+        ]
+    }
+    encoded = build_document_from_record(
+        record,
+        tokenizer=tokenizer,
+        template=chat_template,
+        current_date="2026-06-04",
+        current_location="Beijing, China",
+    )
+    decoded = tokenizer.decode(encoded.input_ids[:-1])
+    assert "Current date: 2026-06-04" in decoded
+    assert "Current location: Beijing, China" in decoded
+
+
+def test_pack_encoded_documents_pads_with_masked_eod_and_separator(tokenizer: TRIE_TOKENIZER):
     eod_id = eod_token_id(tokenizer)
+    separator = _encode_separator(tokenizer)
     packed = list(
         pack_encoded_documents(
             [
                 EncodedDocument(input_ids=[10, eod_id], loss_mask=[1, 1]),
                 EncodedDocument(input_ids=[11, eod_id], loss_mask=[1, 1]),
             ],
-            pack_length=5,
+            pack_length=6,
             pad_token_id=eod_id,
+            separator=separator,
         )
     )
     assert len(packed) == 1
-    assert packed[0].input_ids == [10, eod_id, 11, eod_id, eod_id]
-    assert packed[0].loss_mask == [1, 1, 1, 1, 0]
+    assert tokenizer.decode(packed[0].input_ids) == f"\n".join(
+        [tokenizer.decode([10, eod_id]), tokenizer.decode([11, eod_id])]
+    ) + EOD_TOKEN
+    assert packed[0].loss_mask[-1] == 0
+    assert 0 in packed[0].loss_mask
 
 
 def test_pack_encoded_documents_splits_long_stream_and_validates_lengths(tokenizer: TRIE_TOKENIZER):
@@ -491,22 +763,11 @@ def test_pack_encoded_documents_splits_long_stream_and_validates_lengths(tokeniz
         )
 
 
-def test_build_document_from_record_ignores_template_text(tokenizer: TRIE_TOKENIZER):
-    record = {"messages": [{"role": "assistant", "content": "answer"}]}
-    encoded = build_document_from_record(record, tokenizer=tokenizer, template="manually different")
-    assert masked_text(tokenizer, encoded) == "answer<|im_end|><|endoftext|>"
-
-
-def test_build_document_from_record_without_assistant_keeps_eod_masked(tokenizer: TRIE_TOKENIZER):
-    record = {"messages": [{"role": "user", "content": "question"}]}
-    encoded = build_document_from_record(record, tokenizer=tokenizer, template="unused")
-    assert encoded.loss_mask[-1] == 0
-
-
 def test_load_helpers_and_shuffle(tmp_path):
     template_path = tmp_path / "template.jinja"
     template_path.write_text("hello", encoding="utf-8")
-    assert load_chat_template(str(template_path)) == "hello"
+    template = load_chat_template(str(template_path))
+    assert hasattr(template, "render")
 
     input_path = tmp_path / "sample.jsonl"
     input_path.write_text("\n".join(["a", "", "b"]) + "\n", encoding="utf-8")
@@ -514,6 +775,13 @@ def test_load_helpers_and_shuffle(tmp_path):
 
     shuffled = shuffled_epoch_lines(["a", "b"], 2, random.Random(0))
     assert sorted(shuffled) == ["a", "a", "b", "b"]
+
+
+def test_compile_chat_template_and_env():
+    env = _build_jinja_env()
+    assert "tojson" in env.filters
+    template = compile_chat_template("{{ value | tojson(ensure_ascii=False) }}")
+    assert template.render(value={"x": "好"}) == '{"x": "好"}'
 
 
 def test_path_helpers_and_default_output_prefix(tmp_path):
@@ -552,21 +820,9 @@ def test_write_documents_rejects_mask_length_mismatch(tmp_path):
         )
 
 
-def test_build_binidx_dataset_writes_token_and_mask_sidecar(tmp_path):
+def test_build_binidx_dataset_writes_token_and_mask_sidecar_for_my_sample(tmp_path):
     input_path = tmp_path / "sample.jsonl"
-    input_path.write_text(
-        json.dumps(
-            {
-                "messages": [
-                    {"role": "user", "content": "问题"},
-                    {"role": "assistant", "content": "答案"},
-                ]
-            },
-            ensure_ascii=False,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    input_path.write_text(MY_SAMPLE_PATH.read_text(encoding="utf-8"), encoding="utf-8")
     output_prefix = str(tmp_path / "packed")
 
     stats = build_binidx_dataset(
@@ -590,31 +846,34 @@ def test_build_binidx_dataset_writes_token_and_mask_sidecar(tmp_path):
     assert stats["pack_length"] is None
     assert len(tokens) == len(mask)
     assert sum(mask) > 0
+    _, expected_no_think_text, _ = final_pattern_chunks()
+    tokenizer_obj = TRIE_TOKENIZER(str(VOCAB_PATH), strict_length=True)
+    assert tokenizer_decode(tokenizer_obj, tokens) == expected_no_think_text + EOD_TOKEN
     assert tokens[-1] == 65532
     assert mask[-1] == 1
 
 
-def test_build_binidx_dataset_packs_to_fixed_length_and_masks_padding_eod(tmp_path):
-    tokenizer = TRIE_TOKENIZER(str(VOCAB_PATH), strict_length=True)
+def tokenizer_decode(tokenizer: TRIE_TOKENIZER, token_ids: list[int]) -> str:
+    return tokenizer.decode(token_ids)
+
+
+def test_build_binidx_dataset_matches_final_pattern_when_packed(tmp_path):
+    think_record, no_think_record = final_pattern_records()
     input_path = tmp_path / "packed.jsonl"
-    records = [
-        {"messages": [{"role": "assistant", "content": "甲"}]},
-        {"messages": [{"role": "assistant", "content": "乙"}]},
-    ]
     input_path.write_text(
         "\n".join(
-            [json.dumps(record, ensure_ascii=False) for record in records]
+            [
+                json.dumps(think_record, ensure_ascii=False),
+                json.dumps(no_think_record, ensure_ascii=False),
+            ]
         )
         + "\n",
         encoding="utf-8",
     )
     output_prefix = str(tmp_path / "packed_fixed")
-    eod_id = eod_token_id(tokenizer)
-    source_documents = [
-        build_document_from_record(record, tokenizer=tokenizer, template=TEMPLATE_PATH.read_text(encoding="utf-8"))
-        for record in records
-    ]
-    pack_length = sum(len(document.input_ids) for document in source_documents) + 1
+    tokenizer_obj = TRIE_TOKENIZER(str(VOCAB_PATH), strict_length=True)
+    expected_text = read_text_auto(FINAL_PATTERN_PATH)
+    pack_length = len(tokenizer_obj.encode(expected_text))
 
     stats = build_binidx_dataset(
         str(input_path),
@@ -630,52 +889,45 @@ def test_build_binidx_dataset_packs_to_fixed_length_and_masks_padding_eod(tmp_pa
     mask_ds = MMapIndexedDataset(output_prefix + ".mask")
     tokens = token_ds[0].astype(int).tolist()
     mask = mask_ds[0].astype(int).tolist()
-    assert len(tokens) == pack_length
-    assert len(mask) == pack_length
+    decoded = tokenizer_obj.decode(tokens)
+
     assert stats["documents"] == 1
     assert stats["source_documents"] == 2
     assert stats["pack_length"] == pack_length
-    learned_eod_positions = [i for i, (token, keep) in enumerate(zip(tokens, mask)) if token == eod_id and keep == 1]
-    padded_eod_positions = [i for i, (token, keep) in enumerate(zip(tokens, mask)) if token == eod_id and keep == 0]
-    assert len(learned_eod_positions) == 2
-    assert len(padded_eod_positions) >= 1
+    assert decoded == expected_text
+    assert len(tokens) == len(mask) == pack_length
+
+    expected_first_text, _, _ = final_pattern_chunks()
+    separator_ids = tokenizer_obj.encode("\n")
+    separator_start = len(tokenizer_obj.encode(expected_first_text))
+    assert tokens[separator_start:separator_start + len(separator_ids)] == separator_ids
+    assert mask[separator_start:separator_start + len(separator_ids)] == [0] * len(separator_ids)
 
 
-def test_packing_keeps_exactly_one_trainable_eod_between_samples(tokenizer: TRIE_TOKENIZER):
-    eod_id = eod_token_id(tokenizer)
-    packed = list(
-        pack_encoded_documents(
-            [
-                EncodedDocument(input_ids=[101, 102, eod_id], loss_mask=[1, 1, 1]),
-                EncodedDocument(input_ids=[201, 202, eod_id], loss_mask=[1, 1, 1]),
-            ],
-            pack_length=7,
-            pad_token_id=eod_id,
-        )
+def test_build_binidx_dataset_padding_keeps_tail_eod_mask_zero(tmp_path):
+    tokenizer_obj = TRIE_TOKENIZER(str(VOCAB_PATH), strict_length=True)
+    input_path = tmp_path / "single.jsonl"
+    input_path.write_text(THINK_SAMPLE_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    output_prefix = str(tmp_path / "single_out")
+    document = build_document_from_record(
+        json.loads(THINK_SAMPLE_PATH.read_text(encoding="utf-8").splitlines()[0]),
+        tokenizer=tokenizer_obj,
+        template=load_chat_template(str(TEMPLATE_PATH)),
     )
-    assert len(packed) == 1
-    assert packed[0].input_ids == [101, 102, eod_id, 201, 202, eod_id, eod_id]
-    assert packed[0].loss_mask == [1, 1, 1, 1, 1, 1, 0]
-    assert packed[0].input_ids[2] == eod_id
-    assert packed[0].input_ids[5] == eod_id
-    assert packed[0].input_ids[6] == eod_id
-    assert packed[0].loss_mask[2] == 1
-    assert packed[0].loss_mask[5] == 1
-    assert packed[0].loss_mask[6] == 0
+    pack_length = len(document.input_ids) + 3
 
-
-def test_single_sample_padding_keeps_first_terminal_eod_trainable(tokenizer: TRIE_TOKENIZER):
-    eod_id = eod_token_id(tokenizer)
-    packed = list(
-        pack_encoded_documents(
-            [EncodedDocument(input_ids=[301, 302, eod_id], loss_mask=[1, 1, 1])],
-            pack_length=6,
-            pad_token_id=eod_id,
-        )
+    build_binidx_dataset(
+        str(input_path),
+        output_prefix=output_prefix,
+        vocab_path=str(VOCAB_PATH),
+        template_path=str(TEMPLATE_PATH),
+        n_epoch=1,
+        seed=7,
+        pack_length=pack_length,
     )
-    assert len(packed) == 1
-    assert packed[0].input_ids == [301, 302, eod_id, eod_id, eod_id, eod_id]
-    assert packed[0].loss_mask == [1, 1, 1, 0, 0, 0]
+    mask_ds = MMapIndexedDataset(output_prefix + ".mask")
+    mask = mask_ds[0].astype(int).tolist()
+    assert mask[-3:] == [0, 0, 0]
 
 
 def test_build_binidx_dataset_shuffles_epochs_deterministically(tmp_path):
@@ -714,19 +966,7 @@ def test_build_binidx_dataset_shuffles_epochs_deterministically(tmp_path):
 
 def test_cli_main_builds_dataset_and_accepts_flags(tmp_path):
     input_path = tmp_path / "cli.jsonl"
-    input_path.write_text(
-        json.dumps(
-            {
-                "messages": [
-                    {"role": "user", "content": "question"},
-                    {"role": "assistant", "content": "answer"},
-                ]
-            },
-            ensure_ascii=False,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    input_path.write_text(THINK_SAMPLE_PATH.read_text(encoding="utf-8"), encoding="utf-8")
     output_prefix = tmp_path / "cli_out"
 
     stdout = io.StringIO()
@@ -745,7 +985,7 @@ def test_cli_main_builds_dataset_and_accepts_flags(tmp_path):
                 "--current-location",
                 "Shanghai, China",
                 "--pack-length",
-                "64",
+                "128",
                 "--add-generation-prompt",
                 "--enable-thinking",
             ]
@@ -763,7 +1003,7 @@ def test_arg_parser_defaults_and_overrides():
     parser = build_arg_parser()
     args = parser.parse_args(["sample.jsonl"])
     assert args.vocab == "rwkv_vocab_v20260603.txt"
-    assert args.chat_template == "chat_template.jinja"
+    assert args.chat_template == "data/SFT/sample/chat_template.jinja"
     assert args.n_epoch == 1
     assert args.seed == 1234
 
@@ -798,7 +1038,7 @@ def test_arg_parser_defaults_and_overrides():
 
 def test_tools_jsonl_smoke_still_only_trains_last_assistant_if_available(
     tokenizer: TRIE_TOKENIZER,
-    chat_template: str,
+    chat_template,
 ):
     first_line = TOOLS_JSONL.read_text(encoding="utf-8").splitlines()[0]
     record = json.loads(first_line)
@@ -810,5 +1050,14 @@ def test_tools_jsonl_smoke_still_only_trains_last_assistant_if_available(
         for message in reversed(record["messages"])
         if message["role"] == "assistant"
     )
-    assert trainable_text.startswith(last_assistant)
-    assert trainable_text.endswith("<|im_end|><|endoftext|>")
+    assert trainable_text.endswith("<|im_end|>\n<|endoftext|>")
+    if last_assistant.strip():
+        assert last_assistant.strip() in trainable_text
+    else:
+        assert "<tool_call>" in trainable_text
+
+
+def test_root_template_is_synced_with_authoritative_sample_template():
+    old_template = OLD_TEMPLATE_PATH.read_text(encoding="utf-8")
+    new_template = TEMPLATE_PATH.read_text(encoding="utf-8")
+    assert old_template == new_template

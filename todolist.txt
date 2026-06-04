@@ -85,3 +85,89 @@ Implementation direction
 - Dataset layer returns `(x, y)` for pretrain and `(x, y, loss_mask)` for SFT.
 - Model `training_step` accepts an optional mask and falls back to standard masked CE only when needed.
 - Design from scratch on `new_sft`, using only the current codebase plus `_reference_rwkv_infctx_trainer` as the behavior reference.
+
+2026-06-04 template-aligned SFT preprocessing rewrite plan
+
+Reason for rewrite
+- The current `src/sft_binidx.py` still hardcodes a Python-side copy of the chat template.
+- The user has updated the chat template behavior and provided new golden references in `data/SFT/sample/my_sample.jsonl`, `data/SFT/sample/my_sample_outs.txt`, and `data/SFT/sample/final_pattern.txt`.
+- The old Python replica is now divergent enough that patching it further is riskier than rewriting the SFT preprocessing around real Jinja rendering.
+
+Target behavior to match exactly
+- Rendering `data/SFT/sample/my_sample.jsonl` with the latest intended chat template must reproduce `data/SFT/sample/my_sample_outs.txt`.
+- A single serialized sample must end as:
+- `...<|im_end|>\n<|endoftext|>`
+- When packing multiple real samples, the boundary must be:
+- `...<|im_end|>\n<|endoftext|>\n<|im_start|>...`
+- In other words, each real sample contributes one learned `EOD`, and if another real sample follows there is one extra separator newline after that `EOD`.
+- Tail padding in the final packed chunk remains repeated `<|endoftext|>` with loss mask `0`.
+
+Masking rules for the rewrite
+- Only the final assistant block of each source sample is trainable.
+- The assistant role prefix `<|im_start|>Assistant: ` remains masked.
+- The trainable span must include:
+- normalized final-assistant think block text,
+- final assistant visible content,
+- final assistant `tool_calls`,
+- the final assistant closing `<|im_end|>`,
+- and the sample-final `<|endoftext|>`.
+- The masked span must include:
+- system text,
+- tool schema,
+- user text,
+- tool responses,
+- earlier assistant outputs,
+- packing separator newline,
+- and padding `<|endoftext|>` tokens.
+
+Think normalization rules to implement
+- The final assistant in the processed training text should always contain think tags.
+- If the final assistant content already contains `</think>`:
+- prefix render for mask boundary uses `add_generation_prompt=True`, `enable_thinking=False`, `no_add_thinking=True`.
+- full render uses the original final assistant content unchanged with `add_generation_prompt=False`, `enable_thinking=False`, `no_add_thinking=True`.
+- If the final assistant content does not contain `</think>`:
+- prefix render for mask boundary uses `add_generation_prompt=True`, `enable_thinking=False`, `no_add_thinking=False`, so the generated prefix ends with ` <think>\n\n</think>\n\n`.
+- full render manually prepends `<think>\n\n</think>\n\n` to `messages[-1]["content"]`, then uses `add_generation_prompt=False`, `enable_thinking=False`, `no_add_thinking=False`.
+- Malformed edge cases such as content containing only `</think>` must be covered by tests and handled consistently with the chosen template semantics.
+
+Implementation outline
+- Stop treating Python-built segments as the source of truth for SFT text formatting.
+- Build a real Jinja rendering path with the same `tojson` behavior used by the sample conversion script.
+- Use render-twice mask derivation:
+- first render excludes the final assistant and gives the masked prefix length,
+- second render includes the full sample and gives the full text,
+- the trainable span starts immediately after the assistant role prefix in the second render and ends at the end of the rendered sample text.
+- Tokenize the final rendered sample text once, then derive token-level loss mask from the byte-span boundary.
+- Keep the existing `.bin/.idx` plus `.mask.bin/.mask.idx` storage format.
+- Update packing logic so real samples are joined by learned `EOD` plus one masked separator newline, while tail padding still uses masked `EOD` only.
+
+Validation plan
+- Add golden rendering tests against `data/SFT/sample/my_sample_outs.txt`.
+- Add packing golden tests against the structure shown in `data/SFT/sample/final_pattern.txt`.
+- Add focused tests for:
+- no-think final assistant,
+- pre-existing think final assistant,
+- malformed `</think>`-only final assistant,
+- final assistant with empty content but non-empty `tool_calls`,
+- packed sample boundary newline behavior,
+- padding behavior with simultaneous packing and masking.
+- After code changes, rerun:
+- `conda run -n model pytest -q tests\test_sft_binidx.py`
+- `conda run -n model pytest -q tests\test_sft_binidx.py --cov=src.sft_binidx --cov=data.tokenizer.rwkv_tokenizer --cov=data.make_sft_binidx --cov-report=term-missing`
+- `conda run -n model pytest -q`
+
+Checkpoint before coding
+- The sample template at `data/SFT/sample/chat_template.jinja` already includes `no_add_thinking`, but the current root `chat_template.jinja` does not yet expose that branch.
+- Before the rewrite starts, confirm which file path is the authoritative training template:
+- either synchronize the root `chat_template.jinja` to the new sample-template behavior,
+- or temporarily point preprocessing/tests at the sample template until the root template is updated.
+
+2026-06-04 user-confirmed rewrite constraints
+- The authoritative template for the rewrite is `data/SFT/sample/chat_template.jinja`.
+- `data/SFT/sample/convert.py` is the reference script for how the template is rendered and how `tool_calls.arguments` should be normalized before rendering.
+- `data/SFT/sample/final_pattern.txt` is the golden reference for packed multi-sample serialization.
+- `data/SFT/sample/my_sample.jsonl` and `data/SFT/sample/think.jsonl` are the primary regression inputs for the new preprocessing path.
+- `data/SFT/sample/my_sample_outs.txt` and `data/SFT/sample/think_out.txt` are the corresponding golden rendered outputs for those inputs.
+- The final assistant terminator of each real sample must be fully trainable:
+- `<|im_end|>\n<|endoftext|>`
+- That means the last assistant closing `IM_END` and the sample-final `EOD` are both `mask=1`.

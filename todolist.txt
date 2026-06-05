@@ -365,3 +365,25 @@ Validation
 
 Next
 - Ask the server to rerun the CUDA smoke tests from a fresh checkout.
+
+2026-06-05 SFT best-fit packing shard memory follow-up
+
+Completed
+- Changed only the `best-fit-decreasing` SFT packing path to process one normalized JSONL shard at a time.
+- Each JSONL shard is loaded, epoch-expanded, optionally shuffled, rendered/tokenized, length-filtered, and best-fit packed independently.
+- Packed documents from all shards are appended into the same final output prefix, so the result remains one token binidx pair plus one mask binidx pair:
+- `PREFIX.bin`
+- `PREFIX.idx`
+- `PREFIX.mask.bin`
+- `PREFIX.mask.idx`
+- The default `ordered` packing path still uses the previous global source order behavior.
+- Added a regression test where global best-fit would produce fewer docs than shard-local best-fit, proving the new path does not materialize or optimize across JSONL shards.
+- Updated README / README_CN to describe shard-local best-fit behavior and the merged final output contract.
+
+Validation
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_binidx.py --tb=short` -> 73 passed.
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_training.py tests\test_sft_cuda_smoke.py tests\test_convert_deepspeed_checkpoint_to_pth.py tests\test_converted_checkpoint_equivalence.py --tb=short` -> 25 passed, 4 skipped.
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_binidx.py --cov=src.sft_binidx --cov=data.make_sft_binidx --cov=data.tokenizer.rwkv_tokenizer --cov-report=term-missing --tb=short` -> 73 passed, 98% total preprocessing coverage, `src.sft_binidx.py` 99%.
+- `D:\anaconda\envs\model\python.exe -m compileall -q src data tests train.py` -> passed.
+- `git diff --check` -> passed with line-ending normalization warnings only.
+- `git diff -- data/SFT/sample/chat_template.jinja` -> empty.

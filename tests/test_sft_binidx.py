@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import src.sft_binidx as sft_binidx
 from data.make_sft_binidx import build_arg_parser, main as make_sft_binidx_main
 from data.tokenizer.rwkv_tokenizer import TRIE, TRIE_TOKENIZER, parse_vocab_line
 from src.binidx import MMapIndexedDataset
@@ -842,6 +843,81 @@ def test_pack_encoded_documents_best_fit_decreasing_reduces_padding_without_spli
     assert [doc.loss_mask for doc in optimized] == [
         [1, 1, 1, 1, 1, 0, 1, 1, 1, 0],
         [1, 1, 1, 1, 1, 0, 1, 1, 1, 0],
+    ]
+
+
+def test_build_binidx_dataset_best_fit_decreasing_packs_each_jsonl_shard_then_merges_output(
+    tmp_path,
+    monkeypatch,
+):
+    class FakeTokenizer:
+        def encode(self, text):
+            if text == EOD_TOKEN:
+                return [0]
+            if text == "\n":
+                return [99]
+            raise AssertionError(f"unexpected encode call: {text!r}")
+
+    fake_documents = {
+        "large-a": EncodedDocument(input_ids=[1] * 5, loss_mask=[1] * 5),
+        "large-b": EncodedDocument(input_ids=[2] * 5, loss_mask=[1] * 5),
+        "small-a": EncodedDocument(input_ids=[3] * 3, loss_mask=[1] * 3),
+        "small-b": EncodedDocument(input_ids=[4] * 3, loss_mask=[1] * 3),
+        "too-long": EncodedDocument(input_ids=[5] * 10, loss_mask=[1] * 10),
+    }
+
+    def fake_build_documents_from_sources(sources, **_kwargs):
+        for source in sources:
+            yield fake_documents[source.text]
+
+    monkeypatch.setattr(sft_binidx, "TRIE_TOKENIZER", lambda *_args, **_kwargs: FakeTokenizer())
+    monkeypatch.setattr(sft_binidx, "load_chat_template", lambda _path: object())
+    monkeypatch.setattr(sft_binidx, "build_documents_from_sources", fake_build_documents_from_sources)
+
+    first_path = tmp_path / "first.jsonl"
+    second_path = tmp_path / "second.jsonl"
+    first_path.write_text("large-a\nlarge-b\n", encoding="utf-8")
+    second_path.write_text("small-a\nsmall-b\ntoo-long\n", encoding="utf-8")
+    output_prefix = str(tmp_path / "merged")
+
+    stats = build_binidx_dataset(
+        [str(first_path), str(second_path)],
+        output_prefix=output_prefix,
+        vocab_path="fake-vocab.txt",
+        template_path="fake-template.jinja",
+        n_epoch=1,
+        seed=123,
+        pack_length=9,
+        shuffle=False,
+        pack_strategy="best-fit-decreasing",
+    )
+
+    token_ds = MMapIndexedDataset(output_prefix)
+    mask_ds = MMapIndexedDataset(output_prefix + ".mask")
+    token_documents = [token_ds[index].astype(int).tolist() for index in range(len(token_ds))]
+    mask_documents = [mask_ds[index].astype(int).tolist() for index in range(len(mask_ds))]
+
+    assert stats["source_files"] == 2
+    assert stats["source_lines"] == 5
+    assert stats["source_documents"] == 5
+    assert stats["filtered_documents"] == 1
+    assert stats["documents"] == 3
+    assert stats["pack_strategy"] == "best-fit-decreasing"
+    assert sorted(path.name for path in tmp_path.glob("merged*")) == [
+        "merged.bin",
+        "merged.idx",
+        "merged.mask.bin",
+        "merged.mask.idx",
+    ]
+    assert token_documents == [
+        [1, 1, 1, 1, 1, 0, 0, 0, 0],
+        [2, 2, 2, 2, 2, 0, 0, 0, 0],
+        [3, 3, 3, 99, 4, 4, 4, 0, 0],
+    ]
+    assert mask_documents == [
+        [1, 1, 1, 1, 1, 0, 0, 0, 0],
+        [1, 1, 1, 1, 1, 0, 0, 0, 0],
+        [1, 1, 1, 0, 1, 1, 1, 0, 0],
     ]
 
 

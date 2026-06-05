@@ -877,17 +877,14 @@ def build_documents_from_sources(
         yield from executor.map(build, sources)
 
 
-def write_documents(
-    output_prefix: str,
+def append_documents_to_builders(
+    token_builder: MMapIndexedDatasetBuilder,
+    mask_builder: MMapIndexedDatasetBuilder,
     documents: Iterable[EncodedDocument],
     *,
     token_dtype=np.uint16,
     mask_dtype=np.uint8,
 ):
-    token_builder = MMapIndexedDatasetBuilder(data_file_path(output_prefix), dtype=token_dtype)
-    mask_prefix = mask_prefix_path(output_prefix)
-    mask_builder = MMapIndexedDatasetBuilder(data_file_path(mask_prefix), dtype=mask_dtype)
-
     doc_count = 0
     token_count = 0
     trainable_count = 0
@@ -904,14 +901,36 @@ def write_documents(
         token_count += int(token_arr.size)
         trainable_count += int(mask_arr.sum())
 
-    token_builder.finalize(index_file_path(output_prefix))
-    mask_builder.finalize(index_file_path(mask_prefix))
     return {
         "documents": doc_count,
         "tokens": token_count,
         "trainable_tokens": trainable_count,
-        "mask_path": mask_file_path(output_prefix),
     }
+
+
+def write_documents(
+    output_prefix: str,
+    documents: Iterable[EncodedDocument],
+    *,
+    token_dtype=np.uint16,
+    mask_dtype=np.uint8,
+):
+    token_builder = MMapIndexedDatasetBuilder(data_file_path(output_prefix), dtype=token_dtype)
+    mask_prefix = mask_prefix_path(output_prefix)
+    mask_builder = MMapIndexedDatasetBuilder(data_file_path(mask_prefix), dtype=mask_dtype)
+
+    stats = append_documents_to_builders(
+        token_builder,
+        mask_builder,
+        documents,
+        token_dtype=token_dtype,
+        mask_dtype=mask_dtype,
+    )
+
+    token_builder.finalize(index_file_path(output_prefix))
+    mask_builder.finalize(index_file_path(mask_prefix))
+    stats["mask_path"] = mask_file_path(output_prefix)
+    return stats
 
 
 def collect_filtered_documents(
@@ -929,6 +948,80 @@ def collect_filtered_documents(
             continue
         kept.append(document)
     return kept, filtered
+
+
+def write_best_fit_decreasing_sharded_documents(
+    output_prefix: str,
+    input_paths: Sequence[str],
+    *,
+    tokenizer: TRIE_TOKENIZER,
+    template,
+    n_epoch: int,
+    seed: int,
+    pack_length: int,
+    current_date: str | None = None,
+    current_location: str | None = None,
+    num_workers: int = 1,
+    shuffle: bool = True,
+    token_dtype=np.uint16,
+    mask_dtype=np.uint8,
+):
+    token_builder = MMapIndexedDatasetBuilder(data_file_path(output_prefix), dtype=token_dtype)
+    mask_prefix = mask_prefix_path(output_prefix)
+    mask_builder = MMapIndexedDatasetBuilder(data_file_path(mask_prefix), dtype=mask_dtype)
+    rng = random.Random(seed)
+    pad_token_id = eod_token_id(tokenizer)
+    separator = _encode_separator(tokenizer)
+
+    stats = {
+        "documents": 0,
+        "tokens": 0,
+        "trainable_tokens": 0,
+        "source_lines": 0,
+        "source_documents": 0,
+        "filtered_documents": 0,
+    }
+
+    for input_path in input_paths:
+        sources = load_non_empty_source_lines(input_path)
+        shuffled_sources = shuffled_epoch_sources(sources, n_epoch, rng, shuffle=shuffle)
+        documents = build_documents_from_sources(
+            shuffled_sources,
+            tokenizer=tokenizer,
+            template=template,
+            current_date=current_date,
+            current_location=current_location,
+            num_workers=num_workers,
+        )
+        documents, filtered_documents = collect_filtered_documents(
+            documents,
+            max_length=pack_length,
+        )
+        packed_documents = pack_encoded_documents_best_fit_decreasing(
+            documents,
+            pack_length=pack_length,
+            pad_token_id=pad_token_id,
+            separator=separator,
+        )
+        shard_stats = append_documents_to_builders(
+            token_builder,
+            mask_builder,
+            packed_documents,
+            token_dtype=token_dtype,
+            mask_dtype=mask_dtype,
+        )
+
+        stats["documents"] += shard_stats["documents"]
+        stats["tokens"] += shard_stats["tokens"]
+        stats["trainable_tokens"] += shard_stats["trainable_tokens"]
+        stats["source_lines"] += len(sources)
+        stats["source_documents"] += len(shuffled_sources)
+        stats["filtered_documents"] += filtered_documents
+
+    token_builder.finalize(index_file_path(output_prefix))
+    mask_builder.finalize(index_file_path(mask_prefix))
+    stats["mask_path"] = mask_file_path(output_prefix)
+    return stats
 
 
 def default_output_prefix(input_jsonl: str | Sequence[str]) -> str:
@@ -967,52 +1060,64 @@ def build_binidx_dataset(
     if pack_strategy not in {"ordered", "best-fit-decreasing"}:
         raise ValueError("pack_strategy must be 'ordered' or 'best-fit-decreasing'.")
 
+    input_paths = normalize_input_paths(input_jsonl)
+    prefix = output_prefix or default_output_prefix(input_jsonl)
     template = load_chat_template(template_path)
     tokenizer = TRIE_TOKENIZER(vocab_path, strict_length=True)
-    sources = load_jsonl_sources(input_jsonl, num_workers=num_workers)
-    rng = random.Random(seed)
-    shuffled_sources = shuffled_epoch_sources(sources, n_epoch, rng, shuffle=shuffle)
-    prefix = output_prefix or default_output_prefix(input_jsonl)
 
-    documents = build_documents_from_sources(
-        shuffled_sources,
-        tokenizer=tokenizer,
-        template=template,
-        current_date=current_date,
-        current_location=current_location,
-        num_workers=num_workers,
-    )
-
-    max_source_length = pack_length if pack_length is not None else pad_length
-    documents, filtered_documents = collect_filtered_documents(
-        documents,
-        max_length=max_source_length,
-    )
-    if pack_length is not None:
-        packer = (
-            pack_encoded_documents_best_fit_decreasing
-            if pack_strategy == "best-fit-decreasing"
-            else pack_encoded_documents
-        )
-        documents = packer(
-            documents,
+    if pack_length is not None and pack_strategy == "best-fit-decreasing":
+        stats = write_best_fit_decreasing_sharded_documents(
+            prefix,
+            input_paths,
+            tokenizer=tokenizer,
+            template=template,
+            n_epoch=n_epoch,
+            seed=seed,
             pack_length=pack_length,
-            pad_token_id=eod_token_id(tokenizer),
-            separator=_encode_separator(tokenizer),
+            current_date=current_date,
+            current_location=current_location,
+            num_workers=num_workers,
+            shuffle=shuffle,
         )
-    elif pad_length is not None:
-        documents = pad_encoded_documents(
-            documents,
-            pad_length=pad_length,
-            pad_token_id=eod_token_id(tokenizer),
+    else:
+        sources = load_jsonl_sources(input_paths, num_workers=num_workers)
+        rng = random.Random(seed)
+        shuffled_sources = shuffled_epoch_sources(sources, n_epoch, rng, shuffle=shuffle)
+        documents = build_documents_from_sources(
+            shuffled_sources,
+            tokenizer=tokenizer,
+            template=template,
+            current_date=current_date,
+            current_location=current_location,
+            num_workers=num_workers,
         )
 
-    stats = write_documents(prefix, documents)
+        max_source_length = pack_length if pack_length is not None else pad_length
+        documents, filtered_documents = collect_filtered_documents(
+            documents,
+            max_length=max_source_length,
+        )
+        if pack_length is not None:
+            documents = pack_encoded_documents(
+                documents,
+                pack_length=pack_length,
+                pad_token_id=eod_token_id(tokenizer),
+                separator=_encode_separator(tokenizer),
+            )
+        elif pad_length is not None:
+            documents = pad_encoded_documents(
+                documents,
+                pad_length=pad_length,
+                pad_token_id=eod_token_id(tokenizer),
+            )
+
+        stats = write_documents(prefix, documents)
+        stats["source_lines"] = len(sources)
+        stats["source_documents"] = len(shuffled_sources)
+        stats["filtered_documents"] = filtered_documents
+
     stats["output_prefix"] = prefix
-    stats["source_files"] = len(normalize_input_paths(input_jsonl))
-    stats["source_lines"] = len(sources)
-    stats["source_documents"] = len(shuffled_sources)
-    stats["filtered_documents"] = filtered_documents
+    stats["source_files"] = len(input_paths)
     stats["epochs"] = n_epoch
     stats["pack_length"] = pack_length
     stats["pad_length"] = pad_length

@@ -213,8 +213,29 @@ def test_configure_epoch_schedule_preserves_sft_steps_and_keeps_pretrain_schedul
 
     with pytest.raises(ValueError, match="epoch_steps"):
         train.configure_epoch_schedule(SimpleNamespace(data_type="sft_binidx", epoch_steps=0, epoch_count=1))
+    with pytest.raises(ValueError, match="epoch_count"):
+        train.configure_epoch_schedule(SimpleNamespace(data_type="sft_binidx", epoch_steps=1, epoch_count=0))
     with pytest.raises(ValueError, match="Unsupported"):
         train.configure_epoch_schedule(SimpleNamespace(data_type="utf-8"))
+
+
+def test_configure_training_limits_stops_sft_by_epoch_count_and_preserves_pretrain_default():
+    sft_args = SimpleNamespace(data_type="sft_binidx", epoch_count=3, max_epochs=-1)
+    train.configure_training_limits(sft_args)
+    assert sft_args.max_epochs == 3
+
+    pretrain_args = SimpleNamespace(data_type="binidx", epoch_count=3, max_epochs=3)
+    train.configure_training_limits(pretrain_args)
+    assert pretrain_args.max_epochs == -1
+
+
+def test_checkpoint_path_helpers_handle_empty_regular_and_unreadable_paths(tmp_path, monkeypatch):
+    assert train.resolve_resume_checkpoint_path("", "deepspeed_stage_2") is None
+    assert train.resolve_resume_checkpoint_path(str(tmp_path / "plain.pth"), "deepspeed_stage_2") is None
+
+    monkeypatch.setattr(train.os.path, "isdir", lambda path: True)
+    monkeypatch.setattr(train.os, "listdir", lambda path: (_ for _ in ()).throw(OSError("denied")))
+    assert train.is_deepspeed_checkpoint_dir(str(tmp_path / "unreadable.pth")) is False
 
 
 def test_train_callback_uses_lr_init_when_exit_tokens_disabled(tmp_path):

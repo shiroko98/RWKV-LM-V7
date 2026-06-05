@@ -73,7 +73,15 @@ def configure_epoch_schedule(args):
         return
     raise ValueError(f"Unsupported data_type: {args.data_type}")
 
-if __name__ == "__main__":
+
+def configure_training_limits(args):
+    if args.data_type == "sft_binidx":
+        args.max_epochs = args.epoch_count
+    else:
+        args.max_epochs = -1
+
+
+if __name__ == "__main__":  # pragma: no cover
     import os
     import subprocess
     import sys
@@ -200,7 +208,7 @@ if __name__ == "__main__":
     args.num_sanity_val_steps = 0
     args.check_val_every_n_epoch = int(1e20)
     args.log_every_n_steps = int(1e20)
-    args.max_epochs = -1  # continue forever
+    args.max_epochs = -1  # pretrain continues forever unless my_exit_tokens stops it
     args.betas = (args.beta1, args.beta2)
     args.real_bsz = int(args.num_nodes) * int(args.devices) * args.micro_bsz
     os.environ["DEEPSPEED_TIMEOUT"] = str(args.dist_timeout_sec)
@@ -219,6 +227,7 @@ if __name__ == "__main__":
         os.makedirs(args.proj_dir)
 
     configure_epoch_schedule(args)
+    configure_training_limits(args)
 
     if args.train_stage >= 2:  # find latest saved model
         list_p = []

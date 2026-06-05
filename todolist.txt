@@ -229,3 +229,18 @@ Next
 - Document SFT training CLI usage in README / README_CN.
 - Build a tiny SFT binidx sample and run a small smoke test with the provided 0.4B checkpoint.
 - Derive recommended 0.4B args from `model/rwkv7-g1d-0.4b-20260210-ctx8192.txt`.
+
+2026-06-05 SFT training integration checkpoint 2
+
+Completed
+- Added an explicit SFT training limit rule: `data_type=sft_binidx` now sets Lightning `max_epochs` to `--epoch_count`.
+- Preserved the pretrain behavior: `data_type=binidx` still keeps `max_epochs=-1` and relies on the existing token-based / checkpoint-driven flow.
+- Added tests for SFT max-epoch configuration and checkpoint path helper edge cases.
+
+Validation
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_training.py tests\test_deepspeed_checkpointing.py --cov=src.dataset --cov=src.sft_loss --cov=train --cov-report=term-missing --tb=short` -> 32 passed, 100% coverage for `src.dataset`, `src.sft_loss`, and the testable `train.py` helper surface.
+- `D:\anaconda\envs\model\python.exe -m pytest -q --tb=short` -> 113 passed.
+
+Next
+- Document current SFT training usage in README / README_CN.
+- Build a tiny SFT binidx sample and run a small smoke test with the provided 0.4B checkpoint if local VRAM allows.

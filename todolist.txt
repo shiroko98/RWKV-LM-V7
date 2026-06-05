@@ -282,3 +282,30 @@ Validation
 
 Next
 - Ask the server to rerun `RWKV_RUN_CUDA_SFT_SMOKE=1`, then run the train.py and resume smoke tests on 8 H800 GPUs.
+
+2026-06-05 SFT fixture tracking follow-up
+
+Server feedback
+- Server checkout did not contain `data/SFT/sample/chat_template.jinja`, because `data/*` in `.gitignore` ignored the local SFT sample fixtures.
+- CUDA smoke and full SFT preprocessing regression tests require the authoritative sample template and small golden files.
+
+Completed
+- Force-added the existing local SFT test fixtures without changing their content:
+- `data/SFT/sample/chat_template.jinja`
+- `data/SFT/sample/my_sample.jsonl`
+- `data/SFT/sample/my_sample_outs.txt`
+- `data/SFT/sample/think.jsonl`
+- `data/SFT/sample/think_out.txt`
+- `data/SFT/sample/final_pattern.txt`
+- `data/SFT/tools.jsonl`
+
+Next
+- Validate default tests after fixture tracking.
+- Ask the server to rerun the CUDA smoke tests from a fresh checkout.
+
+Validation
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_cuda_smoke.py tests\test_sft_binidx.py --tb=short` -> 68 passed, 3 skipped.
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_binidx.py --cov=src.sft_binidx --cov=data.make_sft_binidx --cov=data.tokenizer.rwkv_tokenizer --cov-report=term-missing --tb=short` -> 66 passed, 99% total preprocessing coverage.
+
+Next
+- Ask the server to rerun the CUDA smoke tests from a fresh checkout.

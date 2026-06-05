@@ -1,0 +1,178 @@
+{#- ==================== 1. 特殊 Token 变量声明 ==================== -#}
+{#- 定义工具调用的起始和结束特殊 Token -#}
+{%- set toolcall_begin_token   = '<tool_call>'         -%}
+{%- set toolcall_end_token     = '</tool_call>'        -%}
+{#- ==================== 2. 工具和文本渲染宏定义 ==================== -#}
+{#- 宏：将外部传入的 tools 工具列表转换为标准的 <tool>JSON</tool> 格式 -#}
+{%- macro render_tool_namespace(tool_list) -%}
+{%- for tool in tool_list -%}
+<tool>{{ tool.function | tojson(ensure_ascii=False) }}</tool>
+{% endfor -%}
+{%- endmacro -%}
+{#- 宏：兼容纯文本字符串或多模态/列表类 (List[Dict]) 消息内容的提取 -#}
+{%- macro visible_text(content) -%}
+    {%- if content is string -%}
+        {{ content }}
+    {%- elif content is iterable and content is not mapping -%}
+        {%- for item in content -%}
+            {%- if item is mapping and item.type == 'text' -%}
+                {{- item.text }}
+            {%- elif item is string -%}
+                {{- item }}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- else -%}
+        {{- content }}
+    {%- endif -%}
+{%- endmacro -%}
+{#- 宏：构建系统级提示词（System Message），支持动态注入日期和位置（仿 MiniMax） -#}
+{%- macro build_system_message(system_message) -%}
+    {%- if system_message and system_message.content -%}
+        {{- visible_text(system_message.content) }}
+    {%- else -%}
+        {#- 默认缺省系统提示词 -#}
+        {{- "You are a helpful assistant. Your name is xiaoke and is built by CETC." }}
+    {%- endif -%}
+    {#- 动态拼接当前日期 -#}
+    {%- if system_message and system_message.current_date -%}
+        {{- '\n' ~ 'Current date: ' + system_message.current_date }}
+    {%- endif -%}
+    {#- 动态拼接当前位置 -#}
+    {%- if system_message and system_message.current_location -%}
+        {{- '\n' ~ 'Current location: ' + system_message.current_location }}
+    {%- endif -%}
+{%- endmacro -%}
+{#- ==================== 3. 核心模板解析逻辑 ==================== -#}
+{#- 3.1 提取并分离系统消息（仅当第一条消息的 role 为 system 时进行分离） -#}
+{%- set system_message = none -%}
+{%- set conversation_messages = messages -%}
+{%- if messages and messages[0].role == "system" -%}
+    {%- set system_message = messages[0] -%}
+    {%- set conversation_messages = messages[1:] -%}
+{%- endif -%}
+{#- 3.2 动态寻找全会话中最后一次人类用户的交互索引（用于控制历史思维链截断） -#}
+{%- set ns = namespace(last_user_index=-1) %}
+{% for m in conversation_messages %}
+    {%- if m.role == 'user' %}
+        {%- set ns.last_user_index = loop.index0 -%}
+    {%- endif %}
+{%- endfor %}
+{#- 3.3 渲染 System 模块：外层硬隔离，内层兼容基座 "System: " 激活词 -#}
+{{- '<|im_start|>System: ' }}
+{{- build_system_message(system_message) }}
+{#- 如果当前携带可用工具，则在系统消息内拼接完整的工具 Schema 声明与少样本调用示例 -#}
+{%- if tools -%}
+    {{- '\n\n' ~ '# Tools' ~ '\n' ~ 'You may call one or more tools to assist with the user query.\nHere are the tools available in JSONSchema format:' ~ '\n' }}
+    {{- '\n' ~ '<tools>' ~ '\n' }}
+    {{- render_tool_namespace(tools) }}
+    {{- '</tools>' ~ '\n\n' }}
+{{- 'When making tool calls, use XML format to invoke tools and pass parameters:' ~ '\n' }}
+{{- '\n' ~ toolcall_begin_token }}
+<invoke name="tool-name-1">
+<parameter name="param-key-1">param-value-1</parameter>
+<parameter name="param-key-2">param-value-2</parameter>
+...
+</invoke>
+{{- '\n' ~ toolcall_end_token }}
+{%- endif -%}
+{{- '<|im_end|>\n' }}
+{#- 3.4 循环渲染对话主体历史（遍历处理 Assistant / Tool / User 各自的角色行为） -#}
+{%- for message in conversation_messages -%}
+    {#- ---------------- 角色 A：模型回复 (Assistant) ---------------- -#}
+    {%- if message.role == 'assistant' -%}
+        {#- 保持内层前缀 "Assistant: " 兼容基座倾向 -#}
+        {{- '<|im_start|>Assistant: ' }}
+        {#- 解析并隔离可能包含在 content 或 reasoning_content 中的思维思考链（Thinking Chain） -#}
+        {%- set reasoning_content = '' %}
+        {%- set content = visible_text(message.content) %}
+        {%- set has_thinking_block = false %}
+        {%- if message.reasoning_content is string %}
+            {%- set reasoning_content = message.reasoning_content %}
+        {%- else %}
+            {%- if '</think>' in content %}
+                {%- set has_thinking_block = true %}
+                {%- set reasoning_content = content.split('</think>')[0].strip('\n').split('<think>')[-1].strip('\n') %}
+                {%- set content = content.split('</think>')[-1].strip('\n') %}
+            {%- endif %}
+        {%- endif %}
+        {#- 历史思考链过滤：仅当显式要求保留（preserve_thinking=true）或属于最后一轮对话时，才渲染思维链，大幅节约长文本 Token -#}
+        {%- if (reasoning_content or has_thinking_block) and ((preserve_thinking is defined and preserve_thinking is true) or (loop.index0 > ns.last_user_index)) -%}
+            {{- '<think>' ~ '\n' ~ reasoning_content ~ '\n' ~ '</think>\n\n' }}
+            {{- content.lstrip('\n') }}
+        {%- else -%}
+            {{- content }}
+        {%- endif -%}
+        {#- 判定并输出模型历史中曾发起的工具调用（完全兼容 MiniMax 引擎的 XML 属性传参节点格式） -#}
+        {%- if message.tool_calls -%}
+            {{- '\n' ~ toolcall_begin_token ~ '\n' }}
+            {%- for tool_call in message.tool_calls -%}
+                {%- if tool_call.function %}
+                    {%- set tool_call = tool_call.function %}
+                {%- endif %}
+                {{- '<invoke name="' + tool_call.name + '">' }}
+                {% set _args = tool_call.arguments %}
+                {%- if _args is string %}
+                    {{- _args }}
+                {%- else %}
+                    {%- for k, v in _args.items() %}
+                    {{- '<parameter name="' + k + '">' }}
+                    {{- v | tojson(ensure_ascii=False) if v is not string else v }}
+                    {{- '</parameter>' }}
+                    {% endfor %}
+                {%- endif %}
+                {{- '</invoke>' ~ '\n' }}
+            {%- endfor -%}
+            {{- toolcall_end_token }}
+        {%- endif -%}
+        {{- '<|im_end|>\n' }}
+    {#- ---------------- 角色 B：工具执行结果返回 (Tool) ---------------- -#}
+    {%- elif message.role == 'tool' -%}
+        {#- 如果存在连续的多个工具返回，将其优雅地合并在同一个大 Tool 块内 -#}
+        {%- if loop.first or (conversation_messages[loop.index0 - 1].role != 'tool') -%}
+            {{- '<|im_start|>Tool: ' }}
+        {%- endif -%}
+        {#- 动态感知工具函数名，并在 <response> 标签中赋予 name 属性，协助长文调用链精准映射 -#}
+        {%- set tool_name_attr = '' %}
+        {%- if message.name -%}
+            {%- set tool_name_attr = ' name="' + message.name + '"' %}
+        {%- endif -%}
+        
+        {%- if message.content is string -%}
+            {{- '\n<response' + tool_name_attr + '>' }}
+            {{- message.content }}
+            {{- '</response>' }}
+        {%- else -%}
+            {%- for tr in message.content -%}
+                {{- '\n<response' + tool_name_attr + '>' }}
+                {{- tr.output if tr.output is defined else (tr.text if tr.type == 'text' and tr.text is defined else tr) }}
+                {{- '\n</response>' }}
+            {%- endfor -%}
+        {%- endif -%}
+        {#- 当工具流全部输出完毕时，使用特殊结束 Token 硬闭合 -#}
+        {%- if loop.last or (conversation_messages[loop.index0 + 1].role != 'tool') -%}
+            {{- '<|im_end|>\n' -}}
+        {%- endif -%}
+    {#- ---------------- 角色 C：人类用户输入 (User) ---------------- -#}
+    {%- elif message.role == 'user' -%}
+        {{- '<|im_start|>User: ' }}
+        {{- visible_text(message.content) }}
+        {{- '<|im_end|>\n' }}
+    {%- endif -%}
+{%- endfor %}
+{#- ==================== 4. 推理引导输出控制 (Inference Generation) ==================== -#}
+{#- 用于离线推理或在线 API 服务请求时（add_generation_prompt=true），强行垫字指导生成 -#}
+{%- if add_generation_prompt -%}
+    {{- '<|im_start|>Assistant:' }}
+    {#- 
+       通过传入的布尔型控制变量 enable_thinking 来硬切模型是否思考。
+       - enable_thinking 为 true：光标紧贴停留在 <think> 标签右侧（且绝不换行），诱导进行 CoT 思考。
+       - 其他或未传：默认输出基座原生空闭合标签形式，诱导跳过思考直出普通文本回复。
+    -#}
+    {%- if enable_thinking is defined and enable_thinking is true -%}
+        {{- ' <think>\n' }}
+    {%- elif no_add_thinking is defined and no_add_thinking is true -%}
+        {{- ' ' }}
+    {%- else -%}
+        {{- ' <think>\n\n</think>\n\n' }}
+    {%- endif -%}
+{%- endif -%}

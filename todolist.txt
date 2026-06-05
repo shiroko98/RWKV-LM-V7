@@ -311,6 +311,20 @@ Completed
   - `RWKV_SFT_SMOKE_STRATEGY=deepspeed_stage_3_offload`
   - result: `1 passed in 284.01s`.
 
+2026-06-05 SFT sample-preserving packing
+
+Completed
+- Confirmed training `ctx_len`, preprocessing `--ctx-len`, `--pack-length`, and `--pad-length` are token counts.
+- Added `--ctx-len` plus boolean `--pack` / `--pad`; these use `ctx_len + 1` for next-token SFT documents.
+- Kept legacy explicit `--pack-length` / `--pad-length` for compatibility.
+- Changed SFT packing to preserve source sample boundaries: samples are never split across packed documents.
+- Added post-tokenization length filtering before packing/padding; overlong samples are dropped instead of stopping the build.
+- Updated README / README_CN and the 13.3B launcher comment.
+- Validation:
+  - `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_binidx.py` -> 71 passed.
+  - `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_training.py tests\test_sft_cuda_smoke.py tests\test_convert_deepspeed_checkpoint_to_pth.py tests\test_converted_checkpoint_equivalence.py` -> 25 passed, 4 skipped.
+  - `D:\anaconda\envs\model\python.exe -m compileall -q src data tests train.py` -> passed.
+
 2026-06-05 SFT fixture tracking follow-up
 
 Server feedback

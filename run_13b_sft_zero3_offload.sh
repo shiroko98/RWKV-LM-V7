@@ -8,7 +8,8 @@ set -euo pipefail
 # Prepare data first. For example, for CTX_LEN=8192:
 #   python data/make_sft_binidx.py /path/to/sft_jsonl_dir \
 #     --out-prefix /mnt/data/datasets/sft_train_ctx8192 \
-#     --pack-length 8193 \
+#     --ctx-len 8192 \
+#     --pack \
 #     --num-workers 32 \
 #     --shuffle
 #

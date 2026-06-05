@@ -196,7 +196,8 @@ python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
   --out-prefix data/sft_train \
   --vocab rwkv_vocab_v20260603.txt \
   --chat-template data/SFT/sample/chat_template.jinja \
-  --pack-length 4096 \
+  --ctx-len 4096 \
+  --pack \
   --num-workers 8 \
   --shuffle
 ```
@@ -206,7 +207,8 @@ python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
 ```bash
 python data/make_sft_binidx.py data/sft_shards \
   --output-prefix data/sft_train \
-  --pack-length 4096 \
+  --ctx-len 4096 \
+  --pack \
   --num-workers 8
 ```
 
@@ -232,7 +234,7 @@ python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
 6. 最后一轮 assistant 会被规范化为始终包含 think 标签。如果原始内容已有 think 结束标签，就保留原始 think；如果没有，就在最终回复前补一个空 think 块。历史 assistant、系统、用户、工具返回都只作为上下文。
 7. loss mask 从“最后一轮 assistant 的可训练后缀”推导：assistant 内容边界之前全部为 `0`。样本里真实存在的 think 内容参与训练；无 thinking 样本自动补出的空 think 块只作为格式上下文，仍然是 `0`；可见回复、最终工具调用、assistant 结束段和真实样本结束段为 `1`。
 8. 文本只 tokenize 一次。代码用 UTF-8 字节跨度记录每个 token 对应的字符区间，再把字符级可训练区间投影为 token 级 mask。这样中文、多字节符号和特殊片段都走同一套规则。
-9. 如果不传 `--pack-length` 或 `--pad-length`，每条重复后的源样本会写成一个变长 binidx document，并同步写入一个同长度的 mask document，不会自动 padding。每个独立 document 末尾仍然会有真实的 `EOD_TOKEN`，并且这个 EOD 参与训练。使用 `--pack-length` 时，样本会被串接成固定长度 document，长流可以跨 document 切分，真实样本之间的分隔换行不计 loss，只有最后不足长度的尾部会 padding。使用 `--pad-length` 时不做 packing：每条源样本仍然独立成一个 document，真实 EOD 在 padding 之前，尾部补齐 token 使用 EOD token id 但 padding mask 为 `0`；如果某条样本本身超过 `--pad-length`，会直接报错。
+9. 如果不传 `--pack`、`--pad`、`--pack-length` 或 `--pad-length`，每条重复后的源样本会写成一个变长 binidx document，并同步写入一个同长度的 mask document，不会自动 padding。每个独立 document 末尾仍然会有真实的 `EOD_TOKEN`，并且这个 EOD 参与训练。`--ctx-len`、`--pack-length` 和 `--pad-length` 都是 token 数，不是字符数。推荐用 `--ctx-len N --pack` 或 `--ctx-len N --pad`，实际写出长度会自动使用 `N + 1`，用于匹配训练端 next-token label。使用 `--pack` / `--pack-length` 时，样本按顺序做不可拆分 packing：多个完整样本可以合并到同一个固定长度 document，样本之间的分隔换行 mask 为 `0`；如果当前 document 放不下下一条完整样本，就先把当前 document 右侧 padding 后写出，再新开 document。使用 `--pad` / `--pad-length` 时不做 packing：每条源样本独立 padding 到固定长度。过长样本会在 tokenize 后、packing/padding 前按目标 token 长度过滤丢弃，不会终止整个构建。
 10. 输出包含主 token 数据集和 mask sidecar：`PREFIX.bin`、`PREFIX.idx`、`PREFIX.mask.bin`、`PREFIX.mask.idx`。SFT 训练时主数据集提供 token，mask sidecar 提供哪些 token 参与 loss。
 
 参数含义：
@@ -244,8 +246,11 @@ python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
 - `--seed`：打乱顺序用的随机种子；关闭 shuffle 时不影响样本顺序。
 - `--shuffle` / `--no-shuffle`：是否在每个 epoch 内打乱样本，默认开启。
 - `--num-workers`：并发读取、渲染和 tokenize 的 worker 数，默认 `1`。
-- `--pack-length`：固定长度 packing 目标；不设置时保持一条源样本一个 document。
-- `--pad-length`：不做 packing 时，把每条样本独立 padding 到固定长度；不能和 `--pack-length` 同时使用。
+- `--ctx-len`：训练上下文 token 数；配合 `--pack` 或 `--pad` 时，预处理长度自动使用 `ctx_len + 1`。
+- `--pack`：启用顺序样本不拆分 packing，长度为 `ctx_len + 1`；不设置时默认关闭。
+- `--pad`：启用逐样本 padding，长度为 `ctx_len + 1`；不设置时默认关闭，不能和 `--pack` 同时使用。
+- `--pack-length`：兼容旧用法，显式指定固定长度 packing 目标 token 数。
+- `--pad-length`：兼容旧用法，显式指定逐样本 padding 目标 token 数；不能和 `--pack-length` 同时使用。
 - `--current-date`、`--current-location`：可覆盖或注入系统消息里的日期和位置字段。
 
 ### 使用 SFT binidx 数据训练
@@ -286,7 +291,7 @@ python train.py \
   --grad_cp 1
 ```
 
-训练端使用 next-token label，所以每个 SFT document 需要提供 `ctx_len + 1` 个 token。document 比这个短时，dataloader 会在内存里用 `--sft_pad_token_id` padding，并把 padding mask 设为 `0`；document 更长时会直接报错。为了让训练长度稳定，建议预处理时使用 `--pack-length CTX_LEN + 1` 或 `--pad-length CTX_LEN + 1`，训练时再设置 `--ctx_len CTX_LEN`。RWKV7 x070 的 `ctx_len` 需要能被 16 整除。
+训练端使用 next-token label，所以每个 SFT document 需要提供 `ctx_len + 1` 个 token。document 比这个短时，dataloader 会在内存里用 `--sft_pad_token_id` padding，并把 padding mask 设为 `0`；document 更长时会直接报错。为了让训练长度稳定，建议预处理时使用 `--ctx-len CTX_LEN --pack` 或 `--ctx-len CTX_LEN --pad`，预处理会自动写出 `CTX_LEN + 1` 个 token，训练时再设置 `--ctx_len CTX_LEN`。RWKV7 x070 的 `ctx_len` 需要能被 16 整除。
 
 上面示例里的 0.4B checkpoint 是 `L24-D1024`，对应 `dim_ffn=4096`、`vocab_size=65536`、`head_size=64`，RWKV7 G1 LoRA 维度为 `64/64/32/128`。如果换用其他 checkpoint，需要先看对应架构文本，保证这些形状参数和 checkpoint 一致。
 
@@ -328,7 +333,8 @@ SFT mask 训练的实现框架：
 ```bash
 python data/make_sft_binidx.py /path/to/sft_jsonl_dir \
   --out-prefix /mnt/data/datasets/sft_train_ctx8192 \
-  --pack-length 8193 \
+  --ctx-len 8192 \
+  --pack \
   --num-workers 32 \
   --shuffle
 ```

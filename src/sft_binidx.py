@@ -601,38 +601,53 @@ def pack_encoded_documents(
     packed_ids: list[int] = []
     packed_mask: list[int] = []
     separator = separator or EncodedDocument(input_ids=[], loss_mask=[])
-    wrote_document = False
+
+    def flush_padded() -> EncodedDocument | None:
+        nonlocal packed_ids, packed_mask
+        if not packed_ids:
+            return None
+        padding = pack_length - len(packed_ids)
+        packed = EncodedDocument(
+            input_ids=packed_ids + [pad_token_id] * padding,
+            loss_mask=packed_mask + [0] * padding,
+        )
+        packed_ids = []
+        packed_mask = []
+        return packed
 
     for document in documents:
         if len(document.input_ids) != len(document.loss_mask):
             raise ValueError("Token ids and loss mask must have identical lengths.")
+        if len(document.input_ids) > pack_length:
+            raise ValueError(
+                f"Document length {len(document.input_ids)} exceeds pack_length {pack_length}."
+            )
 
-        stream_parts = []
-        if wrote_document and separator.input_ids:
-            stream_parts.append(separator)
-        stream_parts.append(document)
-        wrote_document = True
+        next_ids = document.input_ids
+        next_mask = document.loss_mask
+        if packed_ids and separator.input_ids:
+            next_ids = separator.input_ids + next_ids
+            next_mask = separator.loss_mask + next_mask
 
-        for part in stream_parts:
-            offset = 0
-            while offset < len(part.input_ids):
-                remaining = pack_length - len(packed_ids)
-                take = min(remaining, len(part.input_ids) - offset)
-                next_offset = offset + take
-                packed_ids.extend(part.input_ids[offset:next_offset])
-                packed_mask.extend(part.loss_mask[offset:next_offset])
-                offset = next_offset
+        if len(packed_ids) + len(next_ids) > pack_length:
+            packed = flush_padded()
+            if packed is not None:
+                yield packed
+            next_ids = document.input_ids
+            next_mask = document.loss_mask
 
-                if len(packed_ids) == pack_length:
-                    yield EncodedDocument(input_ids=packed_ids, loss_mask=packed_mask)
-                    packed_ids = []
-                    packed_mask = []
+        packed_ids.extend(next_ids)
+        packed_mask.extend(next_mask)
+
+        if len(packed_ids) == pack_length:
+            packed = flush_padded()
+            if packed is not None:
+                yield packed
 
     if packed_ids:
-        padding = pack_length - len(packed_ids)
-        packed_ids.extend([pad_token_id] * padding)
-        packed_mask.extend([0] * padding)
-        yield EncodedDocument(input_ids=packed_ids, loss_mask=packed_mask)
+        packed = flush_padded()
+        if packed is not None:
+            yield packed
 
 
 def pad_encoded_documents(
@@ -648,9 +663,7 @@ def pad_encoded_documents(
         if len(document.input_ids) != len(document.loss_mask):
             raise ValueError("Token ids and loss mask must have identical lengths.")
         if len(document.input_ids) > pad_length:
-            raise ValueError(
-                f"Document length {len(document.input_ids)} exceeds pad_length {pad_length}."
-            )
+            continue
         padding = pad_length - len(document.input_ids)
         yield EncodedDocument(
             input_ids=list(document.input_ids) + [pad_token_id] * padding,
@@ -844,6 +857,23 @@ def write_documents(
     }
 
 
+def collect_filtered_documents(
+    documents: Iterable[EncodedDocument],
+    *,
+    max_length: int | None,
+) -> tuple[list[EncodedDocument], int]:
+    kept: list[EncodedDocument] = []
+    filtered = 0
+    for document in documents:
+        if len(document.input_ids) != len(document.loss_mask):
+            raise ValueError("Token ids and loss mask must have identical lengths.")
+        if max_length is not None and len(document.input_ids) > max_length:
+            filtered += 1
+            continue
+        kept.append(document)
+    return kept, filtered
+
+
 def default_output_prefix(input_jsonl: str | Sequence[str]) -> str:
     if isinstance(input_jsonl, (str, Path)):
         input_paths = [Path(input_jsonl)]
@@ -892,6 +922,12 @@ def build_binidx_dataset(
         current_location=current_location,
         num_workers=num_workers,
     )
+
+    max_source_length = pack_length if pack_length is not None else pad_length
+    documents, filtered_documents = collect_filtered_documents(
+        documents,
+        max_length=max_source_length,
+    )
     if pack_length is not None:
         documents = pack_encoded_documents(
             documents,
@@ -911,6 +947,7 @@ def build_binidx_dataset(
     stats["source_files"] = len(normalize_input_paths(input_jsonl))
     stats["source_lines"] = len(sources)
     stats["source_documents"] = len(shuffled_sources)
+    stats["filtered_documents"] = filtered_documents
     stats["epochs"] = n_epoch
     stats["pack_length"] = pack_length
     stats["pad_length"] = pad_length

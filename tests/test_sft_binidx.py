@@ -37,6 +37,7 @@ from src.sft_binidx import (
     _render_prefix_and_full,
     _tokenize_with_char_spans,
     build_binidx_dataset,
+    collect_filtered_documents,
     build_documents_from_sources,
     build_document_from_record,
     build_system_text,
@@ -746,17 +747,40 @@ def test_pack_encoded_documents_pads_with_masked_eod_and_separator(tokenizer: TR
     assert 0 in packed[0].loss_mask
 
 
-def test_pack_encoded_documents_splits_long_stream_and_validates_lengths(tokenizer: TRIE_TOKENIZER):
+def test_pack_encoded_documents_keeps_samples_atomic_and_validates_lengths(tokenizer: TRIE_TOKENIZER):
     eod_id = eod_token_id(tokenizer)
     packed = list(
         pack_encoded_documents(
-            [EncodedDocument(input_ids=[1, 2, 3, 4, eod_id], loss_mask=[1, 1, 1, 1, 1])],
-            pack_length=3,
+            [
+                EncodedDocument(input_ids=[1, 2, 3, eod_id], loss_mask=[1, 1, 1, 1]),
+                EncodedDocument(input_ids=[4, 5, eod_id], loss_mask=[1, 1, 1]),
+            ],
+            pack_length=6,
             pad_token_id=eod_id,
+            separator=EncodedDocument(input_ids=[99], loss_mask=[0]),
         )
     )
-    assert [doc.input_ids for doc in packed] == [[1, 2, 3], [4, eod_id, eod_id]]
-    assert [doc.loss_mask for doc in packed] == [[1, 1, 1], [1, 1, 0]]
+    assert [doc.input_ids for doc in packed] == [
+        [1, 2, 3, eod_id, eod_id, eod_id],
+        [4, 5, eod_id, eod_id, eod_id, eod_id],
+    ]
+    assert [doc.loss_mask for doc in packed] == [[1, 1, 1, 1, 0, 0], [1, 1, 1, 0, 0, 0]]
+
+    exact_after_flush = list(
+        pack_encoded_documents(
+            [
+                EncodedDocument(input_ids=[1, eod_id], loss_mask=[1, 1]),
+                EncodedDocument(input_ids=[2, 3, 4, eod_id], loss_mask=[1, 1, 1, 1]),
+            ],
+            pack_length=4,
+            pad_token_id=eod_id,
+            separator=EncodedDocument(input_ids=[99], loss_mask=[0]),
+        )
+    )
+    assert [doc.input_ids for doc in exact_after_flush] == [
+        [1, eod_id, eod_id, eod_id],
+        [2, 3, 4, eod_id],
+    ]
 
     with pytest.raises(ValueError, match="positive integer"):
         list(pack_encoded_documents([], pack_length=0, pad_token_id=eod_id))
@@ -769,6 +793,26 @@ def test_pack_encoded_documents_splits_long_stream_and_validates_lengths(tokeniz
                 pad_token_id=eod_id,
             )
         )
+
+    with pytest.raises(ValueError, match="exceeds pack_length"):
+        list(
+            pack_encoded_documents(
+                [EncodedDocument(input_ids=[1, 2, 3], loss_mask=[1, 1, 1])],
+                pack_length=2,
+                pad_token_id=eod_id,
+            )
+        )
+
+
+def test_collect_filtered_documents_drops_too_long_samples_after_tokenization():
+    documents = [
+        EncodedDocument(input_ids=[1, 2], loss_mask=[1, 1]),
+        EncodedDocument(input_ids=[3, 4, 5], loss_mask=[1, 1, 1]),
+    ]
+    kept, filtered = collect_filtered_documents(documents, max_length=2)
+
+    assert [doc.input_ids for doc in kept] == [[1, 2]]
+    assert filtered == 1
 
 
 def test_pad_encoded_documents_pads_each_document_and_validates_lengths(tokenizer: TRIE_TOKENIZER):
@@ -786,7 +830,7 @@ def test_pad_encoded_documents_pads_each_document_and_validates_lengths(tokenize
     with pytest.raises(ValueError, match="positive integer"):
         list(pad_encoded_documents([], pad_length=0, pad_token_id=eod_id))
 
-    with pytest.raises(ValueError, match="exceeds pad_length"):
+    assert (
         list(
             pad_encoded_documents(
                 [EncodedDocument(input_ids=[1, 2, 3], loss_mask=[1, 1, 1])],
@@ -794,6 +838,8 @@ def test_pad_encoded_documents_pads_each_document_and_validates_lengths(tokenize
                 pad_token_id=eod_id,
             )
         )
+        == []
+    )
 
     with pytest.raises(ValueError, match="identical lengths"):
         list(
@@ -1052,6 +1098,42 @@ def test_build_binidx_dataset_padding_keeps_tail_eod_mask_zero(tmp_path):
     assert mask[-3:] == [0, 0, 0]
 
 
+def test_build_binidx_dataset_filters_too_long_samples_before_packing(tmp_path):
+    tokenizer_obj = TRIE_TOKENIZER(str(VOCAB_PATH), strict_length=True)
+    template = load_chat_template(str(TEMPLATE_PATH))
+    keep_record = {"messages": [{"role": "assistant", "content": "short keep"}]}
+    drop_record = {"messages": [{"role": "assistant", "content": "long drop " * 200}]}
+    keep_len = len(build_document_from_record(keep_record, tokenizer=tokenizer_obj, template=template).input_ids)
+    drop_len = len(build_document_from_record(drop_record, tokenizer=tokenizer_obj, template=template).input_ids)
+    assert drop_len > keep_len
+
+    input_path = tmp_path / "filter_pack.jsonl"
+    input_path.write_text(
+        "\n".join(json.dumps(record, ensure_ascii=False) for record in [keep_record, drop_record]) + "\n",
+        encoding="utf-8",
+    )
+    output_prefix = str(tmp_path / "filter_pack")
+
+    stats = build_binidx_dataset(
+        str(input_path),
+        output_prefix=output_prefix,
+        vocab_path=str(VOCAB_PATH),
+        template_path=str(TEMPLATE_PATH),
+        n_epoch=1,
+        seed=123,
+        pack_length=keep_len + 4,
+        shuffle=False,
+    )
+
+    token_ds = MMapIndexedDataset(output_prefix)
+    decoded = tokenizer_obj.decode(token_ds[0].astype(int).tolist())
+    assert stats["source_documents"] == 2
+    assert stats["filtered_documents"] == 1
+    assert stats["documents"] == 1
+    assert "short keep" in decoded
+    assert "long drop" not in decoded
+
+
 def test_build_binidx_dataset_shuffles_epochs_deterministically(tmp_path):
     input_path = tmp_path / "sample.jsonl"
     records = [
@@ -1230,6 +1312,40 @@ def test_build_binidx_dataset_can_pad_each_unpacked_document(tmp_path):
     ]
 
 
+def test_build_binidx_dataset_filters_too_long_samples_before_padding(tmp_path):
+    tokenizer_obj = TRIE_TOKENIZER(str(VOCAB_PATH), strict_length=True)
+    template = load_chat_template(str(TEMPLATE_PATH))
+    keep_record = {"messages": [{"role": "assistant", "content": "pad keep"}]}
+    drop_record = {"messages": [{"role": "assistant", "content": "pad drop " * 200}]}
+    keep_len = len(build_document_from_record(keep_record, tokenizer=tokenizer_obj, template=template).input_ids)
+
+    input_path = tmp_path / "filter_pad.jsonl"
+    input_path.write_text(
+        "\n".join(json.dumps(record, ensure_ascii=False) for record in [keep_record, drop_record]) + "\n",
+        encoding="utf-8",
+    )
+    output_prefix = str(tmp_path / "filter_pad")
+
+    stats = build_binidx_dataset(
+        str(input_path),
+        output_prefix=output_prefix,
+        vocab_path=str(VOCAB_PATH),
+        template_path=str(TEMPLATE_PATH),
+        n_epoch=1,
+        seed=123,
+        pad_length=keep_len + 3,
+        shuffle=False,
+    )
+
+    token_ds = MMapIndexedDataset(output_prefix)
+    decoded = tokenizer_obj.decode(token_ds[0].astype(int).tolist())
+    assert stats["source_documents"] == 2
+    assert stats["filtered_documents"] == 1
+    assert stats["documents"] == 1
+    assert "pad keep" in decoded
+    assert "pad drop" not in decoded
+
+
 def test_build_binidx_dataset_can_disable_shuffle_for_ordered_epochs(tmp_path):
     first_path = tmp_path / "first.jsonl"
     second_path = tmp_path / "second.jsonl"
@@ -1332,8 +1448,9 @@ def test_cli_main_builds_dataset_and_accepts_flags(tmp_path):
                 "2026-06-03",
                 "--current-location",
                 "Shanghai, China",
-                "--pack-length",
-                "128",
+                "--ctx-len",
+                "127",
+                "--pack",
                 "--num-workers",
                 "2",
                 "--no-shuffle",
@@ -1350,6 +1467,40 @@ def test_cli_main_builds_dataset_and_accepts_flags(tmp_path):
     assert (tmp_path / "cli_out.mask.idx").exists()
 
 
+def test_cli_main_accepts_legacy_explicit_pack_length(tmp_path):
+    input_path = tmp_path / "cli_legacy.jsonl"
+    input_path.write_text(THINK_SAMPLE_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    output_prefix = tmp_path / "cli_legacy_out"
+
+    stdout = io.StringIO()
+    with redirect_stdout(stdout):
+        make_sft_binidx_main(
+            [
+                str(input_path),
+                "--out-prefix",
+                str(output_prefix),
+                "--vocab",
+                str(VOCAB_PATH),
+                "--chat-template",
+                str(TEMPLATE_PATH),
+                "--pack-length",
+                "128",
+                "--num-workers",
+                "2",
+                "--no-shuffle",
+                "--add-generation-prompt",
+                "--enable-thinking",
+            ]
+        )
+
+    output = stdout.getvalue()
+    assert "Built SFT binidx dataset" in output
+    assert (tmp_path / "cli_legacy_out.bin").exists()
+    assert (tmp_path / "cli_legacy_out.idx").exists()
+    assert Path(mask_file_path(str(output_prefix))).exists()
+    assert (tmp_path / "cli_legacy_out.mask.idx").exists()
+
+
 def test_arg_parser_defaults_and_overrides():
     parser = build_arg_parser()
     args = parser.parse_args(["sample.jsonl"])
@@ -1360,6 +1511,10 @@ def test_arg_parser_defaults_and_overrides():
     assert args.seed == 1234
     assert args.num_workers == 1
     assert args.shuffle is True
+    assert args.ctx_len is None
+    assert args.pack is False
+    assert args.pad is False
+    assert args.pack_length is None
     assert args.pad_length is None
 
     overridden = parser.parse_args(
@@ -1372,10 +1527,11 @@ def test_arg_parser_defaults_and_overrides():
             "2026-06-03",
             "--current-location",
             "Shanghai",
+            "--ctx-len",
+            "127",
+            "--pack",
             "--pack-length",
             "64",
-            "--pad-length",
-            "128",
             "--add-generation-prompt",
             "--enable-thinking",
             "--n-epoch",
@@ -1391,14 +1547,29 @@ def test_arg_parser_defaults_and_overrides():
     assert overridden.out_prefix == "out"
     assert overridden.current_date == "2026-06-03"
     assert overridden.current_location == "Shanghai"
+    assert overridden.ctx_len == 127
+    assert overridden.pack is True
+    assert overridden.pad is False
     assert overridden.pack_length == 64
-    assert overridden.pad_length == 128
+    assert overridden.pad_length is None
     assert overridden.add_generation_prompt is True
     assert overridden.enable_thinking is True
     assert overridden.n_epoch == 2
     assert overridden.seed == 9
     assert overridden.num_workers == 3
     assert overridden.shuffle is False
+
+
+def test_cli_main_rejects_ambiguous_pack_and_pad_flags(tmp_path):
+    input_path = tmp_path / "cli_error.jsonl"
+    input_path.write_text(THINK_SAMPLE_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        make_sft_binidx_main([str(input_path), "--pack", "--pad", "--ctx-len", "16"])
+    with pytest.raises(SystemExit):
+        make_sft_binidx_main([str(input_path), "--pack"])
+    with pytest.raises(SystemExit):
+        make_sft_binidx_main([str(input_path), "--pack", "--ctx-len", "16", "--pad-length", "17"])
 
 
 def test_tools_jsonl_smoke_still_only_trains_last_assistant_if_available(

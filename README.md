@@ -393,7 +393,8 @@ python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
   --out-prefix data/sft_train \
   --vocab rwkv_vocab_v20260603.txt \
   --chat-template data/SFT/sample/chat_template.jinja \
-  --pack-length 4096 \
+  --ctx-len 4096 \
+  --pack \
   --num-workers 8 \
   --shuffle
 ```
@@ -403,7 +404,8 @@ You can also pass a directory containing JSONL shards. A directory input recursi
 ```bash
 python data/make_sft_binidx.py data/sft_shards \
   --output-prefix data/sft_train \
-  --pack-length 4096 \
+  --ctx-len 4096 \
+  --pack \
   --num-workers 8
 ```
 
@@ -429,7 +431,7 @@ The high-level flow is:
 6. Normalize the final assistant turn so it always contains think tags. Existing think content is preserved; missing think content receives an empty think block before the visible reply. Historical assistant turns, system text, user text, and tool outputs are context only.
 7. Derive the loss mask from the final assistant trainable suffix: everything before the final assistant content boundary is `0`. Real think content that comes from the sample is trainable, but the automatically added empty think block for no-think samples is context only and remains `0`; the visible reply, final tool calls, assistant ending segment, and real sample ending segment are `1`.
 8. Tokenize the final text once. The code records each token's UTF-8 byte span, maps it back to character spans, and projects the character-level trainable region into a token-level mask. This handles Chinese, multi-byte symbols, and special fragments through the same path.
-9. Without `--pack-length` or `--pad-length`, each repeated source sample becomes one variable-length binidx document and one same-length mask document; no padding is added. Each independent document still ends with the real `EOD_TOKEN`, and that EOD is trainable. With `--pack-length`, samples are concatenated into fixed-length documents, long streams can be split across documents, the separator newline between real samples is masked out, and only the final tail is padded. With `--pad-length`, packing stays disabled: each source sample remains its own document and is padded to the requested length with mask `0`; the real EOD remains before padding, while padding token ids use EOD with mask `0`. A sample longer than `--pad-length` raises an error.
+9. Without `--pack`, `--pad`, `--pack-length`, or `--pad-length`, each repeated source sample becomes one variable-length binidx document and one same-length mask document; no padding is added. Each independent document still ends with the real `EOD_TOKEN`, and that EOD is trainable. `--ctx-len`, `--pack-length`, and `--pad-length` are token counts, not character counts. The recommended form is `--ctx-len N --pack` or `--ctx-len N --pad`; the actual preprocessing length is `N + 1` to match next-token labels at training time. With `--pack` / `--pack-length`, samples are packed in order without splitting a sample: multiple complete samples may share one fixed-length document, the separator newline between samples is masked out, and if the next complete sample does not fit, the current document is right-padded and a new one starts. With `--pad` / `--pad-length`, packing stays disabled and each source sample is padded independently. Overlong samples are filtered after tokenization and before packing/padding according to the target token length; they are dropped instead of stopping the whole build.
 10. The output is the token dataset plus a mask sidecar: `PREFIX.bin`, `PREFIX.idx`, `PREFIX.mask.bin`, and `PREFIX.mask.idx`. SFT training reads tokens from the main dataset and loss participation from the sidecar mask.
 
 Main parameters:
@@ -441,8 +443,11 @@ Main parameters:
 - `--seed`: random seed for shuffling; it does not affect order when shuffle is disabled.
 - `--shuffle` / `--no-shuffle`: whether to shuffle samples inside each epoch. Default is enabled.
 - `--num-workers`: worker count for concurrent reading, rendering, and tokenization. Default is `1`.
-- `--pack-length`: fixed-length packing target. If omitted, each source sample remains one document.
-- `--pad-length`: fixed-length per-sample padding target without packing. Mutually exclusive with `--pack-length`.
+- `--ctx-len`: training context length in tokens. With `--pack` or `--pad`, preprocessing uses `ctx_len + 1`.
+- `--pack`: enable ordered sample-preserving packing at `ctx_len + 1`. Disabled by default.
+- `--pad`: enable per-sample padding at `ctx_len + 1`. Disabled by default and mutually exclusive with `--pack`.
+- `--pack-length`: legacy explicit fixed-length packing target in tokens.
+- `--pad-length`: legacy explicit fixed-length per-sample padding target in tokens. Mutually exclusive with `--pack-length`.
 - `--current-date`, `--current-location`: override or inject date and location fields in the system message.
 
 ### Train with SFT binidx data
@@ -483,7 +488,7 @@ python train.py \
   --grad_cp 1
 ```
 
-Training samples use next-token labels, so the dataloader needs `ctx_len + 1` token ids per SFT document. A shorter document is padded in memory with `--sft_pad_token_id` and mask `0`; a longer document raises an error. For predictable fixed-length training, build data with `--pack-length CTX_LEN + 1` or `--pad-length CTX_LEN + 1`, then train with `--ctx_len CTX_LEN`. For RWKV7 x070, keep `ctx_len` divisible by 16.
+Training samples use next-token labels, so the dataloader needs `ctx_len + 1` token ids per SFT document. A shorter document is padded in memory with `--sft_pad_token_id` and mask `0`; a longer document raises an error. For predictable fixed-length training, build data with `--ctx-len CTX_LEN --pack` or `--ctx-len CTX_LEN --pad`; preprocessing writes `CTX_LEN + 1` token documents, then train with `--ctx_len CTX_LEN`. For RWKV7 x070, keep `ctx_len` divisible by 16.
 
 The 0.4B checkpoint listed in the example is `L24-D1024` with `dim_ffn=4096`, `vocab_size=65536`, `head_size=64`, and RWKV7 G1 LoRA dimensions `64/64/32/128`. If you use another checkpoint, read its architecture text and keep these shape parameters aligned with the checkpoint.
 
@@ -525,7 +530,8 @@ Prepare data first. For fixed-length training, use `ctx_len + 1`:
 ```bash
 python data/make_sft_binidx.py /path/to/sft_jsonl_dir \
   --out-prefix /mnt/data/datasets/sft_train_ctx8192 \
-  --pack-length 8193 \
+  --ctx-len 8192 \
+  --pack \
   --num-workers 32 \
   --shuffle
 ```

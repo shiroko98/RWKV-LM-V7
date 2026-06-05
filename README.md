@@ -557,9 +557,25 @@ pytest -q tests/test_sft_cuda_smoke.py
 RWKV_SFT_SMOKE_MODEL=model/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
 RWKV_RUN_TRAIN_PY_SFT_RESUME_SMOKE=1 \
 pytest -q tests/test_sft_cuda_smoke.py
+
+RWKV_SFT_SMOKE_MODEL=model/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
+RWKV_RUN_TRAIN_PY_SFT_MERGE_SMOKE=1 \
+RWKV_SFT_SMOKE_DEVICES=8 \
+RWKV_SFT_SMOKE_STRATEGY=deepspeed_stage_3_offload \
+pytest -q tests/test_sft_cuda_smoke.py::test_train_py_sft_deepspeed_checkpoint_converts_to_pth
 ```
 
-The first command runs an in-process CUDA forward/backward on SFT masked loss. The second command launches `train.py` for one SFT step and also validates the Lightning/DeepSpeed/optimizer path. The third command saves `rwkv-step-1.pth` and resumes from it, covering SFT checkpoint resume and DeepSpeed sharded checkpoint loading when a DeepSpeed strategy is used. On multi-GPU servers, add `RWKV_SFT_SMOKE_DEVICES=8`; `train.py` will relaunch with torchrun for multi-card DeepSpeed. You can also set `RWKV_SFT_SMOKE_STRATEGY=deepspeed_stage_3` or `deepspeed_stage_3_offload` to validate a different sharding mode.
+The first command runs an in-process CUDA forward/backward on SFT masked loss. The second command launches `train.py` for one SFT step and also validates the Lightning/DeepSpeed/optimizer path. The third command saves `rwkv-step-1.pth` and resumes from it, covering SFT checkpoint resume and DeepSpeed sharded checkpoint loading when a DeepSpeed strategy is used. The fourth command creates a tiny SFT DeepSpeed checkpoint, converts the sharded checkpoint directory to a single `.pth`, reloads it, and compares it against the reconstructed ZeRO checkpoint. On multi-GPU servers, add `RWKV_SFT_SMOKE_DEVICES=8`; `train.py` will relaunch with torchrun for multi-card DeepSpeed. You can also set `RWKV_SFT_SMOKE_STRATEGY=deepspeed_stage_3` or `deepspeed_stage_3_offload` to validate a different sharding mode.
+
+To test pth merge for an existing checkpoint directory instead of training a tiny one first:
+
+```bash
+RWKV_RUN_TRAIN_PY_SFT_MERGE_SMOKE=1 \
+RWKV_SFT_MERGE_CHECKPOINT_DIR=/mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1.pth \
+RWKV_SFT_MERGE_OUTPUT_FILE=/mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1.bf16.pth \
+RWKV_SFT_MERGE_STRICT_FORWARD=1 \
+pytest -q tests/test_sft_cuda_smoke.py::test_train_py_sft_deepspeed_checkpoint_converts_to_pth
+```
 
 ### Compute magic_prime for specified binidx dataset
 

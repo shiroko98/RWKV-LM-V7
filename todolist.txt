@@ -298,6 +298,17 @@ Completed
 - Derived 13.3B args from `model/rwkv7-g1f-13.3b.txt`: `n_layer=61`, `n_embd=4096`, `dim_ffn=16384`, `vocab_size=65536`, `head_size=64`, LoRA dimensions `192/192/128/384`.
 - Validated the new shell launcher syntax with `bash -n run_13b_sft_zero3_offload.sh`.
 
+2026-06-05 SFT pth merge smoke
+
+Completed
+- Added `tests/test_sft_cuda_smoke.py::test_train_py_sft_deepspeed_checkpoint_converts_to_pth`.
+- The smoke can either train a tiny SFT DeepSpeed checkpoint first, or use `RWKV_SFT_MERGE_CHECKPOINT_DIR` to test an existing checkpoint directory.
+- The smoke calls `scripts/convert_deepspeed_checkpoint_to_pth.py`, loads the produced single-file `.pth`, and runs `scripts/test_converted_checkpoint_equivalence.py` against the original ZeRO checkpoint.
+- Documented the server commands in README / README_CN.
+
+Next
+- Run the new pth merge smoke on the 8xH800 server.
+
 2026-06-05 SFT fixture tracking follow-up
 
 Server feedback

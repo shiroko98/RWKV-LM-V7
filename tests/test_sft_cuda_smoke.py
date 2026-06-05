@@ -194,6 +194,20 @@ def _run_train_py(command: list[str], label: str) -> str:
     return combined_output
 
 
+def _run_checkpoint_merge_command(command: list[str], label: str) -> str:
+    result = subprocess.run(
+        command,
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=int(os.environ.get("RWKV_SFT_MERGE_TIMEOUT", os.environ.get("RWKV_SFT_SMOKE_TIMEOUT", "3600"))),
+    )
+    combined_output = result.stdout + "\n" + result.stderr
+    if result.returncode != 0:
+        pytest.fail(f"{label} failed with code {result.returncode}\n{combined_output[-12000:]}")
+    return combined_output
+
+
 def test_infer_rwkv7_dims_from_sft_smoke_state_dict():
     state = OrderedDict(
         [
@@ -347,3 +361,112 @@ def test_train_py_sft_cuda_resume_from_step_checkpoint(tmp_path):
 
     assert "Preloading resume position" in resume_output
     assert "Resuming trainer state" in resume_output
+
+
+@pytest.mark.cuda
+@pytest.mark.slow
+def test_train_py_sft_deepspeed_checkpoint_converts_to_pth(tmp_path):
+    if os.environ.get("RWKV_RUN_TRAIN_PY_SFT_MERGE_SMOKE") != "1":
+        pytest.skip("set RWKV_RUN_TRAIN_PY_SFT_MERGE_SMOKE=1 to run this SFT checkpoint merge smoke test")
+
+    checkpoint_dir_env = os.environ.get("RWKV_SFT_MERGE_CHECKPOINT_DIR", "")
+    if checkpoint_dir_env:
+        checkpoint_dir = Path(checkpoint_dir_env).expanduser()
+        if not checkpoint_dir.is_dir():
+            pytest.skip(f"RWKV_SFT_MERGE_CHECKPOINT_DIR is not a directory: {checkpoint_dir}")
+    else:
+        model_path = _require_cuda_smoke("RWKV_RUN_TRAIN_PY_SFT_MERGE_SMOKE")
+        pad_length = int(os.environ.get("RWKV_SFT_SMOKE_PAD_LENGTH", "257"))
+        ctx_len = pad_length - 1
+        assert ctx_len > 0 and ctx_len % 16 == 0, "ctx_len must be positive and divisible by the RWKV7 chunk length 16"
+
+        prefix = _build_tiny_sft_binidx(tmp_path, pad_length)
+        state = _load_state_dict(model_path)
+        dims = _infer_rwkv7_dims(state)
+        proj_dir = tmp_path / "merge_out"
+
+        train_command = _train_py_command(
+            load_model=model_path,
+            prefix=prefix,
+            proj_dir=proj_dir,
+            dims=dims,
+            ctx_len=ctx_len,
+            epoch_steps=2,
+            epoch_count=1,
+            extra_args=["--save_at_step", "1"],
+        )
+        _run_train_py(train_command, "train.py SFT DeepSpeed merge source run")
+        checkpoint_dir = proj_dir / "rwkv-step-1.pth"
+
+    assert checkpoint_dir.is_dir(), (
+        "checkpoint merge smoke requires a DeepSpeed sharded checkpoint directory. "
+        "Set RWKV_SFT_SMOKE_STRATEGY=deepspeed_stage_2, deepspeed_stage_3, or deepspeed_stage_3_offload."
+    )
+
+    dtype = os.environ.get("RWKV_SFT_MERGE_DTYPE", "bf16")
+    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+    assert dtype in dtype_map
+
+    output_env = os.environ.get("RWKV_SFT_MERGE_OUTPUT_FILE", "")
+    output_file = Path(output_env).expanduser() if output_env else tmp_path / f"{checkpoint_dir.stem}.{dtype}.pth"
+    if output_file.exists() and os.environ.get("RWKV_SFT_MERGE_OVERWRITE", "") != "1":
+        pytest.fail(f"merge output already exists, set RWKV_SFT_MERGE_OVERWRITE=1 to overwrite: {output_file}")
+
+    summary_env = os.environ.get("RWKV_SFT_MERGE_SUMMARY_FILE", "")
+    summary_file = Path(summary_env).expanduser() if summary_env else output_file.with_suffix(".summary.txt")
+    equivalence_env = os.environ.get("RWKV_SFT_MERGE_EQUIV_FILE", "")
+    equivalence_file = Path(equivalence_env).expanduser() if equivalence_env else output_file.with_suffix(".equivalence.json")
+
+    convert_command = [
+        sys.executable,
+        str(ROOT / "scripts" / "convert_deepspeed_checkpoint_to_pth.py"),
+        "--checkpoint-dir",
+        str(checkpoint_dir),
+        "--output-file",
+        str(output_file),
+        "--dtype",
+        dtype,
+        "--summary-file",
+        str(summary_file),
+    ]
+    verify_summary = os.environ.get("RWKV_SFT_MERGE_VERIFY_SUMMARY_FILE", "")
+    if verify_summary:
+        convert_command.extend(["--verify-summary-file", verify_summary])
+    if os.environ.get("RWKV_SFT_MERGE_NO_LAZY", "") == "1":
+        convert_command.append("--no-lazy-mode")
+
+    _run_checkpoint_merge_command(convert_command, "DeepSpeed checkpoint to pth conversion")
+    assert output_file.is_file()
+    assert summary_file.is_file()
+
+    loaded = torch.load(output_file, map_location="cpu", weights_only=True)
+    assert isinstance(loaded, dict)
+    assert "emb.weight" in loaded
+    assert loaded["emb.weight"].dtype == dtype_map[dtype]
+
+    equivalence_command = [
+        sys.executable,
+        str(ROOT / "scripts" / "test_converted_checkpoint_equivalence.py"),
+        "--checkpoint-dir",
+        str(checkpoint_dir),
+        "--converted-file",
+        str(output_file),
+        "--dtype",
+        dtype,
+        "--summary-file",
+        str(equivalence_file),
+    ]
+    merge_device = os.environ.get("RWKV_SFT_MERGE_DEVICE", "")
+    if merge_device:
+        equivalence_command.extend(["--device", merge_device])
+    merge_prompt = os.environ.get("RWKV_SFT_MERGE_PROMPT", "")
+    if merge_prompt:
+        equivalence_command.extend(["--prompt", merge_prompt])
+    if os.environ.get("RWKV_SFT_MERGE_STRICT_FORWARD", "") == "1":
+        equivalence_command.append("--strict-forward")
+    if os.environ.get("RWKV_SFT_MERGE_NO_LAZY", "") == "1":
+        equivalence_command.append("--no-lazy-mode")
+
+    equivalence_output = _run_checkpoint_merge_command(equivalence_command, "converted pth equivalence check")
+    assert "[equiv] PASS" in equivalence_output
+    assert equivalence_file.is_file()

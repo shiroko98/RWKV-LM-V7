@@ -262,3 +262,23 @@ Validation
 
 Next
 - Wait for server-side CUDA smoke results if local RTX 3050 VRAM / compile time is not representative.
+
+2026-06-05 SFT CUDA smoke follow-up
+
+Server feedback
+- `RWKV_RUN_CUDA_SFT_SMOKE=1` reached `_build_tiny_sft_binidx` and failed because the test helper did not pass the now-required `n_epoch` and `seed` keyword arguments to `build_binidx_dataset`.
+
+Completed
+- Fixed `tests/test_sft_cuda_smoke.py` to call `build_binidx_dataset(..., n_epoch=1, seed=1234, ...)`.
+- Added a default non-CUDA test that builds and reads the tiny SFT binidx smoke dataset, so this helper is covered by ordinary pytest instead of only by env-gated CUDA tests.
+- Added an optional `RWKV_RUN_TRAIN_PY_SFT_RESUME_SMOKE=1` test that runs `train.py`, saves `rwkv-step-1.pth`, then resumes from that step checkpoint.
+- Documented multi-GPU server usage with `RWKV_SFT_SMOKE_DEVICES=8` and strategy overrides such as `RWKV_SFT_SMOKE_STRATEGY=deepspeed_stage_3`.
+
+Validation
+- `D:\anaconda\envs\model\python.exe -m py_compile tests\test_sft_cuda_smoke.py` -> passed.
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_cuda_smoke.py --tb=short` -> 2 passed, 3 skipped by default CUDA env gates.
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_training.py tests\test_deepspeed_checkpointing.py tests\test_sft_cuda_smoke.py --cov=src.dataset --cov=src.sft_loss --cov=train --cov-report=term-missing --tb=short` -> 34 passed, 3 skipped, 100% coverage for `src.dataset`, `src.sft_loss`, and the testable `train.py` helper surface.
+- `D:\anaconda\envs\model\python.exe -m pytest -q --tb=short` -> 115 passed, 3 skipped.
+
+Next
+- Ask the server to rerun `RWKV_RUN_CUDA_SFT_SMOKE=1`, then run the train.py and resume smoke tests on 8 H800 GPUs.

@@ -497,9 +497,13 @@ pytest -q tests/test_sft_cuda_smoke.py
 RWKV_SFT_SMOKE_MODEL=model/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
 RWKV_RUN_TRAIN_PY_SFT_SMOKE=1 \
 pytest -q tests/test_sft_cuda_smoke.py
+
+RWKV_SFT_SMOKE_MODEL=model/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
+RWKV_RUN_TRAIN_PY_SFT_RESUME_SMOKE=1 \
+pytest -q tests/test_sft_cuda_smoke.py
 ```
 
-The first command runs an in-process CUDA forward/backward on SFT masked loss. The second command launches `train.py` for one SFT step and also validates the Lightning/DeepSpeed/optimizer path.
+The first command runs an in-process CUDA forward/backward on SFT masked loss. The second command launches `train.py` for one SFT step and also validates the Lightning/DeepSpeed/optimizer path. The third command saves `rwkv-step-1.pth` and resumes from it, covering SFT checkpoint resume and DeepSpeed sharded checkpoint loading when a DeepSpeed strategy is used. On multi-GPU servers, add `RWKV_SFT_SMOKE_DEVICES=8`; `train.py` will relaunch with torchrun for multi-card DeepSpeed. You can also set `RWKV_SFT_SMOKE_STRATEGY=deepspeed_stage_3` or `deepspeed_stage_3_offload` to validate a different sharding mode.
 
 ### Compute magic_prime for specified binidx dataset
 

@@ -67,6 +67,8 @@ def _build_tiny_sft_binidx(tmp_path: Path, pad_length: int) -> Path:
         output_prefix=str(prefix),
         vocab_path=str(ROOT / "rwkv_vocab_v20260603.txt"),
         template_path=str(ROOT / "data" / "SFT" / "sample" / "chat_template.jinja"),
+        n_epoch=1,
+        seed=1234,
         pad_length=pad_length,
         num_workers=1,
         shuffle=False,
@@ -96,6 +98,102 @@ def _base_sft_args(prefix: Path, dims: dict[str, int], ctx_len: int) -> SimpleNa
     )
 
 
+def _train_py_command(
+    *,
+    load_model: Path,
+    prefix: Path,
+    proj_dir: Path,
+    dims: dict[str, int],
+    ctx_len: int,
+    epoch_steps: int,
+    epoch_count: int,
+    extra_args: list[str] | None = None,
+) -> list[str]:
+    command = [
+        sys.executable,
+        str(ROOT / "train.py"),
+        "--load_model",
+        str(load_model),
+        "--wandb",
+        "",
+        "--proj_dir",
+        str(proj_dir),
+        "--data_file",
+        str(prefix),
+        "--data_type",
+        "sft_binidx",
+        "--ctx_len",
+        str(ctx_len),
+        "--epoch_steps",
+        str(epoch_steps),
+        "--epoch_count",
+        str(epoch_count),
+        "--micro_bsz",
+        "1",
+        "--my_exit_tokens",
+        "0",
+        "--vocab_size",
+        str(dims["vocab_size"]),
+        "--n_layer",
+        str(dims["n_layer"]),
+        "--n_embd",
+        str(dims["n_embd"]),
+        "--dim_ffn",
+        str(dims["dim_ffn"]),
+        "--head_size",
+        str(dims["head_size"]),
+        "--d_decay_lora",
+        str(dims["d_decay_lora"]),
+        "--d_aaa_lora",
+        str(dims["d_aaa_lora"]),
+        "--d_mv_lora",
+        str(dims["d_mv_lora"]),
+        "--d_gate_lora",
+        str(dims["d_gate_lora"]),
+        "--my_testing",
+        os.environ.get("RWKV_SFT_SMOKE_MY_TESTING", "x070"),
+        "--kernel",
+        os.environ.get("RWKV_SFT_SMOKE_KERNEL", ""),
+        "--lr_init",
+        "1e-5",
+        "--lr_final",
+        "1e-5",
+        "--warmup_steps",
+        "0",
+        "--weight_decay",
+        "0",
+        "--accelerator",
+        "gpu",
+        "--devices",
+        os.environ.get("RWKV_SFT_SMOKE_DEVICES", "1"),
+        "--precision",
+        "bf16",
+        "--strategy",
+        os.environ.get("RWKV_SFT_SMOKE_STRATEGY", "deepspeed_stage_2"),
+        "--grad_cp",
+        os.environ.get("RWKV_SFT_SMOKE_GRAD_CP", "1"),
+        "--enable_progress_bar",
+        "False",
+    ]
+    if extra_args:
+        command.extend(extra_args)
+    return command
+
+
+def _run_train_py(command: list[str], label: str) -> str:
+    result = subprocess.run(
+        command,
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=int(os.environ.get("RWKV_SFT_SMOKE_TIMEOUT", "1800")),
+    )
+    combined_output = result.stdout + "\n" + result.stderr
+    if result.returncode != 0:
+        pytest.fail(f"{label} failed with code {result.returncode}\n{combined_output[-8000:]}")
+    return combined_output
+
+
 def test_infer_rwkv7_dims_from_sft_smoke_state_dict():
     state = OrderedDict(
         [
@@ -121,6 +219,20 @@ def test_infer_rwkv7_dims_from_sft_smoke_state_dict():
         "d_mv_lora": 32,
         "d_gate_lora": 128,
     }
+
+
+def test_build_tiny_sft_binidx_smoke_input(tmp_path):
+    from src.binidx import MMapIndexedDataset
+
+    prefix = _build_tiny_sft_binidx(tmp_path, 257)
+    token_data = MMapIndexedDataset(str(prefix))
+    mask_data = MMapIndexedDataset(str(prefix) + ".mask")
+
+    assert len(token_data) == 1
+    assert len(mask_data) == 1
+    assert int(token_data.sizes[0]) == 257
+    assert int(mask_data.sizes[0]) == 257
+    assert int(mask_data[0].sum()) > 0
 
 
 @pytest.mark.cuda
@@ -179,84 +291,59 @@ def test_train_py_sft_cuda_one_step(tmp_path):
     state = _load_state_dict(model_path)
     dims = _infer_rwkv7_dims(state)
     proj_dir = tmp_path / "out"
-    strategy = os.environ.get("RWKV_SFT_SMOKE_STRATEGY", "deepspeed_stage_2")
 
-    command = [
-        sys.executable,
-        str(ROOT / "train.py"),
-        "--load_model",
-        str(model_path),
-        "--wandb",
-        "",
-        "--proj_dir",
-        str(proj_dir),
-        "--data_file",
-        str(prefix),
-        "--data_type",
-        "sft_binidx",
-        "--ctx_len",
-        str(ctx_len),
-        "--epoch_steps",
-        "1",
-        "--epoch_count",
-        "1",
-        "--micro_bsz",
-        "1",
-        "--my_exit_tokens",
-        "0",
-        "--vocab_size",
-        str(dims["vocab_size"]),
-        "--n_layer",
-        str(dims["n_layer"]),
-        "--n_embd",
-        str(dims["n_embd"]),
-        "--dim_ffn",
-        str(dims["dim_ffn"]),
-        "--head_size",
-        str(dims["head_size"]),
-        "--d_decay_lora",
-        str(dims["d_decay_lora"]),
-        "--d_aaa_lora",
-        str(dims["d_aaa_lora"]),
-        "--d_mv_lora",
-        str(dims["d_mv_lora"]),
-        "--d_gate_lora",
-        str(dims["d_gate_lora"]),
-        "--my_testing",
-        os.environ.get("RWKV_SFT_SMOKE_MY_TESTING", "x070"),
-        "--kernel",
-        os.environ.get("RWKV_SFT_SMOKE_KERNEL", ""),
-        "--lr_init",
-        "1e-5",
-        "--lr_final",
-        "1e-5",
-        "--warmup_steps",
-        "0",
-        "--weight_decay",
-        "0",
-        "--accelerator",
-        "gpu",
-        "--devices",
-        os.environ.get("RWKV_SFT_SMOKE_DEVICES", "1"),
-        "--precision",
-        "bf16",
-        "--strategy",
-        strategy,
-        "--grad_cp",
-        os.environ.get("RWKV_SFT_SMOKE_GRAD_CP", "1"),
-        "--enable_progress_bar",
-        "False",
-    ]
-
-    result = subprocess.run(
-        command,
-        cwd=ROOT,
-        text=True,
-        capture_output=True,
-        timeout=int(os.environ.get("RWKV_SFT_SMOKE_TIMEOUT", "1800")),
+    command = _train_py_command(
+        load_model=model_path,
+        prefix=prefix,
+        proj_dir=proj_dir,
+        dims=dims,
+        ctx_len=ctx_len,
+        epoch_steps=1,
+        epoch_count=1,
     )
-    if result.returncode != 0:
-        output_tail = (result.stdout + "\n" + result.stderr)[-8000:]
-        pytest.fail(f"train.py SFT CUDA smoke failed with code {result.returncode}\n{output_tail}")
+    _run_train_py(command, "train.py SFT CUDA smoke")
 
     assert (proj_dir / "train_log.txt").is_file()
+
+
+@pytest.mark.cuda
+@pytest.mark.slow
+def test_train_py_sft_cuda_resume_from_step_checkpoint(tmp_path):
+    model_path = _require_cuda_smoke("RWKV_RUN_TRAIN_PY_SFT_RESUME_SMOKE")
+    pad_length = int(os.environ.get("RWKV_SFT_SMOKE_PAD_LENGTH", "257"))
+    ctx_len = pad_length - 1
+    assert ctx_len > 0 and ctx_len % 16 == 0, "ctx_len must be positive and divisible by the RWKV7 chunk length 16"
+
+    prefix = _build_tiny_sft_binidx(tmp_path, pad_length)
+    state = _load_state_dict(model_path)
+    dims = _infer_rwkv7_dims(state)
+    proj_dir = tmp_path / "resume_out"
+
+    first_command = _train_py_command(
+        load_model=model_path,
+        prefix=prefix,
+        proj_dir=proj_dir,
+        dims=dims,
+        ctx_len=ctx_len,
+        epoch_steps=2,
+        epoch_count=1,
+        extra_args=["--save_at_step", "1"],
+    )
+    _run_train_py(first_command, "train.py SFT CUDA initial run")
+
+    step_checkpoint = proj_dir / "rwkv-step-1.pth"
+    assert step_checkpoint.exists()
+
+    resume_command = _train_py_command(
+        load_model=step_checkpoint,
+        prefix=prefix,
+        proj_dir=proj_dir,
+        dims=dims,
+        ctx_len=ctx_len,
+        epoch_steps=2,
+        epoch_count=1,
+    )
+    resume_output = _run_train_py(resume_command, "train.py SFT CUDA resume run")
+
+    assert "Preloading resume position" in resume_output
+    assert "Resuming trainer state" in resume_output

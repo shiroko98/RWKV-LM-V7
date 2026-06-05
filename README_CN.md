@@ -300,9 +300,13 @@ pytest -q tests/test_sft_cuda_smoke.py
 RWKV_SFT_SMOKE_MODEL=model/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
 RWKV_RUN_TRAIN_PY_SFT_SMOKE=1 \
 pytest -q tests/test_sft_cuda_smoke.py
+
+RWKV_SFT_SMOKE_MODEL=model/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
+RWKV_RUN_TRAIN_PY_SFT_RESUME_SMOKE=1 \
+pytest -q tests/test_sft_cuda_smoke.py
 ```
 
-第一条命令在进程内跑 CUDA forward/backward，验证 SFT masked loss。第二条命令启动 `train.py` 跑 1 个 SFT step，额外覆盖 Lightning、DeepSpeed 和 optimizer 链路。
+第一条命令在进程内跑 CUDA forward/backward，验证 SFT masked loss。第二条命令启动 `train.py` 跑 1 个 SFT step，额外覆盖 Lightning、DeepSpeed 和 optimizer 链路。第三条命令会先保存 `rwkv-step-1.pth`，再从这个 step checkpoint 恢复，覆盖 SFT 断点续训；使用 DeepSpeed strategy 时，也会覆盖 DeepSpeed 分片 checkpoint 的加载。多卡服务器可以加 `RWKV_SFT_SMOKE_DEVICES=8`，`train.py` 会自动用 torchrun 重启多卡 DeepSpeed；也可以设置 `RWKV_SFT_SMOKE_STRATEGY=deepspeed_stage_3` 或 `deepspeed_stage_3_offload` 来验证不同分片模式。
 
 ### 为指定 binidx 数据集计算 magic_prime
 

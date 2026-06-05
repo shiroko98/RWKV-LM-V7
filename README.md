@@ -487,6 +487,62 @@ Training samples use next-token labels, so the dataloader needs `ctx_len + 1` to
 
 The 0.4B checkpoint listed in the example is `L24-D1024` with `dim_ffn=4096`, `vocab_size=65536`, `head_size=64`, and RWKV7 G1 LoRA dimensions `64/64/32/128`. If you use another checkpoint, read its architecture text and keep these shape parameters aligned with the checkpoint.
 
+SFT masked-training implementation:
+
+1. Offline preprocessing writes two aligned binidx datasets. `PREFIX.bin/.idx` stores token ids, while `PREFIX.mask.bin/.idx` stores the same-length `0/1` loss mask.
+2. `train.py` enters SFT mode with `--data_type sft_binidx`. This mode does not use the pretraining magic-prime schedule. It preserves user-provided `--epoch_steps` and `--epoch_count`, and sets Lightning `max_epochs` to `epoch_count`.
+3. `src/dataset.py::MyDataset` loads the token prefix from `--data_file` and the mask prefix from `--data_file.mask` by default. `--sft_mask_file` can override the mask prefix. Initialization validates matching document counts and identical per-document sizes.
+4. Each SFT document may contain at most `ctx_len + 1` tokens. Short documents are padded in memory with `--sft_pad_token_id` and mask `0`; long documents raise an error instead of being silently truncated.
+5. The dataset returns `(x, y, loss_mask)`: `x = token_ids[:-1]`, `y = token_ids[1:]`, and `loss_mask = raw_mask[1:]`. The mask is shifted so it marks whether each next-token target contributes to loss.
+6. `src/model.py::training_step` dispatches by batch shape. Pretraining batches `(x, y)` keep the existing fused CE path. SFT batches `(x, y, loss_mask)` use `src/sft_loss.py::masked_cross_entropy`.
+7. `masked_cross_entropy` computes per-token CE, averages only positions with `loss_mask=1`, and returns a differentiable zero loss if the mask is empty.
+
+Validation coverage:
+
+- Default unit tests in `tests/test_sft_training.py` cover sidecar loading, mask shifting, padding, invalid masks, too-long documents, SFT epoch scheduling, and masked CE math.
+- `tests/test_sft_binidx.py` covers authoritative Jinja rendering, think/no-think rules, Chinese UTF-8 spans, tool calls, packing, padding, recursive directory input, concurrent JSONL loading, and CLI parsing.
+- `RWKV_RUN_CUDA_SFT_SMOKE=1` loads a real RWKV7 checkpoint, builds a tiny SFT binidx dataset, and runs CUDA forward/backward with masked SFT loss.
+- `RWKV_RUN_TRAIN_PY_SFT_SMOKE=1` launches `train.py` for one SFT step and covers Lightning, DeepSpeed, optimizer, and multi-card torchrun.
+- `RWKV_RUN_TRAIN_PY_SFT_RESUME_SMOKE=1` saves `rwkv-step-1.pth` and resumes from it, covering SFT checkpoint resume and DeepSpeed sharded checkpoint loading.
+
+Current validation results:
+
+- Local default regression: `115 passed, 3 skipped`.
+- SFT training targeted coverage: `src.dataset`, `src.sft_loss`, and testable `train.py` helper surface are `100%`.
+- SFT preprocessing coverage: `src.sft_binidx`, `data.make_sft_binidx`, and `data.tokenizer.rwkv_tokenizer` total `99%`.
+- Server 8xH800:
+  - `RWKV_RUN_CUDA_SFT_SMOKE=1` -> `3 passed, 2 skipped`.
+  - `RWKV_RUN_TRAIN_PY_SFT_SMOKE=1` + `RWKV_SFT_SMOKE_DEVICES=8` + `deepspeed_stage_2` -> `3 passed, 2 skipped`.
+  - `RWKV_RUN_TRAIN_PY_SFT_RESUME_SMOKE=1` + `RWKV_SFT_SMOKE_DEVICES=8` + `deepspeed_stage_3_offload` -> `3 passed, 2 skipped`.
+
+13.3B SFT launcher:
+
+`run_13b_sft_zero3_offload.sh` is derived from `model/rwkv7-g1f-13.3b.txt`: `n_layer=61`, `n_embd=4096`, `dim_ffn=16384`, `vocab_size=65536`, `head_size=64`, and LoRA dimensions `192/192/128/384`. It defaults to 8xH800, `deepspeed_stage_3_offload`, and SFT binidx+mask data.
+
+Prepare data first. For fixed-length training, use `ctx_len + 1`:
+
+```bash
+python data/make_sft_binidx.py /path/to/sft_jsonl_dir \
+  --out-prefix /mnt/data/datasets/sft_train_ctx8192 \
+  --pack-length 8193 \
+  --num-workers 32 \
+  --shuffle
+```
+
+Then launch 13.3B SFT:
+
+```bash
+LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b.pth \
+DATA_FILE=/mnt/data/datasets/sft_train_ctx8192 \
+CTX_LEN=8192 \
+EPOCH_STEPS=1000 \
+EPOCH_COUNT=1 \
+WANDB_PROJECT=RWKV-13B-SFT \
+bash run_13b_sft_zero3_offload.sh
+```
+
+Use `STRATEGY=deepspeed_stage_3` if you want pure ZeRO-3 instead of offload. To resume, point `LOAD_MODEL` at a saved `rwkv-step-N.pth` checkpoint directory or file; the SFT path uses the same resume logic.
+
 Optional CUDA smoke tests are available for server validation:
 
 ```bash

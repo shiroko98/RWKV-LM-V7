@@ -283,6 +283,21 @@ Validation
 Next
 - Ask the server to rerun `RWKV_RUN_CUDA_SFT_SMOKE=1`, then run the train.py and resume smoke tests on 8 H800 GPUs.
 
+2026-06-05 SFT training documentation and 13.3B launcher
+
+Completed
+- Documented the SFT masked-training implementation in README / README_CN:
+  - offline token binidx + mask sidecar contract,
+  - `data_type=sft_binidx` scheduling,
+  - dataset mask loading / validation / shift / padding,
+  - model training-step dispatch,
+  - masked CE behavior,
+  - test coverage and server smoke test meanings.
+- Recorded current local and 8xH800 server validation results in README / README_CN.
+- Added `run_13b_sft_zero3_offload.sh` for 13.3B SFT training.
+- Derived 13.3B args from `model/rwkv7-g1f-13.3b.txt`: `n_layer=61`, `n_embd=4096`, `dim_ffn=16384`, `vocab_size=65536`, `head_size=64`, LoRA dimensions `192/192/128/384`.
+- Validated the new shell launcher syntax with `bash -n run_13b_sft_zero3_offload.sh`.
+
 2026-06-05 SFT fixture tracking follow-up
 
 Server feedback

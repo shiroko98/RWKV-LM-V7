@@ -290,6 +290,62 @@ python train.py \
 
 上面示例里的 0.4B checkpoint 是 `L24-D1024`，对应 `dim_ffn=4096`、`vocab_size=65536`、`head_size=64`，RWKV7 G1 LoRA 维度为 `64/64/32/128`。如果换用其他 checkpoint，需要先看对应架构文本，保证这些形状参数和 checkpoint 一致。
 
+SFT mask 训练的实现框架：
+
+1. 离线数据处理阶段只负责生成两套完全对齐的 binidx：主数据 `PREFIX.bin/.idx` 存 token id，sidecar `PREFIX.mask.bin/.idx` 存同长度的 `0/1` loss mask。
+2. `train.py` 通过 `--data_type sft_binidx` 进入 SFT 分支。这个分支不使用预训练的 magic-prime 调度，而是保留用户传入的 `--epoch_steps` 和 `--epoch_count`，并把 Lightning `max_epochs` 设为 `epoch_count`，所以 SFT 会按指定 epoch 数正常结束。
+3. `src/dataset.py` 的 `MyDataset` 会加载 `--data_file` 指向的 token binidx，同时默认加载 `--data_file.mask`。如果你传了 `--sft_mask_file`，就用显式 mask 前缀。初始化时会检查 token 和 mask 的 document 数量、每个 document 长度必须完全一致。
+4. 每个 SFT document 最长允许 `ctx_len + 1` 个 token。短 document 会在内存中用 `--sft_pad_token_id` padding 到 `ctx_len + 1`，padding mask 始终为 `0`；长 document 直接报错，避免静默截断破坏 mask。
+5. dataloader 返回三元组 `(x, y, loss_mask)`：`x = token_ids[:-1]`，`y = token_ids[1:]`，`loss_mask = raw_mask[1:]`。mask 右移是为了和 next-token label 对齐，也就是 mask 标记的是“这个 target token 是否参与 loss”。
+6. `src/model.py` 的 `training_step` 根据 batch 长度分流：普通预训练 `(x, y)` 继续走原来的 fused CE 快路径；SFT `(x, y, loss_mask)` 走 `src/sft_loss.py::masked_cross_entropy`。这样 SFT 不影响预训练性能路径。
+7. `masked_cross_entropy` 先用标准 CE 得到每个 token 的 loss，再只对 `loss_mask=1` 的位置求平均。如果一个 batch 的 mask 全为 `0`，返回可反传的 0 loss，避免除零和梯度图断裂。
+
+测试流程和覆盖内容：
+
+- 默认 CPU/单进程单测：`tests/test_sft_training.py` 覆盖 mask sidecar 加载、mask shift、padding、坏 mask、过长 document、SFT epoch 调度和 masked CE 数学正确性。
+- 数据处理回归：`tests/test_sft_binidx.py` 覆盖权威 Jinja 渲染、think/no-think 规则、中文 UTF-8 span、工具调用、packing、padding、递归目录、多 JSONL 并发读取和 CLI 参数。
+- CUDA smoke 第一档：`RWKV_RUN_CUDA_SFT_SMOKE=1` 会在服务器加载真实 RWKV7 checkpoint，构造 tiny SFT binidx，跑 CUDA forward/backward，验证 masked SFT loss 可以反传。
+- CUDA smoke 第二档：`RWKV_RUN_TRAIN_PY_SFT_SMOKE=1` 会启动 `train.py` 跑 1 个 SFT step，覆盖 Lightning、DeepSpeed、optimizer、多卡 torchrun 链路。
+- CUDA smoke 第三档：`RWKV_RUN_TRAIN_PY_SFT_RESUME_SMOKE=1` 会保存 `rwkv-step-1.pth` 并从它恢复，覆盖 SFT 断点续训和 DeepSpeed 分片 checkpoint 加载。
+
+当前已验证结果：
+
+- 本地默认回归：`115 passed, 3 skipped`。
+- SFT 训练相关 targeted 覆盖率：`src.dataset`、`src.sft_loss`、可单测的 `train.py` helper surface 为 `100%`。
+- SFT 数据处理覆盖率：`src.sft_binidx`、`data.make_sft_binidx`、`data.tokenizer.rwkv_tokenizer` 合计 `99%`。
+- 服务器 8xH800：
+  - `RWKV_RUN_CUDA_SFT_SMOKE=1` -> `3 passed, 2 skipped`。
+  - `RWKV_RUN_TRAIN_PY_SFT_SMOKE=1` + `RWKV_SFT_SMOKE_DEVICES=8` + `deepspeed_stage_2` -> `3 passed, 2 skipped`。
+  - `RWKV_RUN_TRAIN_PY_SFT_RESUME_SMOKE=1` + `RWKV_SFT_SMOKE_DEVICES=8` + `deepspeed_stage_3_offload` -> `3 passed, 2 skipped`。
+
+13.3B SFT 启动脚本：
+
+`run_13b_sft_zero3_offload.sh` 按 `model/rwkv7-g1f-13.3b.txt` 推导了模型形状：`n_layer=61`、`n_embd=4096`、`dim_ffn=16384`、`vocab_size=65536`、`head_size=64`、LoRA 维度 `192/192/128/384`。默认适配 8 卡 H800、`deepspeed_stage_3_offload` 和 SFT binidx+mask 数据。
+
+先准备数据，注意固定长度建议使用 `ctx_len + 1`：
+
+```bash
+python data/make_sft_binidx.py /path/to/sft_jsonl_dir \
+  --out-prefix /mnt/data/datasets/sft_train_ctx8192 \
+  --pack-length 8193 \
+  --num-workers 32 \
+  --shuffle
+```
+
+再启动 13.3B SFT：
+
+```bash
+LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b.pth \
+DATA_FILE=/mnt/data/datasets/sft_train_ctx8192 \
+CTX_LEN=8192 \
+EPOCH_STEPS=1000 \
+EPOCH_COUNT=1 \
+WANDB_PROJECT=RWKV-13B-SFT \
+bash run_13b_sft_zero3_offload.sh
+```
+
+如果你想验证纯 ZeRO-3 而不是 offload，可以覆盖 `STRATEGY=deepspeed_stage_3`。如果要断点续训，把 `LOAD_MODEL` 指到保存出来的 `rwkv-step-N.pth` 目录或文件，脚本仍走同一个 SFT resume 路径。
+
 服务器上可以打开可选 CUDA smoke 测试：
 
 ```bash

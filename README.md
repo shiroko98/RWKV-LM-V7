@@ -382,6 +382,55 @@ The final binidx will be like (here "/" means end_of_doc, which is actually toke
 > [!WARNING]
 > make_data.py will be very slow for large jsonl,check [json2binidx_tool](https://github.com/Abel2076/json2binidx_tool) if you need to process large jsonl.
 
+### Convert SFT messages jsonl to binidx + loss mask
+
+SFT preprocessing uses `data/make_sft_binidx.py`. The input is one JSON object per line. Each object should contain `messages`, and may optionally contain `tools`. `messages` follows a chat-style structure with roles such as `system`, `user`, `assistant`, and `tool`. Assistant tool-call arguments are normalized before rendering: JSON strings are parsed into structured arguments, while existing XML-style parameter fragments are preserved.
+
+Example:
+
+```bash
+python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
+  --out-prefix data/sft_train \
+  --vocab rwkv_vocab_v20260603.txt \
+  --chat-template data/SFT/sample/chat_template.jinja \
+  --pack-length 4096 \
+  --num-workers 8 \
+  --shuffle
+```
+
+To keep the original order across input files and epochs, disable shuffling:
+
+```bash
+python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
+  --out-prefix data/sft_train_ordered \
+  --no-shuffle
+```
+
+When passing more than one input JSONL, `--out-prefix` is required because there is no single source filename from which to infer the output prefix. `--num-workers` reads multiple JSONL files concurrently and also parallelizes template rendering plus tokenization. Output order remains deterministic, so the same inputs, `--seed`, and shuffle setting produce reproducible datasets. Text files are read as UTF-8; JSONL also accepts a UTF-8 BOM. Chinese and other multi-byte text are mapped through UTF-8 byte spans, so mask projection does not lose non-ASCII content.
+
+The high-level flow is:
+
+1. Read one or more UTF-8 JSONL files, skip empty lines, and keep source path plus line number for error reporting.
+2. Repeat the source samples by `--n-epoch`. By default each epoch is deterministically shuffled with `--seed`; `--no-shuffle` keeps input order.
+3. Load the authoritative SFT chat template from `data/SFT/sample/chat_template.jinja`. The root template is not used by this preprocessing path.
+4. Normalize tool-call arguments, then render each sample twice with the same Jinja template: one prefix render up to the final assistant turn for the context boundary, and one full render for the actual training text.
+5. Normalize the final assistant turn so it always contains think tags. Existing think content is preserved; missing think content receives an empty think block before the visible reply. Historical assistant turns, system text, user text, and tool outputs are context only.
+6. Derive the loss mask from the final assistant trainable suffix: everything before the final assistant content boundary is `0`; the final assistant think block, visible reply, final tool calls, assistant ending segment, and real sample ending segment are `1`.
+7. Tokenize the final text once. The code records each token's UTF-8 byte span, maps it back to character spans, and projects the character-level trainable region into a token-level mask. This handles Chinese, multi-byte symbols, and special fragments through the same path.
+8. Without packing, each source sample becomes one binidx document and one same-length mask document. With `--pack-length`, real samples are concatenated into fixed-length documents; the separator newline between real samples and tail padding are both masked out.
+9. The output is the token dataset plus a mask sidecar: `PREFIX.bin`, `PREFIX.idx`, `PREFIX.mask.bin`, and `PREFIX.mask.idx`. The future SFT dataloader should read tokens from the main dataset and loss participation from the sidecar mask.
+
+Main parameters:
+
+- `--chat-template`: SFT render template path. Defaults to `data/SFT/sample/chat_template.jinja`.
+- `--vocab`: tokenizer vocab. Defaults to `rwkv_vocab_v20260603.txt`.
+- `--n-epoch`: offline data repetition count.
+- `--seed`: random seed for shuffling; it does not affect order when shuffle is disabled.
+- `--shuffle` / `--no-shuffle`: whether to shuffle samples inside each epoch. Default is enabled.
+- `--num-workers`: worker count for concurrent reading, rendering, and tokenization. Default is `1`.
+- `--pack-length`: fixed-length packing target. If omitted, each source sample remains one document.
+- `--current-date`, `--current-location`: override or inject date and location fields in the system message.
+
 ### Compute magic_prime for specified binidx dataset
 
 The `data/compute_magic_prime.py` script computes the correct values of `--my_exit_tokens` and `--magic_prime` for a specified binidx dataset and context length (ctx_len).

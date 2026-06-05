@@ -185,6 +185,55 @@ python make_data.py demo.jsonl 3 4096
 > [!WARNING]
 > make_data.py 处理大体积 jsonl 时会非常慢，如需处理大文件请参考 [json2binidx_tool](https://github.com/Abel2076/json2binidx_tool)。
 
+### 将 SFT messages jsonl 转换为 binidx + loss mask
+
+SFT 数据处理使用 `data/make_sft_binidx.py`，输入是每行一个样本的 JSONL。每个样本至少需要包含 `messages`，可选包含 `tools`。`messages` 遵循常见的 chat 结构：`system`、`user`、`assistant`、`tool` 等角色按对话顺序排列；`assistant.tool_calls` 会在渲染前统一整理参数格式，字符串 JSON 会被解析成结构化参数，已有 XML 参数片段会原样保留。
+
+示例命令：
+
+```bash
+python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
+  --out-prefix data/sft_train \
+  --vocab rwkv_vocab_v20260603.txt \
+  --chat-template data/SFT/sample/chat_template.jinja \
+  --pack-length 4096 \
+  --num-workers 8 \
+  --shuffle
+```
+
+如果你需要保持多个输入文件和每个 epoch 内的原始顺序，可以关闭打乱：
+
+```bash
+python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
+  --out-prefix data/sft_train_ordered \
+  --no-shuffle
+```
+
+多个输入 JSONL 同时处理时必须显式指定 `--out-prefix`，因为脚本无法从多个源文件自动推导唯一输出名前缀。`--num-workers` 会并发读取多个 JSONL，并并发执行模板渲染与 tokenization；输出仍按确定的样本顺序写入，所以相同输入、`--seed`、`--shuffle` 设置会得到可复现结果。当前所有文本文件按 UTF-8 读取，JSONL 额外兼容 UTF-8 BOM，中文内容会按 UTF-8 字节映射到 token span，不会在 mask 推导中丢失。
+
+整体流程可以抽象为：
+
+1. 读取一个或多个 UTF-8 JSONL，过滤空行，并记录每条样本来自哪个文件和行号，便于定位坏 JSON。
+2. 按 `--n-epoch` 复制 epoch。默认每个 epoch 内使用 `--seed` 做确定性打乱；使用 `--no-shuffle` 时保留输入文件顺序。
+3. 加载权威 chat template：`data/SFT/sample/chat_template.jinja`。根目录模板不是 SFT 数据处理入口，避免误用。
+4. 对每条样本先规范化工具调用参数，再用同一个 Jinja template 渲染两次：一次渲染到最后一轮 assistant 之前，用来确定条件上下文边界；一次渲染完整样本，用来得到真正写入训练集的文本。
+5. 最后一轮 assistant 会被规范化为始终包含 think 标签。如果原始内容已有 think 结束标签，就保留原始 think；如果没有，就在最终回复前补一个空 think 块。历史 assistant、系统、用户、工具返回都只作为上下文。
+6. loss mask 从“最后一轮 assistant 的可训练后缀”推导：assistant 角色前缀之前全部为 `0`；最终 assistant 的 think 块、可见回复、最终工具调用、assistant 结束段和真实样本结束段为 `1`。
+7. 文本只 tokenize 一次。代码用 UTF-8 字节跨度记录每个 token 对应的字符区间，再把字符级可训练区间投影为 token 级 mask。这样中文、多字节符号和特殊片段都走同一套规则。
+8. 不启用 packing 时，每个源样本写成一个 binidx document，并同步写入一个同长度的 mask document。启用 `--pack-length` 时，多个真实样本会串接成固定长度 document；真实样本之间插入一个不计 loss 的分隔换行，尾部 padding 也不计 loss。
+9. 输出包含主 token 数据集和 mask sidecar：`PREFIX.bin`、`PREFIX.idx`、`PREFIX.mask.bin`、`PREFIX.mask.idx`。后续训练接入 SFT 时，主数据集提供 token，mask sidecar 提供哪些 token 参与 loss。
+
+参数含义：
+
+- `--chat-template`：SFT 渲染模板路径，默认 `data/SFT/sample/chat_template.jinja`。
+- `--vocab`：tokenizer vocab，默认 `rwkv_vocab_v20260603.txt`。
+- `--n-epoch`：离线重复数据的 epoch 数。
+- `--seed`：打乱顺序用的随机种子；关闭 shuffle 时不影响样本顺序。
+- `--shuffle` / `--no-shuffle`：是否在每个 epoch 内打乱样本，默认开启。
+- `--num-workers`：并发读取、渲染和 tokenize 的 worker 数，默认 `1`。
+- `--pack-length`：固定长度 packing 目标；不设置时保持一条源样本一个 document。
+- `--current-date`、`--current-location`：可覆盖或注入系统消息里的日期和位置字段。
+
 ### 为指定 binidx 数据集计算 magic_prime
 
 `data/compute_magic_prime.py` 脚本可为指定的 binidx 数据集和上下文长度（ctx_len）计算正确的 `--my_exit_tokens` 和 `--magic_prime` 值。

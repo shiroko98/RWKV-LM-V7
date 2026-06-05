@@ -21,6 +21,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--pack-length", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=1)
+    parser.add_argument("--shuffle", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--current-date", type=str, default=None)
     parser.add_argument("--current-location", type=str, default=None)
     parser.add_argument("--add-generation-prompt", action="store_true", default=False)
@@ -41,6 +42,7 @@ def main(argv=None):
         seed=args.seed,
         pack_length=args.pack_length,
         num_workers=args.num_workers,
+        shuffle=args.shuffle,
         current_date=args.current_date,
         current_location=args.current_location,
     )

@@ -780,6 +780,8 @@ def test_load_helpers_and_shuffle(tmp_path):
 
     shuffled = shuffled_epoch_lines(["a", "b"], 2, random.Random(0))
     assert sorted(shuffled) == ["a", "a", "b", "b"]
+    not_shuffled = shuffled_epoch_lines(["a", "b"], 2, random.Random(0), shuffle=False)
+    assert not_shuffled == ["a", "b", "a", "b"]
 
 
 def test_load_jsonl_sources_supports_utf8_chinese_bom_and_parallel_reads(tmp_path):
@@ -819,6 +821,13 @@ def test_shuffled_epoch_sources_keeps_source_metadata():
         ("a.jsonl", 1),
         ("a.jsonl", 1),
         ("b.jsonl", 2),
+        ("b.jsonl", 2),
+    ]
+    not_shuffled = shuffled_epoch_sources(sources, 2, random.Random(0), shuffle=False)
+    assert [(source.source_path, source.line_number) for source in not_shuffled] == [
+        ("a.jsonl", 1),
+        ("b.jsonl", 2),
+        ("a.jsonl", 1),
         ("b.jsonl", 2),
     ]
 
@@ -1072,6 +1081,38 @@ def test_build_binidx_dataset_accepts_multiple_utf8_jsonl_files_with_workers(tmp
     assert any("中文答案二" in text for text in trainable_documents)
 
 
+def test_build_binidx_dataset_can_disable_shuffle_for_ordered_epochs(tmp_path):
+    first_path = tmp_path / "first.jsonl"
+    second_path = tmp_path / "second.jsonl"
+    first_path.write_text(
+        json.dumps({"messages": [{"role": "assistant", "content": "first-answer"}]}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    second_path.write_text(
+        json.dumps({"messages": [{"role": "assistant", "content": "second-answer"}]}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    output_prefix = str(tmp_path / "ordered")
+
+    stats = build_binidx_dataset(
+        [str(first_path), str(second_path)],
+        output_prefix=output_prefix,
+        vocab_path=str(VOCAB_PATH),
+        template_path=str(TEMPLATE_PATH),
+        n_epoch=2,
+        seed=999,
+        num_workers=2,
+        shuffle=False,
+    )
+
+    tokenizer_obj = TRIE_TOKENIZER(str(VOCAB_PATH), strict_length=True)
+    token_ds = MMapIndexedDataset(output_prefix)
+    decoded_documents = [tokenizer_obj.decode(token_ds[index].astype(int).tolist()) for index in range(len(token_ds))]
+    assert stats["shuffle"] is False
+    assert ["first-answer" in text for text in decoded_documents] == [True, False, True, False]
+    assert ["second-answer" in text for text in decoded_documents] == [False, True, False, True]
+
+
 def test_build_documents_from_sources_reports_json_errors(tokenizer: TRIE_TOKENIZER, chat_template):
     sources = [JsonlSourceLine(text="{bad json", source_path="bad.jsonl", line_number=3)]
     with pytest.raises(ValueError, match=r"bad\.jsonl:3"):
@@ -1127,6 +1168,7 @@ def test_cli_main_builds_dataset_and_accepts_flags(tmp_path):
                 "128",
                 "--num-workers",
                 "2",
+                "--no-shuffle",
                 "--add-generation-prompt",
                 "--enable-thinking",
             ]
@@ -1149,6 +1191,7 @@ def test_arg_parser_defaults_and_overrides():
     assert args.n_epoch == 1
     assert args.seed == 1234
     assert args.num_workers == 1
+    assert args.shuffle is True
 
     overridden = parser.parse_args(
         [
@@ -1170,6 +1213,7 @@ def test_arg_parser_defaults_and_overrides():
             "9",
             "--num-workers",
             "3",
+            "--no-shuffle",
         ]
     )
     assert overridden.input_jsonl == ["sample.jsonl", "sample2.jsonl"]
@@ -1182,6 +1226,7 @@ def test_arg_parser_defaults_and_overrides():
     assert overridden.n_epoch == 2
     assert overridden.seed == 9
     assert overridden.num_workers == 3
+    assert overridden.shuffle is False
 
 
 def test_tools_jsonl_smoke_still_only_trains_last_assistant_if_available(

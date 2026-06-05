@@ -681,11 +681,18 @@ def load_jsonl_sources(input_jsonl: str | Sequence[str], *, num_workers: int = 1
         return [source for group in grouped_sources for source in group]
 
 
-def shuffled_epoch_lines(lines: Sequence[str], n_epoch: int, rng: random.Random) -> list[str]:
+def shuffled_epoch_lines(
+    lines: Sequence[str],
+    n_epoch: int,
+    rng: random.Random,
+    *,
+    shuffle: bool = True,
+) -> list[str]:
     shuffled_lines: list[str] = []
     for _ in range(n_epoch):
         epoch_lines = list(lines)
-        rng.shuffle(epoch_lines)
+        if shuffle:
+            rng.shuffle(epoch_lines)
         shuffled_lines.extend(epoch_lines)
     return shuffled_lines
 
@@ -694,11 +701,14 @@ def shuffled_epoch_sources(
     sources: Sequence[JsonlSourceLine],
     n_epoch: int,
     rng: random.Random,
+    *,
+    shuffle: bool = True,
 ) -> list[JsonlSourceLine]:
     shuffled_sources: list[JsonlSourceLine] = []
     for _ in range(n_epoch):
         epoch_sources = list(sources)
-        rng.shuffle(epoch_sources)
+        if shuffle:
+            rng.shuffle(epoch_sources)
         shuffled_sources.extend(epoch_sources)
     return shuffled_sources
 
@@ -816,6 +826,7 @@ def build_binidx_dataset(
     current_date: str | None = None,
     current_location: str | None = None,
     num_workers: int = 1,
+    shuffle: bool = True,
 ):
     if num_workers <= 0:
         raise ValueError("num_workers must be a positive integer.")
@@ -824,7 +835,7 @@ def build_binidx_dataset(
     tokenizer = TRIE_TOKENIZER(vocab_path, strict_length=True)
     sources = load_jsonl_sources(input_jsonl, num_workers=num_workers)
     rng = random.Random(seed)
-    shuffled_sources = shuffled_epoch_sources(sources, n_epoch, rng)
+    shuffled_sources = shuffled_epoch_sources(sources, n_epoch, rng, shuffle=shuffle)
     prefix = output_prefix or default_output_prefix(input_jsonl)
 
     documents = build_documents_from_sources(
@@ -851,4 +862,5 @@ def build_binidx_dataset(
     stats["epochs"] = n_epoch
     stats["pack_length"] = pack_length
     stats["num_workers"] = num_workers
+    stats["shuffle"] = shuffle
     return stats

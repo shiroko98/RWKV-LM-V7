@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import random
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -68,6 +69,13 @@ class Segment:
 class EncodedDocument:
     input_ids: list[int]
     loss_mask: list[int]
+
+
+@dataclass(frozen=True)
+class JsonlSourceLine:
+    text: str
+    source_path: str
+    line_number: int
 
 
 def _tojson_filter(obj, ensure_ascii=False):
@@ -630,8 +638,47 @@ def pack_encoded_documents(
 
 
 def load_non_empty_lines(input_path: str) -> list[str]:
-    with open(input_path, "r", encoding="utf-8") as file:
+    with open(input_path, "r", encoding="utf-8-sig") as file:
         return [line.strip() for line in file if line.strip()]
+
+
+def load_non_empty_source_lines(input_path: str) -> list[JsonlSourceLine]:
+    source_lines: list[JsonlSourceLine] = []
+    with open(input_path, "r", encoding="utf-8-sig") as file:
+        for line_number, line in enumerate(file, start=1):
+            stripped = line.strip()
+            if stripped:
+                source_lines.append(
+                    JsonlSourceLine(
+                        text=stripped,
+                        source_path=str(Path(input_path)),
+                        line_number=line_number,
+                    )
+                )
+    return source_lines
+
+
+def normalize_input_paths(input_jsonl: str | Sequence[str]) -> list[str]:
+    if isinstance(input_jsonl, (str, Path)):
+        paths = [str(input_jsonl)]
+    else:
+        paths = [str(path) for path in input_jsonl]
+    if not paths:
+        raise ValueError("At least one input JSONL path is required.")
+    return paths
+
+
+def load_jsonl_sources(input_jsonl: str | Sequence[str], *, num_workers: int = 1) -> list[JsonlSourceLine]:
+    input_paths = normalize_input_paths(input_jsonl)
+    if num_workers <= 1 or len(input_paths) == 1:
+        sources: list[JsonlSourceLine] = []
+        for input_path in input_paths:
+            sources.extend(load_non_empty_source_lines(input_path))
+        return sources
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        grouped_sources = executor.map(load_non_empty_source_lines, input_paths)
+        return [source for group in grouped_sources for source in group]
 
 
 def shuffled_epoch_lines(lines: Sequence[str], n_epoch: int, rng: random.Random) -> list[str]:
@@ -641,6 +688,75 @@ def shuffled_epoch_lines(lines: Sequence[str], n_epoch: int, rng: random.Random)
         rng.shuffle(epoch_lines)
         shuffled_lines.extend(epoch_lines)
     return shuffled_lines
+
+
+def shuffled_epoch_sources(
+    sources: Sequence[JsonlSourceLine],
+    n_epoch: int,
+    rng: random.Random,
+) -> list[JsonlSourceLine]:
+    shuffled_sources: list[JsonlSourceLine] = []
+    for _ in range(n_epoch):
+        epoch_sources = list(sources)
+        rng.shuffle(epoch_sources)
+        shuffled_sources.extend(epoch_sources)
+    return shuffled_sources
+
+
+def _build_document_from_source_line(
+    source: JsonlSourceLine,
+    *,
+    tokenizer: TRIE_TOKENIZER,
+    template,
+    current_date: str | None = None,
+    current_location: str | None = None,
+) -> EncodedDocument:
+    try:
+        record = json.loads(source.text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Invalid JSON in {source.source_path}:{source.line_number}: {exc.msg}"
+        ) from exc
+    return build_document_from_record(
+        record,
+        tokenizer=tokenizer,
+        template=template,
+        current_date=current_date,
+        current_location=current_location,
+    )
+
+
+def build_documents_from_sources(
+    sources: Sequence[JsonlSourceLine],
+    *,
+    tokenizer: TRIE_TOKENIZER,
+    template,
+    current_date: str | None = None,
+    current_location: str | None = None,
+    num_workers: int = 1,
+) -> Iterable[EncodedDocument]:
+    if num_workers <= 1:
+        for source in sources:
+            yield _build_document_from_source_line(
+                source,
+                tokenizer=tokenizer,
+                template=template,
+                current_date=current_date,
+                current_location=current_location,
+            )
+        return
+
+    def build(source: JsonlSourceLine) -> EncodedDocument:
+        return _build_document_from_source_line(
+            source,
+            tokenizer=tokenizer,
+            template=template,
+            current_date=current_date,
+            current_location=current_location,
+        )
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        yield from executor.map(build, sources)
 
 
 def write_documents(
@@ -680,13 +796,16 @@ def write_documents(
     }
 
 
-def default_output_prefix(input_jsonl: str) -> str:
-    input_path = Path(input_jsonl).resolve()
+def default_output_prefix(input_jsonl: str | Sequence[str]) -> str:
+    input_paths = normalize_input_paths(input_jsonl)
+    if len(input_paths) != 1:
+        raise ValueError("--out-prefix is required when building from multiple input JSONL files.")
+    input_path = Path(input_paths[0]).resolve()
     return str(input_path.with_suffix(""))
 
 
 def build_binidx_dataset(
-    input_jsonl: str,
+    input_jsonl: str | Sequence[str],
     *,
     output_prefix: str | None,
     vocab_path: str,
@@ -696,23 +815,25 @@ def build_binidx_dataset(
     pack_length: int | None = None,
     current_date: str | None = None,
     current_location: str | None = None,
+    num_workers: int = 1,
 ):
+    if num_workers <= 0:
+        raise ValueError("num_workers must be a positive integer.")
+
     template = load_chat_template(template_path)
     tokenizer = TRIE_TOKENIZER(vocab_path, strict_length=True)
-    lines = load_non_empty_lines(input_jsonl)
+    sources = load_jsonl_sources(input_jsonl, num_workers=num_workers)
     rng = random.Random(seed)
-    shuffled_lines = shuffled_epoch_lines(lines, n_epoch, rng)
+    shuffled_sources = shuffled_epoch_sources(sources, n_epoch, rng)
     prefix = output_prefix or default_output_prefix(input_jsonl)
 
-    documents = (
-        build_document_from_record(
-            json.loads(line),
-            tokenizer=tokenizer,
-            template=template,
-            current_date=current_date,
-            current_location=current_location,
-        )
-        for line in shuffled_lines
+    documents = build_documents_from_sources(
+        shuffled_sources,
+        tokenizer=tokenizer,
+        template=template,
+        current_date=current_date,
+        current_location=current_location,
+        num_workers=num_workers,
     )
     if pack_length is not None:
         documents = pack_encoded_documents(
@@ -724,8 +845,10 @@ def build_binidx_dataset(
 
     stats = write_documents(prefix, documents)
     stats["output_prefix"] = prefix
-    stats["source_lines"] = len(lines)
-    stats["source_documents"] = len(shuffled_lines)
+    stats["source_files"] = len(normalize_input_paths(input_jsonl))
+    stats["source_lines"] = len(sources)
+    stats["source_documents"] = len(shuffled_sources)
     stats["epochs"] = n_epoch
     stats["pack_length"] = pack_length
+    stats["num_workers"] = num_workers
     return stats

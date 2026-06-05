@@ -22,6 +22,7 @@ from src.sft_binidx import (
     EOD_TOKEN,
     EncodedDocument,
     IM_START_TOKEN,
+    JsonlSourceLine,
     NO_THINKING_PREFIX,
     Segment,
     _assistant_has_existing_think,
@@ -36,6 +37,7 @@ from src.sft_binidx import (
     _render_prefix_and_full,
     _tokenize_with_char_spans,
     build_binidx_dataset,
+    build_documents_from_sources,
     build_document_from_record,
     build_system_text,
     build_template_segments,
@@ -48,9 +50,12 @@ from src.sft_binidx import (
     last_assistant_content_index,
     last_assistant_message,
     load_chat_template,
+    load_jsonl_sources,
     load_non_empty_lines,
+    load_non_empty_source_lines,
     mask_file_path,
     mask_prefix_path,
+    normalize_input_paths,
     normalize_tool_calls,
     normalize_record,
     pack_encoded_documents,
@@ -60,6 +65,7 @@ from src.sft_binidx import (
     render_tool_response,
     render_tool_schema,
     shuffled_epoch_lines,
+    shuffled_epoch_sources,
     split_system_and_conversation,
     visible_text,
     write_documents,
@@ -776,6 +782,47 @@ def test_load_helpers_and_shuffle(tmp_path):
     assert sorted(shuffled) == ["a", "a", "b", "b"]
 
 
+def test_load_jsonl_sources_supports_utf8_chinese_bom_and_parallel_reads(tmp_path):
+    first_path = tmp_path / "first.jsonl"
+    second_path = tmp_path / "second.jsonl"
+    first_path.write_text(
+        "\ufeff"
+        + json.dumps({"messages": [{"role": "assistant", "content": "中文答案一"}]}, ensure_ascii=False)
+        + "\n\n",
+        encoding="utf-8",
+    )
+    second_path.write_text(
+        json.dumps({"messages": [{"role": "assistant", "content": "中文答案二"}]}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    sources = load_jsonl_sources([str(first_path), str(second_path)], num_workers=2)
+
+    assert [source.line_number for source in sources] == [1, 1]
+    assert [json.loads(source.text)["messages"][0]["content"] for source in sources] == [
+        "中文答案一",
+        "中文答案二",
+    ]
+    assert normalize_input_paths(str(first_path)) == [str(first_path)]
+    assert normalize_input_paths([first_path, second_path]) == [str(first_path), str(second_path)]
+    with pytest.raises(ValueError, match="At least one"):
+        normalize_input_paths([])
+
+
+def test_shuffled_epoch_sources_keeps_source_metadata():
+    sources = [
+        JsonlSourceLine(text="a", source_path="a.jsonl", line_number=1),
+        JsonlSourceLine(text="b", source_path="b.jsonl", line_number=2),
+    ]
+    shuffled = shuffled_epoch_sources(sources, 2, random.Random(0))
+    assert sorted((source.source_path, source.line_number) for source in shuffled) == [
+        ("a.jsonl", 1),
+        ("a.jsonl", 1),
+        ("b.jsonl", 2),
+        ("b.jsonl", 2),
+    ]
+
+
 def test_compile_chat_template_and_env():
     env = _build_jinja_env()
     assert "tojson" in env.filters
@@ -790,6 +837,9 @@ def test_path_helpers_and_default_output_prefix(tmp_path):
     assert mask_prefix_path(prefix).endswith(".mask")
     assert mask_file_path(prefix).endswith(".mask.bin")
     assert default_output_prefix(str(tmp_path / "file.jsonl")) == str((tmp_path / "file").resolve())
+    assert default_output_prefix([str(tmp_path / "file.jsonl")]) == str((tmp_path / "file").resolve())
+    with pytest.raises(ValueError, match="out-prefix"):
+        default_output_prefix([str(tmp_path / "a.jsonl"), str(tmp_path / "b.jsonl")])
 
 
 def test_write_documents_writes_token_and_mask_sidecar(tmp_path):
@@ -963,6 +1013,96 @@ def test_build_binidx_dataset_shuffles_epochs_deterministically(tmp_path):
     assert Path(mask_file_path(prefix_one)).read_bytes() == Path(mask_file_path(prefix_two)).read_bytes()
 
 
+def test_build_binidx_dataset_accepts_multiple_utf8_jsonl_files_with_workers(tmp_path):
+    first_path = tmp_path / "first.jsonl"
+    second_path = tmp_path / "second.jsonl"
+    first_record = {"messages": [{"role": "assistant", "content": "中文答案一"}]}
+    second_record = {"messages": [{"role": "assistant", "content": "中文答案二"}]}
+    first_path.write_text(json.dumps(first_record, ensure_ascii=False) + "\n", encoding="utf-8")
+    second_path.write_text(json.dumps(second_record, ensure_ascii=False) + "\n", encoding="utf-8")
+    serial_prefix = str(tmp_path / "serial")
+    parallel_prefix = str(tmp_path / "parallel")
+
+    serial_stats = build_binidx_dataset(
+        [str(first_path), str(second_path)],
+        output_prefix=serial_prefix,
+        vocab_path=str(VOCAB_PATH),
+        template_path=str(TEMPLATE_PATH),
+        n_epoch=2,
+        seed=123,
+        num_workers=1,
+    )
+    parallel_stats = build_binidx_dataset(
+        [str(first_path), str(second_path)],
+        output_prefix=parallel_prefix,
+        vocab_path=str(VOCAB_PATH),
+        template_path=str(TEMPLATE_PATH),
+        n_epoch=2,
+        seed=123,
+        num_workers=2,
+    )
+
+    assert serial_stats["source_files"] == parallel_stats["source_files"] == 2
+    assert serial_stats["source_lines"] == parallel_stats["source_lines"] == 2
+    assert serial_stats["source_documents"] == parallel_stats["source_documents"] == 4
+    assert parallel_stats["num_workers"] == 2
+    assert Path(data_file_path(serial_prefix)).read_bytes() == Path(data_file_path(parallel_prefix)).read_bytes()
+    assert Path(mask_file_path(serial_prefix)).read_bytes() == Path(mask_file_path(parallel_prefix)).read_bytes()
+
+    tokenizer_obj = TRIE_TOKENIZER(str(VOCAB_PATH), strict_length=True)
+    token_ds = MMapIndexedDataset(parallel_prefix)
+    mask_ds = MMapIndexedDataset(parallel_prefix + ".mask")
+    decoded_documents = [tokenizer_obj.decode(token_ds[index].astype(int).tolist()) for index in range(len(token_ds))]
+    trainable_documents = [
+        tokenizer_obj.decode(
+            [
+                token_id
+                for token_id, keep in zip(
+                    token_ds[index].astype(int).tolist(),
+                    mask_ds[index].astype(int).tolist(),
+                )
+                if keep == 1
+            ]
+        )
+        for index in range(len(token_ds))
+    ]
+    assert any("中文答案一" in text for text in decoded_documents)
+    assert any("中文答案二" in text for text in decoded_documents)
+    assert any("中文答案一" in text for text in trainable_documents)
+    assert any("中文答案二" in text for text in trainable_documents)
+
+
+def test_build_documents_from_sources_reports_json_errors(tokenizer: TRIE_TOKENIZER, chat_template):
+    sources = [JsonlSourceLine(text="{bad json", source_path="bad.jsonl", line_number=3)]
+    with pytest.raises(ValueError, match=r"bad\.jsonl:3"):
+        list(
+            build_documents_from_sources(
+                sources,
+                tokenizer=tokenizer,
+                template=chat_template,
+                num_workers=2,
+            )
+        )
+
+
+def test_build_binidx_dataset_rejects_invalid_worker_count(tmp_path):
+    input_path = tmp_path / "sample.jsonl"
+    input_path.write_text(
+        json.dumps({"messages": [{"role": "assistant", "content": "a"}]}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="num_workers"):
+        build_binidx_dataset(
+            str(input_path),
+            output_prefix=str(tmp_path / "out"),
+            vocab_path=str(VOCAB_PATH),
+            template_path=str(TEMPLATE_PATH),
+            n_epoch=1,
+            seed=1,
+            num_workers=0,
+        )
+
+
 def test_cli_main_builds_dataset_and_accepts_flags(tmp_path):
     input_path = tmp_path / "cli.jsonl"
     input_path.write_text(THINK_SAMPLE_PATH.read_text(encoding="utf-8"), encoding="utf-8")
@@ -985,6 +1125,8 @@ def test_cli_main_builds_dataset_and_accepts_flags(tmp_path):
                 "Shanghai, China",
                 "--pack-length",
                 "128",
+                "--num-workers",
+                "2",
                 "--add-generation-prompt",
                 "--enable-thinking",
             ]
@@ -1001,14 +1143,17 @@ def test_cli_main_builds_dataset_and_accepts_flags(tmp_path):
 def test_arg_parser_defaults_and_overrides():
     parser = build_arg_parser()
     args = parser.parse_args(["sample.jsonl"])
+    assert args.input_jsonl == ["sample.jsonl"]
     assert args.vocab == "rwkv_vocab_v20260603.txt"
     assert args.chat_template == "data/SFT/sample/chat_template.jinja"
     assert args.n_epoch == 1
     assert args.seed == 1234
+    assert args.num_workers == 1
 
     overridden = parser.parse_args(
         [
             "sample.jsonl",
+            "sample2.jsonl",
             "--out-prefix",
             "out",
             "--current-date",
@@ -1023,8 +1168,11 @@ def test_arg_parser_defaults_and_overrides():
             "2",
             "--seed",
             "9",
+            "--num-workers",
+            "3",
         ]
     )
+    assert overridden.input_jsonl == ["sample.jsonl", "sample2.jsonl"]
     assert overridden.out_prefix == "out"
     assert overridden.current_date == "2026-06-03"
     assert overridden.current_location == "Shanghai"
@@ -1033,6 +1181,7 @@ def test_arg_parser_defaults_and_overrides():
     assert overridden.enable_thinking is True
     assert overridden.n_epoch == 2
     assert overridden.seed == 9
+    assert overridden.num_workers == 3
 
 
 def test_tools_jsonl_smoke_still_only_trains_last_assistant_if_available(

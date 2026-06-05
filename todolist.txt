@@ -305,9 +305,11 @@ Completed
 - The smoke can either train a tiny SFT DeepSpeed checkpoint first, or use `RWKV_SFT_MERGE_CHECKPOINT_DIR` to test an existing checkpoint directory.
 - The smoke calls `scripts/convert_deepspeed_checkpoint_to_pth.py`, loads the produced single-file `.pth`, and runs `scripts/test_converted_checkpoint_equivalence.py` against the original ZeRO checkpoint.
 - Documented the server commands in README / README_CN.
-
-Next
-- Run the new pth merge smoke on the 8xH800 server.
+- Server 8xH800 validation passed:
+  - `RWKV_RUN_TRAIN_PY_SFT_MERGE_SMOKE=1`
+  - `RWKV_SFT_SMOKE_DEVICES=8`
+  - `RWKV_SFT_SMOKE_STRATEGY=deepspeed_stage_3_offload`
+  - result: `1 passed in 284.01s`.
 
 2026-06-05 SFT fixture tracking follow-up
 

@@ -59,6 +59,7 @@ from src.sft_binidx import (
     normalize_tool_calls,
     normalize_record,
     pack_encoded_documents,
+    pad_encoded_documents,
     parse_tool_arguments,
     render_chat_template,
     render_tool_calls,
@@ -770,6 +771,40 @@ def test_pack_encoded_documents_splits_long_stream_and_validates_lengths(tokeniz
         )
 
 
+def test_pad_encoded_documents_pads_each_document_and_validates_lengths(tokenizer: TRIE_TOKENIZER):
+    eod_id = eod_token_id(tokenizer)
+    padded = list(
+        pad_encoded_documents(
+            [EncodedDocument(input_ids=[1, 2], loss_mask=[0, 1])],
+            pad_length=4,
+            pad_token_id=eod_id,
+        )
+    )
+    assert padded[0].input_ids == [1, 2, eod_id, eod_id]
+    assert padded[0].loss_mask == [0, 1, 0, 0]
+
+    with pytest.raises(ValueError, match="positive integer"):
+        list(pad_encoded_documents([], pad_length=0, pad_token_id=eod_id))
+
+    with pytest.raises(ValueError, match="exceeds pad_length"):
+        list(
+            pad_encoded_documents(
+                [EncodedDocument(input_ids=[1, 2, 3], loss_mask=[1, 1, 1])],
+                pad_length=2,
+                pad_token_id=eod_id,
+            )
+        )
+
+    with pytest.raises(ValueError, match="identical lengths"):
+        list(
+            pad_encoded_documents(
+                [EncodedDocument(input_ids=[1, 2], loss_mask=[1])],
+                pad_length=2,
+                pad_token_id=eod_id,
+            )
+        )
+
+
 def test_load_helpers_and_shuffle(tmp_path):
     template_path = tmp_path / "template.jinja"
     template_path.write_text("hello", encoding="utf-8")
@@ -813,6 +848,27 @@ def test_load_jsonl_sources_supports_utf8_chinese_bom_and_parallel_reads(tmp_pat
         normalize_input_paths([])
 
 
+def test_normalize_input_paths_expands_jsonl_directory_sorted(tmp_path):
+    input_dir = tmp_path / "inputs"
+    input_dir.mkdir()
+    (input_dir / "b.jsonl").write_text('{"messages":[]}\n', encoding="utf-8")
+    (input_dir / "a.jsonl").write_text('{"messages":[]}\n', encoding="utf-8")
+    (input_dir / "notes.txt").write_text("skip me\n", encoding="utf-8")
+    nested = input_dir / "nested"
+    nested.mkdir()
+    (nested / "c.jsonl").write_text('{"messages":[]}\n', encoding="utf-8")
+
+    assert normalize_input_paths(str(input_dir)) == [
+        str(input_dir / "a.jsonl"),
+        str(input_dir / "b.jsonl"),
+    ]
+
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    with pytest.raises(ValueError, match=r"No \.jsonl files"):
+        normalize_input_paths(str(empty_dir))
+
+
 def test_shuffled_epoch_sources_keeps_source_metadata():
     sources = [
         JsonlSourceLine(text="a", source_path="a.jsonl", line_number=1),
@@ -849,6 +905,9 @@ def test_path_helpers_and_default_output_prefix(tmp_path):
     assert mask_file_path(prefix).endswith(".mask.bin")
     assert default_output_prefix(str(tmp_path / "file.jsonl")) == str((tmp_path / "file").resolve())
     assert default_output_prefix([str(tmp_path / "file.jsonl")]) == str((tmp_path / "file").resolve())
+    input_dir = tmp_path / "input_dir"
+    input_dir.mkdir()
+    assert default_output_prefix(str(input_dir)) == str(input_dir.resolve())
     with pytest.raises(ValueError, match="out-prefix"):
         default_output_prefix([str(tmp_path / "a.jsonl"), str(tmp_path / "b.jsonl")])
 
@@ -1083,6 +1142,91 @@ def test_build_binidx_dataset_accepts_multiple_utf8_jsonl_files_with_workers(tmp
     assert any("中文答案二" in text for text in trainable_documents)
 
 
+def test_build_binidx_dataset_accepts_input_directory_and_custom_output_prefix(tmp_path):
+    input_dir = tmp_path / "jsonl_parts"
+    input_dir.mkdir()
+    first_path = input_dir / "001.jsonl"
+    second_path = input_dir / "002.jsonl"
+    first_path.write_text(
+        json.dumps({"messages": [{"role": "assistant", "content": "folder-answer-one"}]}, ensure_ascii=False)
+        + "\n",
+        encoding="utf-8",
+    )
+    second_path.write_text(
+        json.dumps({"messages": [{"role": "assistant", "content": "folder-answer-two"}]}, ensure_ascii=False)
+        + "\n",
+        encoding="utf-8",
+    )
+    (input_dir / "README.txt").write_text("ignored\n", encoding="utf-8")
+    output_prefix = str(tmp_path / "custom_sft_name")
+
+    stats = build_binidx_dataset(
+        str(input_dir),
+        output_prefix=output_prefix,
+        vocab_path=str(VOCAB_PATH),
+        template_path=str(TEMPLATE_PATH),
+        n_epoch=1,
+        seed=123,
+        num_workers=2,
+        shuffle=False,
+    )
+
+    tokenizer_obj = TRIE_TOKENIZER(str(VOCAB_PATH), strict_length=True)
+    token_ds = MMapIndexedDataset(output_prefix)
+    decoded_documents = [tokenizer_obj.decode(token_ds[index].astype(int).tolist()) for index in range(len(token_ds))]
+    assert stats["output_prefix"] == output_prefix
+    assert stats["source_files"] == 2
+    assert stats["source_lines"] == 2
+    assert (tmp_path / "custom_sft_name.bin").exists()
+    assert (tmp_path / "custom_sft_name.idx").exists()
+    assert (tmp_path / "custom_sft_name.mask.bin").exists()
+    assert (tmp_path / "custom_sft_name.mask.idx").exists()
+    assert ["folder-answer-one" in text for text in decoded_documents] == [True, False]
+    assert ["folder-answer-two" in text for text in decoded_documents] == [False, True]
+
+
+def test_build_binidx_dataset_can_pad_each_unpacked_document(tmp_path):
+    tokenizer_obj = TRIE_TOKENIZER(str(VOCAB_PATH), strict_length=True)
+    records = [
+        {"messages": [{"role": "assistant", "content": "pad-answer-one"}]},
+        {"messages": [{"role": "assistant", "content": "pad-answer-two"}]},
+    ]
+    input_path = tmp_path / "pad.jsonl"
+    input_path.write_text(
+        "\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    template = load_chat_template(str(TEMPLATE_PATH))
+    max_document_length = max(
+        len(build_document_from_record(record, tokenizer=tokenizer_obj, template=template).input_ids)
+        for record in records
+    )
+    pad_length = max_document_length + 5
+    output_prefix = str(tmp_path / "padded")
+
+    stats = build_binidx_dataset(
+        str(input_path),
+        output_prefix=output_prefix,
+        vocab_path=str(VOCAB_PATH),
+        template_path=str(TEMPLATE_PATH),
+        n_epoch=1,
+        seed=123,
+        pad_length=pad_length,
+        shuffle=False,
+    )
+
+    token_ds = MMapIndexedDataset(output_prefix)
+    mask_ds = MMapIndexedDataset(output_prefix + ".mask")
+    assert stats["documents"] == 2
+    assert stats["pack_length"] is None
+    assert stats["pad_length"] == pad_length
+    assert [len(token_ds[index]) for index in range(len(token_ds))] == [pad_length, pad_length]
+    assert [mask_ds[index].astype(int).tolist()[-5:] for index in range(len(mask_ds))] == [
+        [0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0],
+    ]
+
+
 def test_build_binidx_dataset_can_disable_shuffle_for_ordered_epochs(tmp_path):
     first_path = tmp_path / "first.jsonl"
     second_path = tmp_path / "second.jsonl"
@@ -1146,6 +1290,25 @@ def test_build_binidx_dataset_rejects_invalid_worker_count(tmp_path):
         )
 
 
+def test_build_binidx_dataset_rejects_pack_and_pad_together(tmp_path):
+    input_path = tmp_path / "sample.jsonl"
+    input_path.write_text(
+        json.dumps({"messages": [{"role": "assistant", "content": "a"}]}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        build_binidx_dataset(
+            str(input_path),
+            output_prefix=str(tmp_path / "out"),
+            vocab_path=str(VOCAB_PATH),
+            template_path=str(TEMPLATE_PATH),
+            n_epoch=1,
+            seed=1,
+            pack_length=128,
+            pad_length=128,
+        )
+
+
 def test_cli_main_builds_dataset_and_accepts_flags(tmp_path):
     input_path = tmp_path / "cli.jsonl"
     input_path.write_text(THINK_SAMPLE_PATH.read_text(encoding="utf-8"), encoding="utf-8")
@@ -1194,12 +1357,13 @@ def test_arg_parser_defaults_and_overrides():
     assert args.seed == 1234
     assert args.num_workers == 1
     assert args.shuffle is True
+    assert args.pad_length is None
 
     overridden = parser.parse_args(
         [
             "sample.jsonl",
             "sample2.jsonl",
-            "--out-prefix",
+            "--output-prefix",
             "out",
             "--current-date",
             "2026-06-03",
@@ -1207,6 +1371,8 @@ def test_arg_parser_defaults_and_overrides():
             "Shanghai",
             "--pack-length",
             "64",
+            "--pad-length",
+            "128",
             "--add-generation-prompt",
             "--enable-thinking",
             "--n-epoch",
@@ -1223,6 +1389,7 @@ def test_arg_parser_defaults_and_overrides():
     assert overridden.current_date == "2026-06-03"
     assert overridden.current_location == "Shanghai"
     assert overridden.pack_length == 64
+    assert overridden.pad_length == 128
     assert overridden.add_generation_prompt is True
     assert overridden.enable_thinking is True
     assert overridden.n_epoch == 2

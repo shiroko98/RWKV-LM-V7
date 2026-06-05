@@ -398,6 +398,15 @@ python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
   --shuffle
 ```
 
+You can also pass a directory containing JSONL shards. A directory input expands to its direct child `*.jsonl` files in sorted path order:
+
+```bash
+python data/make_sft_binidx.py data/sft_shards \
+  --output-prefix data/sft_train \
+  --pack-length 4096 \
+  --num-workers 8
+```
+
 To keep the original order across input files and epochs, disable shuffling:
 
 ```bash
@@ -406,29 +415,34 @@ python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
   --no-shuffle
 ```
 
-When passing more than one input JSONL, `--out-prefix` is required because there is no single source filename from which to infer the output prefix. `--num-workers` reads multiple JSONL files concurrently and also parallelizes template rendering plus tokenization. Output order remains deterministic, so the same inputs, `--seed`, and shuffle setting produce reproducible datasets. Text files are read as UTF-8; JSONL also accepts a UTF-8 BOM. Chinese and other multi-byte text are mapped through UTF-8 byte spans, so mask projection does not lose non-ASCII content.
+Use `--out-prefix` or its alias `--output-prefix` to choose the output binidx prefix. For example, `--out-prefix data/sft_train` writes `data/sft_train.bin`, `data/sft_train.idx`, `data/sft_train.mask.bin`, and `data/sft_train.mask.idx`. When passing more than one positional input path, the prefix is required because there is no single source name to infer it from. A single file defaults to that file name without `.jsonl`; a single directory defaults to the directory path as the prefix.
+
+`--num-workers` is used in two places. During input loading, each JSONL file is one read task, so multiple files can be read concurrently; one large file is not split across workers at the read stage. After loading, template rendering and tokenization are parallelized across source samples. Output order remains deterministic, so the same inputs, `--seed`, and shuffle setting produce reproducible datasets. Text files are read as UTF-8; JSONL also accepts a UTF-8 BOM. Chinese and other multi-byte text are mapped through UTF-8 byte spans, so mask projection does not lose non-ASCII content.
 
 The high-level flow is:
 
 1. Read one or more UTF-8 JSONL files, skip empty lines, and keep source path plus line number for error reporting.
-2. Repeat the source samples by `--n-epoch`. By default each epoch is deterministically shuffled with `--seed`; `--no-shuffle` keeps input order.
-3. Load the authoritative SFT chat template from `data/SFT/sample/chat_template.jinja`. The root template is not used by this preprocessing path.
-4. Normalize tool-call arguments, then render each sample twice with the same Jinja template: one prefix render up to the final assistant turn for the context boundary, and one full render for the actual training text.
-5. Normalize the final assistant turn so it always contains think tags. Existing think content is preserved; missing think content receives an empty think block before the visible reply. Historical assistant turns, system text, user text, and tool outputs are context only.
-6. Derive the loss mask from the final assistant trainable suffix: everything before the final assistant content boundary is `0`. Real think content that comes from the sample is trainable, but the automatically added empty think block for no-think samples is context only and remains `0`; the visible reply, final tool calls, assistant ending segment, and real sample ending segment are `1`.
-7. Tokenize the final text once. The code records each token's UTF-8 byte span, maps it back to character spans, and projects the character-level trainable region into a token-level mask. This handles Chinese, multi-byte symbols, and special fragments through the same path.
-8. Without packing, each source sample becomes one binidx document and one same-length mask document. With `--pack-length`, real samples are concatenated into fixed-length documents; the separator newline between real samples and tail padding are both masked out.
-9. The output is the token dataset plus a mask sidecar: `PREFIX.bin`, `PREFIX.idx`, `PREFIX.mask.bin`, and `PREFIX.mask.idx`. The future SFT dataloader should read tokens from the main dataset and loss participation from the sidecar mask.
+2. Expand directory inputs to sorted direct-child `*.jsonl` files. Nested directories are ignored.
+3. Repeat the source samples by `--n-epoch`. This is offline duplication before writing the dataset: `--n-epoch 3` writes each source sample three times into the produced binidx. By default each repeated pass is deterministically shuffled with `--seed`; `--no-shuffle` keeps input order for every pass.
+4. Load the authoritative SFT chat template from `data/SFT/sample/chat_template.jinja`. The root template is not used by this preprocessing path.
+5. Normalize tool-call arguments, then render each sample twice with the same Jinja template: one prefix render up to the final assistant turn for the context boundary, and one full render for the actual training text.
+6. Normalize the final assistant turn so it always contains think tags. Existing think content is preserved; missing think content receives an empty think block before the visible reply. Historical assistant turns, system text, user text, and tool outputs are context only.
+7. Derive the loss mask from the final assistant trainable suffix: everything before the final assistant content boundary is `0`. Real think content that comes from the sample is trainable, but the automatically added empty think block for no-think samples is context only and remains `0`; the visible reply, final tool calls, assistant ending segment, and real sample ending segment are `1`.
+8. Tokenize the final text once. The code records each token's UTF-8 byte span, maps it back to character spans, and projects the character-level trainable region into a token-level mask. This handles Chinese, multi-byte symbols, and special fragments through the same path.
+9. Without `--pack-length` or `--pad-length`, each repeated source sample becomes one variable-length binidx document and one same-length mask document; no padding is added. With `--pack-length`, samples are concatenated into fixed-length documents, long streams can be split across documents, the separator newline between real samples is masked out, and only the final tail is padded. With `--pad-length`, packing stays disabled: each source sample remains its own document and is padded to the requested length with mask `0`; a sample longer than `--pad-length` raises an error.
+10. The output is the token dataset plus a mask sidecar: `PREFIX.bin`, `PREFIX.idx`, `PREFIX.mask.bin`, and `PREFIX.mask.idx`. The future SFT dataloader should read tokens from the main dataset and loss participation from the sidecar mask.
 
 Main parameters:
 
 - `--chat-template`: SFT render template path. Defaults to `data/SFT/sample/chat_template.jinja`.
 - `--vocab`: tokenizer vocab. Defaults to `rwkv_vocab_v20260603.txt`.
-- `--n-epoch`: offline data repetition count.
+- `--out-prefix` / `--output-prefix`: output binidx prefix. The four output files are derived from this prefix.
+- `--n-epoch`: offline data repetition count; values greater than `1` duplicate samples in the produced dataset.
 - `--seed`: random seed for shuffling; it does not affect order when shuffle is disabled.
 - `--shuffle` / `--no-shuffle`: whether to shuffle samples inside each epoch. Default is enabled.
 - `--num-workers`: worker count for concurrent reading, rendering, and tokenization. Default is `1`.
 - `--pack-length`: fixed-length packing target. If omitted, each source sample remains one document.
+- `--pad-length`: fixed-length per-sample padding target without packing. Mutually exclusive with `--pack-length`.
 - `--current-date`, `--current-location`: override or inject date and location fields in the system message.
 
 ### Compute magic_prime for specified binidx dataset

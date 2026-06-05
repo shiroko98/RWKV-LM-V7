@@ -201,6 +201,15 @@ python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
   --shuffle
 ```
 
+也可以直接传入一个包含 JSONL 分片的文件夹。文件夹输入会展开为该目录直接子级里的 `*.jsonl` 文件，并按路径排序：
+
+```bash
+python data/make_sft_binidx.py data/sft_shards \
+  --output-prefix data/sft_train \
+  --pack-length 4096 \
+  --num-workers 8
+```
+
 如果你需要保持多个输入文件和每个 epoch 内的原始顺序，可以关闭打乱：
 
 ```bash
@@ -209,29 +218,34 @@ python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
   --no-shuffle
 ```
 
-多个输入 JSONL 同时处理时必须显式指定 `--out-prefix`，因为脚本无法从多个源文件自动推导唯一输出名前缀。`--num-workers` 会并发读取多个 JSONL，并并发执行模板渲染与 tokenization；输出仍按确定的样本顺序写入，所以相同输入、`--seed`、`--shuffle` 设置会得到可复现结果。当前所有文本文件按 UTF-8 读取，JSONL 额外兼容 UTF-8 BOM，中文内容会按 UTF-8 字节映射到 token span，不会在 mask 推导中丢失。
+使用 `--out-prefix` 或别名 `--output-prefix` 可以指定输出 binidx 的命名前缀。例如 `--out-prefix data/sft_train` 会写出 `data/sft_train.bin`、`data/sft_train.idx`、`data/sft_train.mask.bin`、`data/sft_train.mask.idx`。传入多个位置参数时必须显式指定输出前缀，因为脚本无法从多个源路径自动推导唯一名字；单个文件默认使用去掉 `.jsonl` 后缀的文件名，单个文件夹默认使用文件夹路径作为前缀。
+
+`--num-workers` 会用在两个阶段。读取阶段以“一个 JSONL 文件”为一个任务，所以多个 JSONL 可以并发读取；单个大 JSONL 在读取阶段不会被多个 worker 拆分读取。加载完成后，模板渲染和 tokenization 会按样本并发执行。输出仍按确定的样本顺序写入，所以相同输入、`--seed`、`--shuffle` 设置会得到可复现结果。当前所有文本文件按 UTF-8 读取，JSONL 额外兼容 UTF-8 BOM，中文内容会按 UTF-8 字节映射到 token span，不会在 mask 推导中丢失。
 
 整体流程可以抽象为：
 
 1. 读取一个或多个 UTF-8 JSONL，过滤空行，并记录每条样本来自哪个文件和行号，便于定位坏 JSON。
-2. 按 `--n-epoch` 复制 epoch。默认每个 epoch 内使用 `--seed` 做确定性打乱；使用 `--no-shuffle` 时保留输入文件顺序。
-3. 加载权威 chat template：`data/SFT/sample/chat_template.jinja`。根目录模板不是 SFT 数据处理入口，避免误用。
-4. 对每条样本先规范化工具调用参数，再用同一个 Jinja template 渲染两次：一次渲染到最后一轮 assistant 之前，用来确定条件上下文边界；一次渲染完整样本，用来得到真正写入训练集的文本。
-5. 最后一轮 assistant 会被规范化为始终包含 think 标签。如果原始内容已有 think 结束标签，就保留原始 think；如果没有，就在最终回复前补一个空 think 块。历史 assistant、系统、用户、工具返回都只作为上下文。
-6. loss mask 从“最后一轮 assistant 的可训练后缀”推导：assistant 内容边界之前全部为 `0`。样本里真实存在的 think 内容参与训练；无 thinking 样本自动补出的空 think 块只作为格式上下文，仍然是 `0`；可见回复、最终工具调用、assistant 结束段和真实样本结束段为 `1`。
-7. 文本只 tokenize 一次。代码用 UTF-8 字节跨度记录每个 token 对应的字符区间，再把字符级可训练区间投影为 token 级 mask。这样中文、多字节符号和特殊片段都走同一套规则。
-8. 不启用 packing 时，每个源样本写成一个 binidx document，并同步写入一个同长度的 mask document。启用 `--pack-length` 时，多个真实样本会串接成固定长度 document；真实样本之间插入一个不计 loss 的分隔换行，尾部 padding 也不计 loss。
-9. 输出包含主 token 数据集和 mask sidecar：`PREFIX.bin`、`PREFIX.idx`、`PREFIX.mask.bin`、`PREFIX.mask.idx`。后续训练接入 SFT 时，主数据集提供 token，mask sidecar 提供哪些 token 参与 loss。
+2. 如果输入里有文件夹，就展开为直接子级的 `*.jsonl` 文件并排序；嵌套子目录会被忽略。
+3. 按 `--n-epoch` 重复源样本。这是写 binidx 前的离线重复：`--n-epoch 3` 表示每条源样本会被写入产物 3 次，确实会让输出数据重复 3 份。默认每一份重复都会按 `--seed` 做确定性打乱；使用 `--no-shuffle` 时，每一份都保持输入顺序。
+4. 加载权威 chat template：`data/SFT/sample/chat_template.jinja`。根目录模板不是 SFT 数据处理入口，避免误用。
+5. 对每条样本先规范化工具调用参数，再用同一个 Jinja template 渲染两次：一次渲染到最后一轮 assistant 之前，用来确定条件上下文边界；一次渲染完整样本，用来得到真正写入训练集的文本。
+6. 最后一轮 assistant 会被规范化为始终包含 think 标签。如果原始内容已有 think 结束标签，就保留原始 think；如果没有，就在最终回复前补一个空 think 块。历史 assistant、系统、用户、工具返回都只作为上下文。
+7. loss mask 从“最后一轮 assistant 的可训练后缀”推导：assistant 内容边界之前全部为 `0`。样本里真实存在的 think 内容参与训练；无 thinking 样本自动补出的空 think 块只作为格式上下文，仍然是 `0`；可见回复、最终工具调用、assistant 结束段和真实样本结束段为 `1`。
+8. 文本只 tokenize 一次。代码用 UTF-8 字节跨度记录每个 token 对应的字符区间，再把字符级可训练区间投影为 token 级 mask。这样中文、多字节符号和特殊片段都走同一套规则。
+9. 如果不传 `--pack-length` 或 `--pad-length`，每条重复后的源样本会写成一个变长 binidx document，并同步写入一个同长度的 mask document，不会自动 padding。使用 `--pack-length` 时，样本会被串接成固定长度 document，长流可以跨 document 切分，真实样本之间的分隔换行不计 loss，只有最后不足长度的尾部会 padding。使用 `--pad-length` 时不做 packing：每条源样本仍然独立成一个 document，只是在尾部补到指定长度且 padding mask 为 `0`；如果某条样本本身超过 `--pad-length`，会直接报错。
+10. 输出包含主 token 数据集和 mask sidecar：`PREFIX.bin`、`PREFIX.idx`、`PREFIX.mask.bin`、`PREFIX.mask.idx`。后续训练接入 SFT 时，主数据集提供 token，mask sidecar 提供哪些 token 参与 loss。
 
 参数含义：
 
 - `--chat-template`：SFT 渲染模板路径，默认 `data/SFT/sample/chat_template.jinja`。
 - `--vocab`：tokenizer vocab，默认 `rwkv_vocab_v20260603.txt`。
-- `--n-epoch`：离线重复数据的 epoch 数。
+- `--out-prefix` / `--output-prefix`：输出 binidx 的命名前缀，四个输出文件都由这个前缀派生。
+- `--n-epoch`：离线重复数据次数；大于 `1` 会让样本在产物中重复出现。
 - `--seed`：打乱顺序用的随机种子；关闭 shuffle 时不影响样本顺序。
 - `--shuffle` / `--no-shuffle`：是否在每个 epoch 内打乱样本，默认开启。
 - `--num-workers`：并发读取、渲染和 tokenize 的 worker 数，默认 `1`。
 - `--pack-length`：固定长度 packing 目标；不设置时保持一条源样本一个 document。
+- `--pad-length`：不做 packing 时，把每条样本独立 padding 到固定长度；不能和 `--pack-length` 同时使用。
 - `--current-date`、`--current-location`：可覆盖或注入系统消息里的日期和位置字段。
 
 ### 为指定 binidx 数据集计算 magic_prime

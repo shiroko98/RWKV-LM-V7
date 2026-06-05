@@ -635,6 +635,29 @@ def pack_encoded_documents(
         yield EncodedDocument(input_ids=packed_ids, loss_mask=packed_mask)
 
 
+def pad_encoded_documents(
+    documents: Iterable[EncodedDocument],
+    *,
+    pad_length: int,
+    pad_token_id: int,
+) -> Iterable[EncodedDocument]:
+    if pad_length <= 0:
+        raise ValueError("pad_length must be a positive integer.")
+
+    for document in documents:
+        if len(document.input_ids) != len(document.loss_mask):
+            raise ValueError("Token ids and loss mask must have identical lengths.")
+        if len(document.input_ids) > pad_length:
+            raise ValueError(
+                f"Document length {len(document.input_ids)} exceeds pad_length {pad_length}."
+            )
+        padding = pad_length - len(document.input_ids)
+        yield EncodedDocument(
+            input_ids=list(document.input_ids) + [pad_token_id] * padding,
+            loss_mask=list(document.loss_mask) + [0] * padding,
+        )
+
+
 def load_non_empty_lines(input_path: str) -> list[str]:
     with open(input_path, "r", encoding="utf-8-sig") as file:
         return [line.strip() for line in file if line.strip()]
@@ -658,11 +681,28 @@ def load_non_empty_source_lines(input_path: str) -> list[JsonlSourceLine]:
 
 def normalize_input_paths(input_jsonl: str | Sequence[str]) -> list[str]:
     if isinstance(input_jsonl, (str, Path)):
-        paths = [str(input_jsonl)]
+        raw_paths = [Path(input_jsonl)]
     else:
-        paths = [str(path) for path in input_jsonl]
-    if not paths:
+        raw_paths = [Path(path) for path in input_jsonl]
+    if not raw_paths:
         raise ValueError("At least one input JSONL path is required.")
+
+    paths: list[str] = []
+    for raw_path in raw_paths:
+        if raw_path.is_dir():
+            jsonl_paths = sorted(
+                (
+                    child
+                    for child in raw_path.iterdir()
+                    if child.is_file() and child.suffix.lower() == ".jsonl"
+                ),
+                key=lambda path: str(path),
+            )
+            if not jsonl_paths:
+                raise ValueError(f"No .jsonl files found in input directory: {raw_path}")
+            paths.extend(str(path) for path in jsonl_paths)
+        else:
+            paths.append(str(raw_path))
     return paths
 
 
@@ -805,10 +845,15 @@ def write_documents(
 
 
 def default_output_prefix(input_jsonl: str | Sequence[str]) -> str:
-    input_paths = normalize_input_paths(input_jsonl)
+    if isinstance(input_jsonl, (str, Path)):
+        input_paths = [Path(input_jsonl)]
+    else:
+        input_paths = [Path(path) for path in input_jsonl]
     if len(input_paths) != 1:
-        raise ValueError("--out-prefix is required when building from multiple input JSONL files.")
-    input_path = Path(input_paths[0]).resolve()
+        raise ValueError("--out-prefix is required when building from multiple input JSONL paths.")
+    input_path = input_paths[0].resolve()
+    if input_path.is_dir():
+        return str(input_path)
     return str(input_path.with_suffix(""))
 
 
@@ -821,6 +866,7 @@ def build_binidx_dataset(
     n_epoch: int,
     seed: int,
     pack_length: int | None = None,
+    pad_length: int | None = None,
     current_date: str | None = None,
     current_location: str | None = None,
     num_workers: int = 1,
@@ -828,6 +874,8 @@ def build_binidx_dataset(
 ):
     if num_workers <= 0:
         raise ValueError("num_workers must be a positive integer.")
+    if pack_length is not None and pad_length is not None:
+        raise ValueError("pack_length and pad_length are mutually exclusive.")
 
     template = load_chat_template(template_path)
     tokenizer = TRIE_TOKENIZER(vocab_path, strict_length=True)
@@ -851,6 +899,12 @@ def build_binidx_dataset(
             pad_token_id=eod_token_id(tokenizer),
             separator=_encode_separator(tokenizer),
         )
+    elif pad_length is not None:
+        documents = pad_encoded_documents(
+            documents,
+            pad_length=pad_length,
+            pad_token_id=eod_token_id(tokenizer),
+        )
 
     stats = write_documents(prefix, documents)
     stats["output_prefix"] = prefix
@@ -859,6 +913,7 @@ def build_binidx_dataset(
     stats["source_documents"] = len(shuffled_sources)
     stats["epochs"] = n_epoch
     stats["pack_length"] = pack_length
+    stats["pad_length"] = pad_length
     stats["num_workers"] = num_workers
     stats["shuffle"] = shuffle
     return stats

@@ -14,12 +14,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Render chat-template SFT JSONL into binidx tokens plus a loss-mask sidecar dataset."
     )
     parser.add_argument("input_jsonl", type=str, nargs="+")
-    parser.add_argument("--out-prefix", type=str, default=None)
+    parser.add_argument("--out-prefix", "--output-prefix", dest="out_prefix", type=str, default=None)
     parser.add_argument("--vocab", type=str, default="rwkv_vocab_v20260603.txt")
     parser.add_argument("--chat-template", type=str, default="data/SFT/sample/chat_template.jinja")
     parser.add_argument("--n-epoch", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--pack-length", type=int, default=None)
+    parser.add_argument("--pad-length", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--shuffle", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--current-date", type=str, default=None)
@@ -41,6 +42,7 @@ def main(argv=None):
         n_epoch=args.n_epoch,
         seed=args.seed,
         pack_length=args.pack_length,
+        pad_length=args.pad_length,
         num_workers=args.num_workers,
         shuffle=args.shuffle,
         current_date=args.current_date,

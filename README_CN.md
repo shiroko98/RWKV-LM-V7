@@ -201,7 +201,7 @@ python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
   --shuffle
 ```
 
-也可以直接传入一个包含 JSONL 分片的文件夹。文件夹输入会展开为该目录直接子级里的 `*.jsonl` 文件，并按路径排序：
+也可以直接传入一个包含 JSONL 分片的文件夹。文件夹输入会递归展开为所有层级里的 `*.jsonl` 文件，并按路径排序：
 
 ```bash
 python data/make_sft_binidx.py data/sft_shards \
@@ -225,14 +225,14 @@ python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
 整体流程可以抽象为：
 
 1. 读取一个或多个 UTF-8 JSONL，过滤空行，并记录每条样本来自哪个文件和行号，便于定位坏 JSON。
-2. 如果输入里有文件夹，就展开为直接子级的 `*.jsonl` 文件并排序；嵌套子目录会被忽略。
-3. 按 `--n-epoch` 重复源样本。这是写 binidx 前的离线重复：`--n-epoch 3` 表示每条源样本会被写入产物 3 次，确实会让输出数据重复 3 份。默认每一份重复都会按 `--seed` 做确定性打乱；使用 `--no-shuffle` 时，每一份都保持输入顺序。
+2. 如果输入里有文件夹，就递归展开为所有层级的 `*.jsonl` 文件并排序。
+3. 按 `--n-epoch` 重复源样本。这是写 binidx 前的离线重复：`--n-epoch 3` 表示每条源样本会被写入产物 3 次，确实会让输出数据重复 3 份。默认值是 `--n-epoch 1`，所以不想重复数据时不用传这个参数。默认每一份重复都会按 `--seed` 做确定性打乱；使用 `--no-shuffle` 时，每一份都保持输入顺序。
 4. 加载权威 chat template：`data/SFT/sample/chat_template.jinja`。根目录模板不是 SFT 数据处理入口，避免误用。
 5. 对每条样本先规范化工具调用参数，再用同一个 Jinja template 渲染两次：一次渲染到最后一轮 assistant 之前，用来确定条件上下文边界；一次渲染完整样本，用来得到真正写入训练集的文本。
 6. 最后一轮 assistant 会被规范化为始终包含 think 标签。如果原始内容已有 think 结束标签，就保留原始 think；如果没有，就在最终回复前补一个空 think 块。历史 assistant、系统、用户、工具返回都只作为上下文。
 7. loss mask 从“最后一轮 assistant 的可训练后缀”推导：assistant 内容边界之前全部为 `0`。样本里真实存在的 think 内容参与训练；无 thinking 样本自动补出的空 think 块只作为格式上下文，仍然是 `0`；可见回复、最终工具调用、assistant 结束段和真实样本结束段为 `1`。
 8. 文本只 tokenize 一次。代码用 UTF-8 字节跨度记录每个 token 对应的字符区间，再把字符级可训练区间投影为 token 级 mask。这样中文、多字节符号和特殊片段都走同一套规则。
-9. 如果不传 `--pack-length` 或 `--pad-length`，每条重复后的源样本会写成一个变长 binidx document，并同步写入一个同长度的 mask document，不会自动 padding。使用 `--pack-length` 时，样本会被串接成固定长度 document，长流可以跨 document 切分，真实样本之间的分隔换行不计 loss，只有最后不足长度的尾部会 padding。使用 `--pad-length` 时不做 packing：每条源样本仍然独立成一个 document，只是在尾部补到指定长度且 padding mask 为 `0`；如果某条样本本身超过 `--pad-length`，会直接报错。
+9. 如果不传 `--pack-length` 或 `--pad-length`，每条重复后的源样本会写成一个变长 binidx document，并同步写入一个同长度的 mask document，不会自动 padding。每个独立 document 末尾仍然会有真实的 `EOD_TOKEN`，并且这个 EOD 参与训练。使用 `--pack-length` 时，样本会被串接成固定长度 document，长流可以跨 document 切分，真实样本之间的分隔换行不计 loss，只有最后不足长度的尾部会 padding。使用 `--pad-length` 时不做 packing：每条源样本仍然独立成一个 document，真实 EOD 在 padding 之前，尾部补齐 token 使用 EOD token id 但 padding mask 为 `0`；如果某条样本本身超过 `--pad-length`，会直接报错。
 10. 输出包含主 token 数据集和 mask sidecar：`PREFIX.bin`、`PREFIX.idx`、`PREFIX.mask.bin`、`PREFIX.mask.idx`。后续训练接入 SFT 时，主数据集提供 token，mask sidecar 提供哪些 token 参与 loss。
 
 参数含义：
@@ -240,7 +240,7 @@ python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
 - `--chat-template`：SFT 渲染模板路径，默认 `data/SFT/sample/chat_template.jinja`。
 - `--vocab`：tokenizer vocab，默认 `rwkv_vocab_v20260603.txt`。
 - `--out-prefix` / `--output-prefix`：输出 binidx 的命名前缀，四个输出文件都由这个前缀派生。
-- `--n-epoch`：离线重复数据次数；大于 `1` 会让样本在产物中重复出现。
+- `--n-epoch`：离线重复数据次数，默认 `1`；大于 `1` 会让样本在产物中重复出现。
 - `--seed`：打乱顺序用的随机种子；关闭 shuffle 时不影响样本顺序。
 - `--shuffle` / `--no-shuffle`：是否在每个 epoch 内打乱样本，默认开启。
 - `--num-workers`：并发读取、渲染和 tokenize 的 worker 数，默认 `1`。

@@ -693,7 +693,7 @@ def normalize_input_paths(input_jsonl: str | Sequence[str]) -> list[str]:
             jsonl_paths = sorted(
                 (
                     child
-                    for child in raw_path.iterdir()
+                    for child in raw_path.rglob("*")
                     if child.is_file() and child.suffix.lower() == ".jsonl"
                 ),
                 key=lambda path: str(path),

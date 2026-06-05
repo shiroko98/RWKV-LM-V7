@@ -848,7 +848,7 @@ def test_load_jsonl_sources_supports_utf8_chinese_bom_and_parallel_reads(tmp_pat
         normalize_input_paths([])
 
 
-def test_normalize_input_paths_expands_jsonl_directory_sorted(tmp_path):
+def test_normalize_input_paths_expands_jsonl_directory_recursively_sorted(tmp_path):
     input_dir = tmp_path / "inputs"
     input_dir.mkdir()
     (input_dir / "b.jsonl").write_text('{"messages":[]}\n', encoding="utf-8")
@@ -857,10 +857,13 @@ def test_normalize_input_paths_expands_jsonl_directory_sorted(tmp_path):
     nested = input_dir / "nested"
     nested.mkdir()
     (nested / "c.jsonl").write_text('{"messages":[]}\n', encoding="utf-8")
+    (nested / "d.JSONL").write_text('{"messages":[]}\n', encoding="utf-8")
 
     assert normalize_input_paths(str(input_dir)) == [
         str(input_dir / "a.jsonl"),
         str(input_dir / "b.jsonl"),
+        str(nested / "c.jsonl"),
+        str(nested / "d.JSONL"),
     ]
 
     empty_dir = tmp_path / "empty"

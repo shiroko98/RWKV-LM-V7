@@ -244,3 +244,21 @@ Validation
 Next
 - Document current SFT training usage in README / README_CN.
 - Build a tiny SFT binidx sample and run a small smoke test with the provided 0.4B checkpoint if local VRAM allows.
+
+2026-06-05 SFT training documentation progress
+
+Completed
+- Updated README / README_CN SFT preprocessing contract to say the current `sft_binidx` trainer reads the token dataset plus mask sidecar.
+- Added SFT training usage with `--data_type sft_binidx`, automatic `DATA_FILE.mask` loading, explicit `--epoch_steps` / `--epoch_count` behavior, and the `ctx_len + 1` document-length rule.
+- Added a 0.4B checkpoint argument example derived from `model/rwkv7-g1d-0.4b-20260210-ctx8192.txt`: `n_layer=24`, `n_embd=1024`, `dim_ffn=4096`, `vocab_size=65536`, `head_size=64`, and LoRA dimensions `64/64/32/128`.
+- Added optional server-side CUDA smoke tests in `tests/test_sft_cuda_smoke.py`.
+- Default pytest skips the CUDA smoke tests; server runs can enable in-process forward/backward with `RWKV_RUN_CUDA_SFT_SMOKE=1`, or full `train.py` one-step smoke with `RWKV_RUN_TRAIN_PY_SFT_SMOKE=1`.
+
+Validation
+- `D:\anaconda\envs\model\python.exe -m py_compile tests\test_sft_cuda_smoke.py` -> passed.
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_cuda_smoke.py --tb=short` -> 1 passed, 2 skipped by default CUDA env gates.
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_training.py tests\test_deepspeed_checkpointing.py tests\test_sft_cuda_smoke.py --cov=src.dataset --cov=src.sft_loss --cov=train --cov-report=term-missing --tb=short` -> 33 passed, 2 skipped, 100% coverage for `src.dataset`, `src.sft_loss`, and the testable `train.py` helper surface.
+- `D:\anaconda\envs\model\python.exe -m pytest -q --tb=short` -> 114 passed, 2 skipped.
+
+Next
+- Wait for server-side CUDA smoke results if local RTX 3050 VRAM / compile time is not representative.

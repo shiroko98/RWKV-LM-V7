@@ -233,7 +233,7 @@ python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
 7. loss mask 从“最后一轮 assistant 的可训练后缀”推导：assistant 内容边界之前全部为 `0`。样本里真实存在的 think 内容参与训练；无 thinking 样本自动补出的空 think 块只作为格式上下文，仍然是 `0`；可见回复、最终工具调用、assistant 结束段和真实样本结束段为 `1`。
 8. 文本只 tokenize 一次。代码用 UTF-8 字节跨度记录每个 token 对应的字符区间，再把字符级可训练区间投影为 token 级 mask。这样中文、多字节符号和特殊片段都走同一套规则。
 9. 如果不传 `--pack-length` 或 `--pad-length`，每条重复后的源样本会写成一个变长 binidx document，并同步写入一个同长度的 mask document，不会自动 padding。每个独立 document 末尾仍然会有真实的 `EOD_TOKEN`，并且这个 EOD 参与训练。使用 `--pack-length` 时，样本会被串接成固定长度 document，长流可以跨 document 切分，真实样本之间的分隔换行不计 loss，只有最后不足长度的尾部会 padding。使用 `--pad-length` 时不做 packing：每条源样本仍然独立成一个 document，真实 EOD 在 padding 之前，尾部补齐 token 使用 EOD token id 但 padding mask 为 `0`；如果某条样本本身超过 `--pad-length`，会直接报错。
-10. 输出包含主 token 数据集和 mask sidecar：`PREFIX.bin`、`PREFIX.idx`、`PREFIX.mask.bin`、`PREFIX.mask.idx`。后续训练接入 SFT 时，主数据集提供 token，mask sidecar 提供哪些 token 参与 loss。
+10. 输出包含主 token 数据集和 mask sidecar：`PREFIX.bin`、`PREFIX.idx`、`PREFIX.mask.bin`、`PREFIX.mask.idx`。SFT 训练时主数据集提供 token，mask sidecar 提供哪些 token 参与 loss。
 
 参数含义：
 
@@ -247,6 +247,62 @@ python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
 - `--pack-length`：固定长度 packing 目标；不设置时保持一条源样本一个 document。
 - `--pad-length`：不做 packing 时，把每条样本独立 padding 到固定长度；不能和 `--pack-length` 同时使用。
 - `--current-date`、`--current-location`：可覆盖或注入系统消息里的日期和位置字段。
+
+### 使用 SFT binidx 数据训练
+
+使用 SFT 预处理产物训练时，设置 `--data_type sft_binidx`。`--data_file` 传 binidx 前缀，不带 `.bin` 或 `.idx`；训练代码默认读取 `DATA_FILE.mask` 作为 mask sidecar，也可以用 `--sft_mask_file` 显式指定另一个 mask 前缀。
+
+在 SFT 模式下，`--epoch_steps` 和 `--epoch_count` 由用户直接控制。`epoch_steps` 表示每个 epoch 多少个 optimizer step，`epoch_count` 表示总共训练多少个 epoch。这个语义不同于预训练 `binidx`，预训练仍保留原来的 magic-prime 调度。
+
+```bash
+python train.py \
+  --load_model model/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
+  --proj_dir out/sft-0.4b \
+  --data_file data/sft_train \
+  --data_type sft_binidx \
+  --ctx_len 4096 \
+  --epoch_steps 1000 \
+  --epoch_count 1 \
+  --micro_bsz 1 \
+  --my_exit_tokens 0 \
+  --vocab_size 65536 \
+  --n_layer 24 \
+  --n_embd 1024 \
+  --dim_ffn 4096 \
+  --head_size 64 \
+  --d_decay_lora 64 \
+  --d_aaa_lora 64 \
+  --d_mv_lora 32 \
+  --d_gate_lora 128 \
+  --my_testing x070 \
+  --lr_init 1e-5 \
+  --lr_final 1e-5 \
+  --warmup_steps 10 \
+  --weight_decay 0 \
+  --accelerator gpu \
+  --devices 1 \
+  --precision bf16 \
+  --strategy deepspeed_stage_2 \
+  --grad_cp 1
+```
+
+训练端使用 next-token label，所以每个 SFT document 需要提供 `ctx_len + 1` 个 token。document 比这个短时，dataloader 会在内存里用 `--sft_pad_token_id` padding，并把 padding mask 设为 `0`；document 更长时会直接报错。为了让训练长度稳定，建议预处理时使用 `--pack-length CTX_LEN + 1` 或 `--pad-length CTX_LEN + 1`，训练时再设置 `--ctx_len CTX_LEN`。RWKV7 x070 的 `ctx_len` 需要能被 16 整除。
+
+上面示例里的 0.4B checkpoint 是 `L24-D1024`，对应 `dim_ffn=4096`、`vocab_size=65536`、`head_size=64`，RWKV7 G1 LoRA 维度为 `64/64/32/128`。如果换用其他 checkpoint，需要先看对应架构文本，保证这些形状参数和 checkpoint 一致。
+
+服务器上可以打开可选 CUDA smoke 测试：
+
+```bash
+RWKV_SFT_SMOKE_MODEL=model/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
+RWKV_RUN_CUDA_SFT_SMOKE=1 \
+pytest -q tests/test_sft_cuda_smoke.py
+
+RWKV_SFT_SMOKE_MODEL=model/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
+RWKV_RUN_TRAIN_PY_SFT_SMOKE=1 \
+pytest -q tests/test_sft_cuda_smoke.py
+```
+
+第一条命令在进程内跑 CUDA forward/backward，验证 SFT masked loss。第二条命令启动 `train.py` 跑 1 个 SFT step，额外覆盖 Lightning、DeepSpeed 和 optimizer 链路。
 
 ### 为指定 binidx 数据集计算 magic_prime
 

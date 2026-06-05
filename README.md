@@ -430,7 +430,7 @@ The high-level flow is:
 7. Derive the loss mask from the final assistant trainable suffix: everything before the final assistant content boundary is `0`. Real think content that comes from the sample is trainable, but the automatically added empty think block for no-think samples is context only and remains `0`; the visible reply, final tool calls, assistant ending segment, and real sample ending segment are `1`.
 8. Tokenize the final text once. The code records each token's UTF-8 byte span, maps it back to character spans, and projects the character-level trainable region into a token-level mask. This handles Chinese, multi-byte symbols, and special fragments through the same path.
 9. Without `--pack-length` or `--pad-length`, each repeated source sample becomes one variable-length binidx document and one same-length mask document; no padding is added. Each independent document still ends with the real `EOD_TOKEN`, and that EOD is trainable. With `--pack-length`, samples are concatenated into fixed-length documents, long streams can be split across documents, the separator newline between real samples is masked out, and only the final tail is padded. With `--pad-length`, packing stays disabled: each source sample remains its own document and is padded to the requested length with mask `0`; the real EOD remains before padding, while padding token ids use EOD with mask `0`. A sample longer than `--pad-length` raises an error.
-10. The output is the token dataset plus a mask sidecar: `PREFIX.bin`, `PREFIX.idx`, `PREFIX.mask.bin`, and `PREFIX.mask.idx`. The future SFT dataloader should read tokens from the main dataset and loss participation from the sidecar mask.
+10. The output is the token dataset plus a mask sidecar: `PREFIX.bin`, `PREFIX.idx`, `PREFIX.mask.bin`, and `PREFIX.mask.idx`. SFT training reads tokens from the main dataset and loss participation from the sidecar mask.
 
 Main parameters:
 
@@ -444,6 +444,62 @@ Main parameters:
 - `--pack-length`: fixed-length packing target. If omitted, each source sample remains one document.
 - `--pad-length`: fixed-length per-sample padding target without packing. Mutually exclusive with `--pack-length`.
 - `--current-date`, `--current-location`: override or inject date and location fields in the system message.
+
+### Train with SFT binidx data
+
+Use `--data_type sft_binidx` when training on the SFT preprocessing output. `--data_file` is the binidx prefix without `.bin` or `.idx`; the trainer automatically loads `DATA_FILE.mask` unless `--sft_mask_file` is provided.
+
+For SFT, `--epoch_steps` and `--epoch_count` are user-controlled. `epoch_steps` is the number of optimizer steps per epoch, and `epoch_count` is the number of epochs to run. This is different from pretraining `binidx`, where `train.py` keeps the historical magic-prime schedule.
+
+```bash
+python train.py \
+  --load_model model/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
+  --proj_dir out/sft-0.4b \
+  --data_file data/sft_train \
+  --data_type sft_binidx \
+  --ctx_len 4096 \
+  --epoch_steps 1000 \
+  --epoch_count 1 \
+  --micro_bsz 1 \
+  --my_exit_tokens 0 \
+  --vocab_size 65536 \
+  --n_layer 24 \
+  --n_embd 1024 \
+  --dim_ffn 4096 \
+  --head_size 64 \
+  --d_decay_lora 64 \
+  --d_aaa_lora 64 \
+  --d_mv_lora 32 \
+  --d_gate_lora 128 \
+  --my_testing x070 \
+  --lr_init 1e-5 \
+  --lr_final 1e-5 \
+  --warmup_steps 10 \
+  --weight_decay 0 \
+  --accelerator gpu \
+  --devices 1 \
+  --precision bf16 \
+  --strategy deepspeed_stage_2 \
+  --grad_cp 1
+```
+
+Training samples use next-token labels, so the dataloader needs `ctx_len + 1` token ids per SFT document. A shorter document is padded in memory with `--sft_pad_token_id` and mask `0`; a longer document raises an error. For predictable fixed-length training, build data with `--pack-length CTX_LEN + 1` or `--pad-length CTX_LEN + 1`, then train with `--ctx_len CTX_LEN`. For RWKV7 x070, keep `ctx_len` divisible by 16.
+
+The 0.4B checkpoint listed in the example is `L24-D1024` with `dim_ffn=4096`, `vocab_size=65536`, `head_size=64`, and RWKV7 G1 LoRA dimensions `64/64/32/128`. If you use another checkpoint, read its architecture text and keep these shape parameters aligned with the checkpoint.
+
+Optional CUDA smoke tests are available for server validation:
+
+```bash
+RWKV_SFT_SMOKE_MODEL=model/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
+RWKV_RUN_CUDA_SFT_SMOKE=1 \
+pytest -q tests/test_sft_cuda_smoke.py
+
+RWKV_SFT_SMOKE_MODEL=model/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
+RWKV_RUN_TRAIN_PY_SFT_SMOKE=1 \
+pytest -q tests/test_sft_cuda_smoke.py
+```
+
+The first command runs an in-process CUDA forward/backward on SFT masked loss. The second command launches `train.py` for one SFT step and also validates the Lightning/DeepSpeed/optimizer path.
 
 ### Compute magic_prime for specified binidx dataset
 

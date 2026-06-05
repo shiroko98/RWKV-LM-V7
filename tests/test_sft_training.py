@@ -1,0 +1,251 @@
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch.nn import functional as F
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import train
+from src import dataset as dataset_mod
+from src import trainer as trainer_mod
+from src.sft_binidx import EncodedDocument, write_documents
+from src.sft_loss import masked_cross_entropy
+
+
+def make_sft_args(prefix: str, **overrides):
+    args = SimpleNamespace(
+        vocab_size=65536,
+        data_file=prefix,
+        data_type="sft_binidx",
+        sft_mask_file="",
+        sft_pad_token_id=65532,
+        epoch_steps=2,
+        real_bsz=1,
+        train_stage=0,
+        ctx_len=5,
+        magic_prime=0,
+        epoch_begin=0,
+        resume_epoch=0,
+        resume_step_offset=0,
+        micro_bsz=1,
+    )
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def test_sft_dataset_reads_mask_sidecar_shifts_mask_and_pads(tmp_path, monkeypatch):
+    monkeypatch.delenv("RANK", raising=False)
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    prefix = str(tmp_path / "sft")
+    write_documents(
+        prefix,
+        [
+            EncodedDocument(input_ids=[10, 11, 12, 13], loss_mask=[0, 1, 0, 1]),
+            EncodedDocument(input_ids=[20, 21, 22], loss_mask=[0, 0, 1]),
+        ],
+    )
+
+    dataset = dataset_mod.MyDataset(make_sft_args(prefix))
+    assert len(dataset) == 2
+
+    x0, y0, mask0 = dataset[0]
+    assert torch.equal(x0, torch.tensor([10, 11, 12, 13, 65532], dtype=torch.long))
+    assert torch.equal(y0, torch.tensor([11, 12, 13, 65532, 65532], dtype=torch.long))
+    assert torch.equal(mask0, torch.tensor([1, 0, 1, 0, 0], dtype=torch.float32))
+
+    x1, y1, mask1 = dataset[1]
+    assert torch.equal(x1, torch.tensor([20, 21, 22, 65532, 65532], dtype=torch.long))
+    assert torch.equal(y1, torch.tensor([21, 22, 65532, 65532, 65532], dtype=torch.long))
+    assert torch.equal(mask1, torch.tensor([0, 1, 0, 0, 0], dtype=torch.float32))
+
+
+def test_sft_dataset_uses_rank_and_resume_offset_for_document_selection(tmp_path):
+    prefix = str(tmp_path / "sft")
+    write_documents(
+        prefix,
+        [
+            EncodedDocument(input_ids=[10, 11], loss_mask=[0, 1]),
+            EncodedDocument(input_ids=[20, 21], loss_mask=[0, 1]),
+            EncodedDocument(input_ids=[30, 31], loss_mask=[0, 1]),
+            EncodedDocument(input_ids=[40, 41], loss_mask=[0, 1]),
+        ],
+    )
+    dataset = dataset_mod.MyDataset(make_sft_args(prefix, ctx_len=3, real_bsz=2))
+    dataset.world_size = 2
+    dataset.global_rank = 1
+    dataset.step_offset = 1
+
+    x, y, mask = dataset[0]
+
+    assert torch.equal(x, torch.tensor([40, 41, 65532], dtype=torch.long))
+    assert torch.equal(y, torch.tensor([41, 65532, 65532], dtype=torch.long))
+    assert torch.equal(mask, torch.tensor([1, 0, 0], dtype=torch.float32))
+
+
+def test_sft_dataset_rejects_too_long_documents_and_bad_masks(tmp_path):
+    too_long_prefix = str(tmp_path / "too_long")
+    write_documents(
+        too_long_prefix,
+        [EncodedDocument(input_ids=[1, 2, 3, 4, 5], loss_mask=[0, 1, 1, 1, 1])],
+    )
+    too_long_dataset = dataset_mod.MyDataset(make_sft_args(too_long_prefix, ctx_len=3))
+    with pytest.raises(ValueError, match="exceeds ctx_len"):
+        too_long_dataset[0]
+
+    bad_mask_prefix = str(tmp_path / "bad_mask")
+    write_documents(
+        bad_mask_prefix,
+        [EncodedDocument(input_ids=[1, 2, 3], loss_mask=[0, 2, 1])],
+    )
+    bad_mask_dataset = dataset_mod.MyDataset(make_sft_args(bad_mask_prefix, ctx_len=3))
+    with pytest.raises(ValueError, match="0/1"):
+        bad_mask_dataset[0]
+
+
+def test_dataset_prime_helper_covers_pretrain_schedule_checks():
+    assert dataset_mod.is_prime(1) is False
+    assert dataset_mod.is_prime(2) is True
+    assert dataset_mod.is_prime(4) is False
+    assert dataset_mod.is_prime(25) is False
+    assert dataset_mod.is_prime(29) is True
+
+
+def test_sft_dataset_initialization_validation_branches(monkeypatch):
+    class DummyIndex:
+        _dtype_size = 2
+
+    class DummyMMap:
+        def __init__(self, sizes):
+            self._bin_buffer = bytes(int(sum(sizes)) * 2)
+            self._index = DummyIndex()
+            self.sizes = torch.tensor(sizes).numpy()
+
+        def __len__(self):
+            return len(self.sizes)
+
+    def args(**overrides):
+        base = make_sft_args("dummy", ctx_len=3)
+        for key, value in overrides.items():
+            setattr(base, key, value)
+        return base
+
+    monkeypatch.setattr(dataset_mod, "MMapIndexedDataset", lambda path: DummyMMap([]))
+    with pytest.raises(ValueError, match="at least one"):
+        dataset_mod.MyDataset(args())
+
+    datasets = [DummyMMap([3]), DummyMMap([3, 3])]
+    monkeypatch.setattr(dataset_mod, "MMapIndexedDataset", lambda path: datasets.pop(0))
+    with pytest.raises(ValueError, match="document count"):
+        dataset_mod.MyDataset(args())
+
+    datasets = [DummyMMap([3]), DummyMMap([2])]
+    monkeypatch.setattr(dataset_mod, "MMapIndexedDataset", lambda path: datasets.pop(0))
+    with pytest.raises(ValueError, match="document sizes"):
+        dataset_mod.MyDataset(args())
+
+    datasets = [DummyMMap([3]), DummyMMap([3])]
+    monkeypatch.setattr(dataset_mod, "MMapIndexedDataset", lambda path: datasets.pop(0))
+    with pytest.raises(ValueError, match="ctx_len"):
+        dataset_mod.MyDataset(args(ctx_len=0))
+
+    monkeypatch.setattr(dataset_mod, "MMapIndexedDataset", lambda path: DummyMMap([3]))
+    with pytest.raises(ValueError, match="Unsupported"):
+        dataset_mod.MyDataset(args(data_type="utf-8"))
+
+
+def test_masked_cross_entropy_matches_manual_selected_token_average():
+    logits = torch.tensor(
+        [
+            [
+                [4.0, 1.0, 0.0],
+                [0.0, 3.0, 1.0],
+                [1.0, 0.0, 5.0],
+            ]
+        ],
+        requires_grad=True,
+    )
+    targets = torch.tensor([[0, 1, 2]], dtype=torch.long)
+    loss_mask = torch.tensor([[1, 0, 1]], dtype=torch.float32)
+
+    loss = masked_cross_entropy(logits, targets, loss_mask)
+    manual_losses = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction="none")
+    expected = (manual_losses[0] + manual_losses[2]) / 2
+
+    assert loss.item() == pytest.approx(expected.item())
+    loss.backward()
+    assert logits.grad[0, 1].abs().sum().item() == pytest.approx(0)
+
+
+def test_masked_cross_entropy_handles_zero_mask_and_validates_shapes():
+    logits = torch.randn(1, 2, 4, requires_grad=True)
+    targets = torch.tensor([[1, 2]], dtype=torch.long)
+    zero_mask = torch.zeros(1, 2)
+
+    loss = masked_cross_entropy(logits, targets, zero_mask)
+    assert loss.item() == pytest.approx(0)
+    loss.backward()
+    assert logits.grad.abs().sum().item() == pytest.approx(0)
+
+    with pytest.raises(ValueError, match="logits"):
+        masked_cross_entropy(logits.squeeze(0), targets, zero_mask)
+    with pytest.raises(ValueError, match="targets"):
+        masked_cross_entropy(logits, targets[:, :1], zero_mask)
+    with pytest.raises(ValueError, match="loss_mask"):
+        masked_cross_entropy(logits, targets, zero_mask[:, :1])
+
+
+def test_configure_epoch_schedule_preserves_sft_steps_and_keeps_pretrain_schedule():
+    sft_args = SimpleNamespace(data_type="sft_binidx", epoch_steps=7, epoch_count=3, real_bsz=8)
+    train.configure_epoch_schedule(sft_args)
+    assert sft_args.epoch_steps == 7
+    assert sft_args.epoch_count == 3
+
+    pretrain_args = SimpleNamespace(data_type="binidx", epoch_steps=1, epoch_count=1, real_bsz=8, magic_prime=80640)
+    train.configure_epoch_schedule(pretrain_args)
+    assert pretrain_args.epoch_steps == 5040
+    assert pretrain_args.epoch_count == 2
+
+    with pytest.raises(ValueError, match="epoch_steps"):
+        train.configure_epoch_schedule(SimpleNamespace(data_type="sft_binidx", epoch_steps=0, epoch_count=1))
+    with pytest.raises(ValueError, match="Unsupported"):
+        train.configure_epoch_schedule(SimpleNamespace(data_type="utf-8"))
+
+
+def test_train_callback_uses_lr_init_when_exit_tokens_disabled(tmp_path):
+    callback = trainer_mod.train_callback(
+        SimpleNamespace(
+            strategy="",
+            proj_dir=str(tmp_path),
+            wandb="",
+            my_timestamp="2026-06-05-12-00-00",
+            run_name="sft-lr-test",
+            epoch_begin=0,
+            epoch_steps=2,
+            warmup_steps=-1,
+            my_exit_tokens=0,
+            ctx_len=16,
+            real_bsz=1,
+            lr_init=2e-4,
+            lr_final=1e-5,
+            weight_decay=0.0,
+        )
+    )
+
+    trainer = SimpleNamespace(
+        global_step=0,
+        is_global_zero=True,
+        strategy=SimpleNamespace(config={}),
+        optimizers=[SimpleNamespace(param_groups=[{"weight_decay": 0.0, "my_lr_scale": 1.0}])],
+    )
+
+    callback.on_train_batch_start(trainer, object(), None, 0)
+
+    assert trainer.my_lr == pytest.approx(2e-4)
+    assert trainer.optimizers[0].param_groups[0]["lr"] == pytest.approx(2e-4)
+    trainer.my_log.close()

@@ -58,6 +58,21 @@ def resolve_resume_checkpoint_path(path: str, strategy: str):
         return path
     return None
 
+
+def configure_epoch_schedule(args):
+    if args.data_type == "binidx":
+        args.epoch_count = args.magic_prime // 40320
+        args.epoch_steps = 40320 // args.real_bsz
+        assert args.epoch_steps * args.real_bsz == 40320
+        return
+    if args.data_type == "sft_binidx":
+        if args.epoch_steps <= 0:
+            raise ValueError("epoch_steps must be positive for sft_binidx training.")
+        if args.epoch_count <= 0:
+            raise ValueError("epoch_count must be positive for sft_binidx training.")
+        return
+    raise ValueError(f"Unsupported data_type: {args.data_type}")
+
 if __name__ == "__main__":
     import os
     import subprocess
@@ -78,6 +93,8 @@ if __name__ == "__main__":
 
     parser.add_argument("--data_file", default="", type=str)
     parser.add_argument("--data_type", default="utf-8", type=str)
+    parser.add_argument("--sft_mask_file", default="", type=str)
+    parser.add_argument("--sft_pad_token_id", default=65532, type=int)
     parser.add_argument("--vocab_size", default=0, type=int)  # vocab_size = 0 means auto (for char-level LM and .txt data)
 
     parser.add_argument("--ctx_len", default=1024, type=int)
@@ -201,9 +218,7 @@ if __name__ == "__main__":
     if not os.path.exists(args.proj_dir):
         os.makedirs(args.proj_dir)
 
-    args.epoch_count = args.magic_prime // 40320
-    args.epoch_steps = 40320 // args.real_bsz
-    assert args.epoch_steps * args.real_bsz == 40320
+    configure_epoch_schedule(args)
 
     if args.train_stage >= 2:  # find latest saved model
         list_p = []
@@ -281,7 +296,7 @@ if __name__ == "__main__":
     )
     rank_zero_info(str(vars(args)) + "\n")
 
-    assert args.data_type in ["binidx"]
+    assert args.data_type in ["binidx", "sft_binidx"]
 
     if args.lr_final == 0 or args.lr_init == 0:
         rank_zero_info("\n\nNote: lr_final = 0 or lr_init = 0. Using linear LR schedule instead.\n\n")

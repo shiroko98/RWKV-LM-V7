@@ -182,3 +182,50 @@ Checkpoint before coding
 - `conda run -n model pytest -q tests\test_sft_binidx.py --cov=src.sft_binidx --cov=data.make_sft_binidx --cov-report=term-missing --tb=short` -> 56 passed, modified preprocessing surface 99% total coverage.
 - `conda run -n model pytest -q --tb=short` -> 92 passed.
 - Next recommended work remains training-side integration: dataset mask loading, optional SFT mode, and masked loss while preserving the pretrain fast path.
+
+2026-06-05 SFT training integration start
+
+Current status
+- SFT preprocessing is considered stable enough to serve as the training input contract.
+- The user provided a local 0.4B RWKV7 checkpoint for later smoke testing:
+- `model/rwkv7-g1d-0.4b-20260210-ctx8192.pth`
+- `model/rwkv7-g1d-0.4b-20260210-ctx8192.txt`
+- The `model/` directory is local test input and should not be committed.
+- User requirements for this stage:
+- keep a clear `todolist.txt` history,
+- commit each stable change,
+- run matching unit tests, regression tests, and coverage checks after modifications,
+- keep modified-code coverage at or above 95%.
+
+Training-side TODO
+- Add an explicit `data_type=sft_binidx` mode while preserving the existing `data_type=binidx` pretrain path.
+- Load `PREFIX.mask` automatically, with an optional explicit mask-prefix override.
+- Make the SFT dataset return `(x, y, loss_mask)` where `loss_mask` is shifted to align with next-token targets.
+- Keep pretrain dataset behavior and magic-prime schedule unchanged.
+- Add masked cross entropy for SFT and preserve fused CUDA CE for pretrain.
+- Add unit tests for SFT dataset alignment, mask validation, and masked CE math.
+- Update train CLI / README with SFT training usage after the first training-side implementation is stable.
+- Then run a small smoke test with the provided 0.4B checkpoint and a tiny SFT binidx sample.
+
+2026-06-05 SFT training integration checkpoint 1
+
+Completed
+- Added `data_type=sft_binidx` support to `src/dataset.py`.
+- SFT dataset now reads token binidx plus `PREFIX.mask` sidecar by default, or an explicit `--sft_mask_file`.
+- SFT dataset returns `(x, y, loss_mask)` and shifts `loss_mask` to align with next-token labels.
+- Short SFT documents are padded in-memory to `ctx_len + 1` using `--sft_pad_token_id` with mask `0`; documents longer than `ctx_len + 1` raise an error.
+- Added `src/sft_loss.py` masked cross entropy for SFT training.
+- `src/model.py` now uses masked CE only when the batch contains a third `loss_mask` tensor; the existing pretrain fused CE path remains unchanged for `(x, y)` batches.
+- `train.py` accepts `data_type=sft_binidx`, `--sft_mask_file`, and `--sft_pad_token_id`.
+- `train.py` keeps magic-prime epoch scheduling only for `data_type=binidx`; SFT preserves user-provided `--epoch_steps` and `--epoch_count`.
+- `src/trainer.py` now initializes `lr` from `lr_init` so SFT runs can set `my_exit_tokens=0` safely.
+
+Validation
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_training.py tests\test_deepspeed_checkpointing.py --cov=src.dataset --cov=src.sft_loss --cov-report=term-missing --tb=short` -> 30 passed, 100% coverage for `src.dataset` and `src.sft_loss`.
+- `D:\anaconda\envs\model\python.exe -m py_compile train.py src\dataset.py src\trainer.py src\model.py src\sft_loss.py` -> passed.
+- `D:\anaconda\envs\model\python.exe -m pytest -q --tb=short` -> 111 passed.
+
+Next
+- Document SFT training CLI usage in README / README_CN.
+- Build a tiny SFT binidx sample and run a small smoke test with the provided 0.4B checkpoint.
+- Derive recommended 0.4B args from `model/rwkv7-g1d-0.4b-20260210-ctx8192.txt`.

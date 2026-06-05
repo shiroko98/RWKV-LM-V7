@@ -9,6 +9,7 @@ from torch.nn import functional as F
 import pytorch_lightning as pl
 from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
 from pytorch_lightning.strategies import DeepSpeedStrategy
+from .sft_loss import masked_cross_entropy
 if importlib.util.find_spec('deepspeed'):
     import deepspeed
     from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
@@ -900,6 +901,11 @@ class RWKV(pl.LightningModule):
             return self._forward_features(idx)
 
         def training_step(self, batch, batch_idx):
+            if len(batch) == 3:
+                idx, targets, loss_mask = batch
+                hidden = self(idx)
+                logits = self.head(hidden)
+                return masked_cross_entropy(logits, targets, loss_mask)
             idx, targets = batch
             hidden = self(idx)
             return head_l2wrap_cross_entropy(hidden, self.head.weight, targets)
@@ -912,6 +918,10 @@ class RWKV(pl.LightningModule):
             return x
 
         def training_step(self, batch, batch_idx):
+            if len(batch) == 3:
+                idx, targets, loss_mask = batch
+                logits = self(idx)
+                return masked_cross_entropy(logits, targets, loss_mask)
             idx, targets = batch
             logits = self(idx)
 

@@ -218,7 +218,7 @@ python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
 3. 加载权威 chat template：`data/SFT/sample/chat_template.jinja`。根目录模板不是 SFT 数据处理入口，避免误用。
 4. 对每条样本先规范化工具调用参数，再用同一个 Jinja template 渲染两次：一次渲染到最后一轮 assistant 之前，用来确定条件上下文边界；一次渲染完整样本，用来得到真正写入训练集的文本。
 5. 最后一轮 assistant 会被规范化为始终包含 think 标签。如果原始内容已有 think 结束标签，就保留原始 think；如果没有，就在最终回复前补一个空 think 块。历史 assistant、系统、用户、工具返回都只作为上下文。
-6. loss mask 从“最后一轮 assistant 的可训练后缀”推导：assistant 角色前缀之前全部为 `0`；最终 assistant 的 think 块、可见回复、最终工具调用、assistant 结束段和真实样本结束段为 `1`。
+6. loss mask 从“最后一轮 assistant 的可训练后缀”推导：assistant 内容边界之前全部为 `0`。样本里真实存在的 think 内容参与训练；无 thinking 样本自动补出的空 think 块只作为格式上下文，仍然是 `0`；可见回复、最终工具调用、assistant 结束段和真实样本结束段为 `1`。
 7. 文本只 tokenize 一次。代码用 UTF-8 字节跨度记录每个 token 对应的字符区间，再把字符级可训练区间投影为 token 级 mask。这样中文、多字节符号和特殊片段都走同一套规则。
 8. 不启用 packing 时，每个源样本写成一个 binidx document，并同步写入一个同长度的 mask document。启用 `--pack-length` 时，多个真实样本会串接成固定长度 document；真实样本之间插入一个不计 loss 的分隔换行，尾部 padding 也不计 loss。
 9. 输出包含主 token 数据集和 mask sidecar：`PREFIX.bin`、`PREFIX.idx`、`PREFIX.mask.bin`、`PREFIX.mask.idx`。后续训练接入 SFT 时，主数据集提供 token，mask sidecar 提供哪些 token 参与 loss。

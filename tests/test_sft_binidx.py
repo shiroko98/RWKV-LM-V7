@@ -554,11 +554,13 @@ def test_render_prefix_and_full_handles_malformed_closing_think(chat_template):
 def test_compute_trainable_span_and_char_mask(chat_template, my_sample_record):
     prefix_text, full_text = _render_prefix_and_full(my_sample_record, template=chat_template)
     start, end = _compute_trainable_span(full_text, prefix_text)
-    assert start == len(prefix_text) - len(NO_THINKING_PREFIX)
+    assert start == len(prefix_text)
     assert end == len(full_text)
-    assert full_text[start : start + len(NO_THINKING_PREFIX)] == NO_THINKING_PREFIX
+    empty_think_start = start - len(NO_THINKING_PREFIX)
+    assert full_text[empty_think_start:start] == NO_THINKING_PREFIX
 
     char_mask = _char_mask_from_span(full_text, start, end)
+    assert sum(char_mask[empty_think_start:start]) == 0
     assert sum(char_mask[:start]) == 0
     assert all(char_mask[pos] == 1 for pos in range(start, end))
 
@@ -629,10 +631,11 @@ def test_build_document_from_record_trains_only_final_assistant_with_added_think
 
     assert full_text == expected_no_think_text.removesuffix(EOD_TOKEN)
     assert trainable_text.lstrip(" ") == (
-        NO_THINKING_PREFIX
-        + "上海今天多云，约 28°C，湿度 72%，东南风 3 级；空气质量为优，AQI 45。整体适合晚上跑步，建议避开闷热时段，控制强度并注意补水。"
+        "上海今天多云，约 28°C，湿度 72%，东南风 3 级；空气质量为优，AQI 45。整体适合晚上跑步，建议避开闷热时段，控制强度并注意补水。"
         + "<|im_end|>\n<|endoftext|>"
     )
+    assert NO_THINKING_PREFIX in full_text
+    assert NO_THINKING_PREFIX not in trainable_text
     assert ASSISTANT_PREFIX not in trainable_text
     assert "<tool_call>" not in trainable_text
     assert encoded.loss_mask[-1] == 1
@@ -690,14 +693,13 @@ def test_build_document_from_record_trains_final_tool_calls_when_content_empty(
     encoded = build_document_from_record(record, tokenizer=tokenizer, template=chat_template)
     trainable_text = masked_text(tokenizer, encoded)
     assert trainable_text.lstrip(" ") == (
-        NO_THINKING_PREFIX
-        + "\n"
-        + "<tool_call>\n"
+        "\n\n\n<tool_call>\n"
         + "<invoke name=\"get_weather\">\n"
         + "<parameter name=\"city\">上海</parameter>\n"
         + "</invoke>\n"
         + "</tool_call><|im_end|>\n<|endoftext|>"
     )
+    assert NO_THINKING_PREFIX not in trainable_text
 
 
 def test_build_document_from_record_uses_override_date_and_location(

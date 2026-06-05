@@ -295,8 +295,6 @@ def _compute_trainable_span(rendered_text: str, prefix_text: str) -> tuple[int, 
     if not rendered_text.startswith(prefix_text):
         raise ValueError("Full rendered text must start with the rendered prefix text.")
     train_start = len(prefix_text)
-    if prefix_text.endswith(NO_THINKING_PREFIX):
-        train_start -= len(NO_THINKING_PREFIX)
     train_end = len(rendered_text)
     return train_start, train_end
 

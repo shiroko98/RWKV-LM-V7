@@ -325,6 +325,20 @@ Completed
   - `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_training.py tests\test_sft_cuda_smoke.py tests\test_convert_deepspeed_checkpoint_to_pth.py tests\test_converted_checkpoint_equivalence.py` -> 25 passed, 4 skipped.
   - `D:\anaconda\envs\model\python.exe -m compileall -q src data tests train.py` -> passed.
 
+2026-06-05 SFT length-aware packing
+
+Completed
+- Added optional `--pack-strategy best-fit-decreasing` for SFT preprocessing.
+- Default remains `ordered`, preserving the existing sample order after shuffle / no-shuffle.
+- `best-fit-decreasing` sorts tokenized samples by length and uses a best-fit approximation to reduce padding while still never splitting a sample.
+- Updated README / README_CN and the 13.3B launcher comment.
+
+Validation
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_binidx.py` -> 72 passed.
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_training.py tests\test_sft_cuda_smoke.py tests\test_convert_deepspeed_checkpoint_to_pth.py tests\test_converted_checkpoint_equivalence.py` -> 25 passed, 4 skipped.
+- `D:\anaconda\envs\model\python.exe -m compileall -q src data tests train.py` -> passed.
+- Coverage for `src.sft_binidx` + `data.make_sft_binidx`: total 97%, `src.sft_binidx.py` 99%.
+
 2026-06-05 SFT fixture tracking follow-up
 
 Server feedback

@@ -650,6 +650,63 @@ def pack_encoded_documents(
             yield packed
 
 
+def pack_encoded_documents_best_fit_decreasing(
+    documents: Iterable[EncodedDocument],
+    *,
+    pack_length: int,
+    pad_token_id: int,
+    separator: EncodedDocument | None = None,
+) -> Iterable[EncodedDocument]:
+    if pack_length <= 0:
+        raise ValueError("pack_length must be a positive integer.")
+
+    separator = separator or EncodedDocument(input_ids=[], loss_mask=[])
+    source_documents = list(documents)
+    for document in source_documents:
+        if len(document.input_ids) != len(document.loss_mask):
+            raise ValueError("Token ids and loss mask must have identical lengths.")
+        if len(document.input_ids) > pack_length:
+            raise ValueError(
+                f"Document length {len(document.input_ids)} exceeds pack_length {pack_length}."
+            )
+
+    sorted_documents = sorted(source_documents, key=lambda document: len(document.input_ids), reverse=True)
+    bins: list[tuple[list[int], list[int]]] = []
+
+    for document in sorted_documents:
+        best_index = None
+        best_remaining = None
+        for index, (packed_ids, _) in enumerate(bins):
+            append_length = len(document.input_ids)
+            if packed_ids and separator.input_ids:
+                append_length += len(separator.input_ids)
+            remaining = pack_length - len(packed_ids)
+            if append_length > remaining:
+                continue
+            leftover = remaining - append_length
+            if best_remaining is None or leftover < best_remaining:
+                best_index = index
+                best_remaining = leftover
+
+        if best_index is None:
+            bins.append((list(document.input_ids), list(document.loss_mask)))
+            continue
+
+        packed_ids, packed_mask = bins[best_index]
+        if packed_ids and separator.input_ids:
+            packed_ids.extend(separator.input_ids)
+            packed_mask.extend(separator.loss_mask)
+        packed_ids.extend(document.input_ids)
+        packed_mask.extend(document.loss_mask)
+
+    for packed_ids, packed_mask in bins:
+        padding = pack_length - len(packed_ids)
+        yield EncodedDocument(
+            input_ids=packed_ids + [pad_token_id] * padding,
+            loss_mask=packed_mask + [0] * padding,
+        )
+
+
 def pad_encoded_documents(
     documents: Iterable[EncodedDocument],
     *,
@@ -901,11 +958,14 @@ def build_binidx_dataset(
     current_location: str | None = None,
     num_workers: int = 1,
     shuffle: bool = True,
+    pack_strategy: str = "ordered",
 ):
     if num_workers <= 0:
         raise ValueError("num_workers must be a positive integer.")
     if pack_length is not None and pad_length is not None:
         raise ValueError("pack_length and pad_length are mutually exclusive.")
+    if pack_strategy not in {"ordered", "best-fit-decreasing"}:
+        raise ValueError("pack_strategy must be 'ordered' or 'best-fit-decreasing'.")
 
     template = load_chat_template(template_path)
     tokenizer = TRIE_TOKENIZER(vocab_path, strict_length=True)
@@ -929,7 +989,12 @@ def build_binidx_dataset(
         max_length=max_source_length,
     )
     if pack_length is not None:
-        documents = pack_encoded_documents(
+        packer = (
+            pack_encoded_documents_best_fit_decreasing
+            if pack_strategy == "best-fit-decreasing"
+            else pack_encoded_documents
+        )
+        documents = packer(
             documents,
             pack_length=pack_length,
             pad_token_id=eod_token_id(tokenizer),
@@ -953,4 +1018,5 @@ def build_binidx_dataset(
     stats["pad_length"] = pad_length
     stats["num_workers"] = num_workers
     stats["shuffle"] = shuffle
+    stats["pack_strategy"] = pack_strategy
     return stats

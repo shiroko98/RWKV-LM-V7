@@ -60,6 +60,7 @@ from src.sft_binidx import (
     normalize_tool_calls,
     normalize_record,
     pack_encoded_documents,
+    pack_encoded_documents_best_fit_decreasing,
     pad_encoded_documents,
     parse_tool_arguments,
     render_chat_template,
@@ -804,6 +805,46 @@ def test_pack_encoded_documents_keeps_samples_atomic_and_validates_lengths(token
         )
 
 
+def test_pack_encoded_documents_best_fit_decreasing_reduces_padding_without_splitting(tokenizer: TRIE_TOKENIZER):
+    eod_id = eod_token_id(tokenizer)
+    separator = EncodedDocument(input_ids=[99], loss_mask=[0])
+    documents = [
+        EncodedDocument(input_ids=[1, 2, 3, 4, eod_id], loss_mask=[1, 1, 1, 1, 1]),
+        EncodedDocument(input_ids=[5, 6, 7, 8, eod_id], loss_mask=[1, 1, 1, 1, 1]),
+        EncodedDocument(input_ids=[10, 11, eod_id], loss_mask=[1, 1, 1]),
+        EncodedDocument(input_ids=[12, 13, eod_id], loss_mask=[1, 1, 1]),
+    ]
+
+    ordered = list(
+        pack_encoded_documents(
+            documents,
+            pack_length=10,
+            pad_token_id=eod_id,
+            separator=separator,
+        )
+    )
+    optimized = list(
+        pack_encoded_documents_best_fit_decreasing(
+            documents,
+            pack_length=10,
+            pad_token_id=eod_id,
+            separator=separator,
+        )
+    )
+
+    assert len(ordered) == 3
+    assert len(optimized) == 2
+    optimized_text = [doc.input_ids for doc in optimized]
+    assert optimized_text == [
+        [1, 2, 3, 4, eod_id, 99, 10, 11, eod_id, eod_id],
+        [5, 6, 7, 8, eod_id, 99, 12, 13, eod_id, eod_id],
+    ]
+    assert [doc.loss_mask for doc in optimized] == [
+        [1, 1, 1, 1, 1, 0, 1, 1, 1, 0],
+        [1, 1, 1, 1, 1, 0, 1, 1, 1, 0],
+    ]
+
+
 def test_collect_filtered_documents_drops_too_long_samples_after_tokenization():
     documents = [
         EncodedDocument(input_ids=[1, 2], loss_mask=[1, 1]),
@@ -1130,6 +1171,7 @@ def test_build_binidx_dataset_filters_too_long_samples_before_packing(tmp_path):
     assert stats["source_documents"] == 2
     assert stats["filtered_documents"] == 1
     assert stats["documents"] == 1
+    assert stats["pack_strategy"] == "ordered"
     assert "short keep" in decoded
     assert "long drop" not in decoded
 
@@ -1530,6 +1572,8 @@ def test_arg_parser_defaults_and_overrides():
             "--ctx-len",
             "127",
             "--pack",
+            "--pack-strategy",
+            "best-fit-decreasing",
             "--pack-length",
             "64",
             "--add-generation-prompt",
@@ -1550,6 +1594,7 @@ def test_arg_parser_defaults_and_overrides():
     assert overridden.ctx_len == 127
     assert overridden.pack is True
     assert overridden.pad is False
+    assert overridden.pack_strategy == "best-fit-decreasing"
     assert overridden.pack_length == 64
     assert overridden.pad_length is None
     assert overridden.add_generation_prompt is True

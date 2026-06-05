@@ -22,6 +22,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ctx-len", "--ctx_len", dest="ctx_len", type=int, default=None)
     parser.add_argument("--pack", action="store_true", default=False)
     parser.add_argument("--pad", action="store_true", default=False)
+    parser.add_argument("--pack-strategy", choices=["ordered", "best-fit-decreasing"], default="ordered")
     parser.add_argument("--pack-length", type=int, default=None)
     parser.add_argument("--pad-length", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=1)
@@ -76,6 +77,7 @@ def main(argv=None):
         pad_length=pad_length,
         num_workers=args.num_workers,
         shuffle=args.shuffle,
+        pack_strategy=args.pack_strategy,
         current_date=args.current_date,
         current_location=args.current_location,
     )

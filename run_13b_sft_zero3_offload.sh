@@ -10,6 +10,7 @@ set -euo pipefail
 #     --out-prefix /mnt/data/datasets/sft_train_ctx8192 \
 #     --ctx-len 8192 \
 #     --pack \
+#     --pack-strategy best-fit-decreasing \
 #     --num-workers 32 \
 #     --shuffle
 #

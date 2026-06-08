@@ -551,32 +551,85 @@ Current validation results:
 
 13.3B SFT launcher:
 
-`run_13b_sft_zero3_offload.sh` is derived from `model/rwkv7-g1f-13.3b.txt`: `n_layer=61`, `n_embd=4096`, `dim_ffn=16384`, `vocab_size=65536`, `head_size=64`, and LoRA dimensions `192/192/128/384`. It defaults to 8xH800, `deepspeed_stage_3_offload`, and SFT binidx+mask data.
+The complete 13.3B example is [run_13b_sft_zero3_offload.sh](/D:/codes/RWKV-LM-V7-12B-train/run_13b_sft_zero3_offload.sh). It is derived from `model/rwkv7-g1f-13.3b.txt`: `n_layer=61`, `n_embd=4096`, `dim_ffn=16384`, `vocab_size=65536`, `head_size=64`, and LoRA dimensions `192/192/128/384`. It defaults to 8xH800, `deepspeed_stage_3_offload`, activation checkpointing enabled, and SFT binidx+mask data.
 
-Prepare data first. For fixed-length training, use `ctx_len + 1`:
+Step 1: prepare fixed-length SFT data. `--ctx-len 8192 --pack` writes `8193` tokens per document, because training uses next-token labels:
 
 ```bash
-python data/make_sft_binidx.py /path/to/sft_jsonl_dir \
+python data/make_sft_binidx.py /mnt/data/datasets/sft_jsonl \
   --out-prefix /mnt/data/datasets/sft_train_ctx8192 \
   --ctx-len 8192 \
   --pack \
+  --pack-strategy best-fit-decreasing \
+  --pack-shard-group-size 8 \
   --num-workers 32 \
   --shuffle
 ```
 
-Then launch 13.3B SFT:
+Step 2: calculate `EPOCH_STEPS` for one full pass over the produced SFT documents:
+
+```bash
+DATA_FILE=/mnt/data/datasets/sft_train_ctx8192 \
+NUM_NODES=1 \
+DEVICES=8 \
+MICRO_BSZ=1 \
+N_PASS=1 \
+python - <<'PY'
+import math, os
+from src.binidx import MMapIndexedDataset
+
+docs = len(MMapIndexedDataset(os.environ["DATA_FILE"]))
+real_bsz = int(os.environ["NUM_NODES"]) * int(os.environ["DEVICES"]) * int(os.environ["MICRO_BSZ"])
+epoch_steps = math.ceil(docs / real_bsz)
+
+print(f"documents={docs}")
+print(f"real_bsz={real_bsz}")
+print(f"EPOCH_STEPS={epoch_steps}")
+print(f"EPOCH_COUNT={int(os.environ['N_PASS'])}")
+print(f"samples_per_epoch={epoch_steps * real_bsz}")
+print(f"extra_repeated_per_epoch={epoch_steps * real_bsz - docs}")
+PY
+```
+
+Step 3: launch 13.3B SFT on 8 H800 GPUs:
 
 ```bash
 LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b.pth \
 DATA_FILE=/mnt/data/datasets/sft_train_ctx8192 \
+PROJ_DIR=/mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload \
 CTX_LEN=8192 \
-EPOCH_STEPS=1000 \
+N_NODE=1 \
+GPU_PER_NODE=8 \
+MICRO_BSZ=1 \
+EPOCH_STEPS=12500 \
 EPOCH_COUNT=1 \
+STRATEGY=deepspeed_stage_3_offload \
+GRAD_CP=1 \
+LR_INIT=1e-5 \
+LR_FINAL=1e-6 \
+WARMUP_STEPS=10 \
+EPOCH_SAVE=1 \
+SAVE_EVERY_N_STEPS=0 \
+KEEP_LAST_N_CHECKPOINTS=3 \
 WANDB_PROJECT=RWKV-13B-SFT \
 bash run_13b_sft_zero3_offload.sh
 ```
 
-Use `STRATEGY=deepspeed_stage_3` if you want pure ZeRO-3 instead of offload. To resume, point `LOAD_MODEL` at a saved `rwkv-step-N.pth` checkpoint directory or file; the SFT path uses the same resume logic.
+Key parameters:
+
+- `LOAD_MODEL`: initial 13.3B checkpoint, or a saved `rwkv-step-N.pth` / `rwkv-N.pth` checkpoint for resume. DeepSpeed checkpoint directories are supported when the strategy is DeepSpeed.
+- `DATA_FILE`: SFT binidx prefix, without `.bin` or `.idx`. The script expects `DATA_FILE.bin`, `DATA_FILE.idx`, `DATA_FILE.mask.bin`, and `DATA_FILE.mask.idx`.
+- `CTX_LEN`: training context length. It must match the preprocessing `--ctx-len`; the binidx documents should contain `CTX_LEN + 1` tokens.
+- `N_NODE`, `GPU_PER_NODE`, `MICRO_BSZ`: define current real batch size: `real_bsz = N_NODE * GPU_PER_NODE * MICRO_BSZ`.
+- `EPOCH_STEPS`: optimizer steps per SFT epoch. For one full pass, use `ceil(num_sft_documents / real_bsz)`.
+- `EPOCH_COUNT`: number of SFT passes. For `N` passes over the SFT data, keep `EPOCH_STEPS` from the one-pass formula and set `EPOCH_COUNT=N`.
+- `GRAD_CP`: activation checkpointing. `1` enables block-level checkpointing to save VRAM; `0` disables it and is faster if memory allows.
+- Gradient accumulation: not wired in this script/code path yet. Do not multiply `real_bsz` by an accumulation factor.
+- `STRATEGY`: defaults to `deepspeed_stage_3_offload` for lower VRAM. Use `deepspeed_stage_3` for pure ZeRO-3 if memory allows.
+- `LR_INIT`, `LR_FINAL`, `WARMUP_STEPS`, `WEIGHT_DECAY`: SFT learning-rate schedule and regularization.
+- `EPOCH_SAVE`, `SAVE_EVERY_N_STEPS`, `KEEP_LAST_N_CHECKPOINTS`: checkpoint cadence and retention.
+- `PROJ_DIR`: output directory for logs and checkpoints.
+- `WANDB_PROJECT`: empty disables wandb; a non-empty value enables logging under that project.
 
 Optional CUDA smoke tests are available for server validation:
 

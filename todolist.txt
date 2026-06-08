@@ -8,6 +8,7 @@ Completed
 - Larger values group multiple JSONL shards, read them concurrently with `--num-workers`, best-fit pack across the group, and append all groups into one token binidx plus mask sidecar.
 - Added regression coverage for grouped multi-JSONL best-fit packing and CLI parsing.
 - Clarified README / README_CN concurrency semantics: groups are serial, reads within one group are bounded by `min(group_size, num_workers, files_in_group)`, and output writes remain single-threaded appends.
+- Expanded the 13.3B SFT README / README_CN example around `run_13b_sft_zero3_offload.sh`, including data preparation, `EPOCH_STEPS` calculation, activation checkpointing, the absence of gradient accumulation, and key environment variables.
 
 Current status
 - Branch `new_sft` created from `ops-train`.

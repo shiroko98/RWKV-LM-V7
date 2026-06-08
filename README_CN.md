@@ -354,32 +354,85 @@ SFT mask 训练的实现框架：
 
 13.3B SFT 启动脚本：
 
-`run_13b_sft_zero3_offload.sh` 按 `model/rwkv7-g1f-13.3b.txt` 推导了模型形状：`n_layer=61`、`n_embd=4096`、`dim_ffn=16384`、`vocab_size=65536`、`head_size=64`、LoRA 维度 `192/192/128/384`。默认适配 8 卡 H800、`deepspeed_stage_3_offload` 和 SFT binidx+mask 数据。
+完整 13.3B 示例就是 [run_13b_sft_zero3_offload.sh](/D:/codes/RWKV-LM-V7-12B-train/run_13b_sft_zero3_offload.sh)。它按 `model/rwkv7-g1f-13.3b.txt` 推导了模型形状：`n_layer=61`、`n_embd=4096`、`dim_ffn=16384`、`vocab_size=65536`、`head_size=64`、LoRA 维度 `192/192/128/384`。默认适配 8 卡 H800、`deepspeed_stage_3_offload`、开启激活检查点，并使用 SFT binidx+mask 数据。
 
-先准备数据，注意固定长度建议使用 `ctx_len + 1`：
+第一步：准备固定长度 SFT 数据。`--ctx-len 8192 --pack` 会写出每个 document `8193` 个 token，因为训练端使用 next-token label：
 
 ```bash
-python data/make_sft_binidx.py /path/to/sft_jsonl_dir \
+python data/make_sft_binidx.py /mnt/data/datasets/sft_jsonl \
   --out-prefix /mnt/data/datasets/sft_train_ctx8192 \
   --ctx-len 8192 \
   --pack \
+  --pack-strategy best-fit-decreasing \
+  --pack-shard-group-size 8 \
   --num-workers 32 \
   --shuffle
 ```
 
-再启动 13.3B SFT：
+第二步：计算完整跑一遍 SFT documents 需要多少 `EPOCH_STEPS`：
+
+```bash
+DATA_FILE=/mnt/data/datasets/sft_train_ctx8192 \
+NUM_NODES=1 \
+DEVICES=8 \
+MICRO_BSZ=1 \
+N_PASS=1 \
+python - <<'PY'
+import math, os
+from src.binidx import MMapIndexedDataset
+
+docs = len(MMapIndexedDataset(os.environ["DATA_FILE"]))
+real_bsz = int(os.environ["NUM_NODES"]) * int(os.environ["DEVICES"]) * int(os.environ["MICRO_BSZ"])
+epoch_steps = math.ceil(docs / real_bsz)
+
+print(f"documents={docs}")
+print(f"real_bsz={real_bsz}")
+print(f"EPOCH_STEPS={epoch_steps}")
+print(f"EPOCH_COUNT={int(os.environ['N_PASS'])}")
+print(f"samples_per_epoch={epoch_steps * real_bsz}")
+print(f"extra_repeated_per_epoch={epoch_steps * real_bsz - docs}")
+PY
+```
+
+第三步：在 8 张 H800 上启动 13.3B SFT：
 
 ```bash
 LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b.pth \
 DATA_FILE=/mnt/data/datasets/sft_train_ctx8192 \
+PROJ_DIR=/mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload \
 CTX_LEN=8192 \
-EPOCH_STEPS=1000 \
+N_NODE=1 \
+GPU_PER_NODE=8 \
+MICRO_BSZ=1 \
+EPOCH_STEPS=12500 \
 EPOCH_COUNT=1 \
+STRATEGY=deepspeed_stage_3_offload \
+GRAD_CP=1 \
+LR_INIT=1e-5 \
+LR_FINAL=1e-6 \
+WARMUP_STEPS=10 \
+EPOCH_SAVE=1 \
+SAVE_EVERY_N_STEPS=0 \
+KEEP_LAST_N_CHECKPOINTS=3 \
 WANDB_PROJECT=RWKV-13B-SFT \
 bash run_13b_sft_zero3_offload.sh
 ```
 
-如果你想验证纯 ZeRO-3 而不是 offload，可以覆盖 `STRATEGY=deepspeed_stage_3`。如果要断点续训，把 `LOAD_MODEL` 指到保存出来的 `rwkv-step-N.pth` 目录或文件，脚本仍走同一个 SFT resume 路径。
+关键参数说明：
+
+- `LOAD_MODEL`：初始 13.3B checkpoint；也可以指向保存出的 `rwkv-step-N.pth` / `rwkv-N.pth` 做断点续训。DeepSpeed checkpoint 目录需要配合 DeepSpeed strategy 恢复。
+- `DATA_FILE`：SFT binidx 前缀，不带 `.bin` 或 `.idx`。脚本会检查 `DATA_FILE.bin`、`DATA_FILE.idx`、`DATA_FILE.mask.bin`、`DATA_FILE.mask.idx`。
+- `CTX_LEN`：训练上下文长度，需要和预处理 `--ctx-len` 一致；预处理产物里的 document 应该是 `CTX_LEN + 1` 个 token。
+- `N_NODE`、`GPU_PER_NODE`、`MICRO_BSZ`：决定当前真实 batch size：`real_bsz = N_NODE * GPU_PER_NODE * MICRO_BSZ`。
+- `EPOCH_STEPS`：每个 SFT epoch 的 optimizer step 数。完整跑一遍建议用 `ceil(num_sft_documents / real_bsz)`。
+- `EPOCH_COUNT`：跑几遍 SFT 数据。想跑 `N` 遍时，`EPOCH_STEPS` 按一遍数据计算，`EPOCH_COUNT=N`。
+- `GRAD_CP`：激活检查点。`1` 表示对 block 开启 checkpointing，省显存但更慢；显存足够时可设 `0`。
+- 梯度累计：当前脚本和代码路径还没有接入 gradient accumulation，所以计算 `real_bsz` 时不要再乘累计步数。
+- `STRATEGY`：默认 `deepspeed_stage_3_offload`，更省显存；显存足够时可以用 `deepspeed_stage_3` 做纯 ZeRO-3。
+- `LR_INIT`、`LR_FINAL`、`WARMUP_STEPS`、`WEIGHT_DECAY`：SFT 学习率计划和正则参数。
+- `EPOCH_SAVE`、`SAVE_EVERY_N_STEPS`、`KEEP_LAST_N_CHECKPOINTS`：checkpoint 保存频率和保留数量。
+- `PROJ_DIR`：训练日志和 checkpoint 输出目录。
+- `WANDB_PROJECT`：空字符串表示不启用 wandb；非空则记录到对应项目。
 
 服务器上可以打开可选 CUDA smoke 测试：
 

@@ -33,6 +33,7 @@ def make_sft_args(prefix: str, **overrides):
         resume_epoch=0,
         resume_step_offset=0,
         micro_bsz=1,
+        accumulate_grad_batches=1,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -86,6 +87,43 @@ def test_sft_dataset_uses_rank_and_resume_offset_for_document_selection(tmp_path
     assert torch.equal(x, torch.tensor([40, 41, 65532], dtype=torch.long))
     assert torch.equal(y, torch.tensor([41, 65532, 65532], dtype=torch.long))
     assert torch.equal(mask, torch.tensor([1, 0, 0], dtype=torch.float32))
+
+
+def test_sft_dataset_uses_gradient_accumulation_for_length_epoch_and_resume(tmp_path):
+    prefix = str(tmp_path / "sft")
+    write_documents(
+        prefix,
+        [
+            EncodedDocument(input_ids=[base, base + 1], loss_mask=[0, 1])
+            for base in range(0, 80, 10)
+        ],
+    )
+
+    dataset = dataset_mod.MyDataset(
+        make_sft_args(
+            prefix,
+            ctx_len=3,
+            epoch_steps=2,
+            real_bsz=1,
+            accumulate_grad_batches=3,
+        )
+    )
+
+    assert len(dataset) == 6
+    assert dataset.samples_per_epoch == 6
+
+    dataset.real_epoch = 1
+    x_epoch, y_epoch, mask_epoch = dataset[0]
+    assert torch.equal(x_epoch, torch.tensor([60, 61, 65532], dtype=torch.long))
+    assert torch.equal(y_epoch, torch.tensor([61, 65532, 65532], dtype=torch.long))
+    assert torch.equal(mask_epoch, torch.tensor([1, 0, 0], dtype=torch.float32))
+
+    dataset.real_epoch = 0
+    dataset.step_offset = 1
+    x_resume, y_resume, mask_resume = dataset[0]
+    assert torch.equal(x_resume, torch.tensor([30, 31, 65532], dtype=torch.long))
+    assert torch.equal(y_resume, torch.tensor([31, 65532, 65532], dtype=torch.long))
+    assert torch.equal(mask_resume, torch.tensor([1, 0, 0], dtype=torch.float32))
 
 
 def test_sft_dataset_rejects_too_long_documents_and_bad_masks(tmp_path):
@@ -227,6 +265,37 @@ def test_configure_training_limits_stops_sft_by_epoch_count_and_preserves_pretra
     pretrain_args = SimpleNamespace(data_type="binidx", epoch_count=3, max_epochs=3)
     train.configure_training_limits(pretrain_args)
     assert pretrain_args.max_epochs == -1
+
+
+def test_batch_size_helpers_track_sft_gradient_accumulation():
+    sft_args = SimpleNamespace(
+        data_type="sft_binidx",
+        epoch_steps=5,
+        real_bsz=8,
+        accumulate_grad_batches="4",
+    )
+    train.configure_batch_sizes(sft_args)
+    train.configure_samples_per_epoch(sft_args)
+
+    assert sft_args.accumulate_grad_batches == 4
+    assert sft_args.effective_bsz == 32
+    assert sft_args.samples_per_epoch == 160
+
+    pretrain_args = SimpleNamespace(
+        data_type="binidx",
+        epoch_steps=5,
+        real_bsz=8,
+        accumulate_grad_batches=4,
+    )
+    train.configure_batch_sizes(pretrain_args)
+    train.configure_samples_per_epoch(pretrain_args)
+    assert pretrain_args.effective_bsz == 8
+    assert pretrain_args.samples_per_epoch == 40
+
+    with pytest.raises(ValueError, match="accumulate_grad_batches"):
+        train.normalize_accumulate_grad_batches(SimpleNamespace(accumulate_grad_batches=0))
+    with pytest.raises(ValueError, match="accumulate_grad_batches"):
+        train.normalize_accumulate_grad_batches(SimpleNamespace(accumulate_grad_batches="bad"))
 
 
 def test_checkpoint_path_helpers_handle_empty_regular_and_unreadable_paths(tmp_path, monkeypatch):

@@ -494,6 +494,7 @@ python train.py \
   --epoch_steps 1000 \
   --epoch_count 1 \
   --micro_bsz 1 \
+  --accumulate_grad_batches 1 \
   --vocab_size 65536 \
   --n_layer 24 \
   --n_embd 1024 \
@@ -515,7 +516,7 @@ python train.py \
   --grad_cp 1
 ```
 
-In this generic example, `--accelerator gpu` tells Lightning to train on CUDA GPUs, and `--devices 1` means one GPU in the current node. For multi-GPU DeepSpeed on one node, set `--devices` to the GPU count, for example `--devices 8`; `train.py` will automatically relaunch itself with `torchrun` when `strategy` contains `deepspeed`, `num_nodes=1`, and `devices > 1`. The global batch used by SFT scheduling is `real_bsz = num_nodes * devices * micro_bsz`. `--my_exit_tokens` is intentionally omitted for SFT because SFT stops by `--epoch_count`; `my_exit_tokens` is part of the pretraining token-limit schedule.
+In this generic example, `--accelerator gpu` tells Lightning to train on CUDA GPUs, and `--devices 1` means one GPU in the current node. For multi-GPU DeepSpeed on one node, set `--devices` to the GPU count, for example `--devices 8`; `train.py` will automatically relaunch itself with `torchrun` when `strategy` contains `deepspeed`, `num_nodes=1`, and `devices > 1`. In SFT scheduling, `real_bsz = num_nodes * devices * micro_bsz` is the global sample count per forward pass, and `effective_bsz = real_bsz * accumulate_grad_batches` is the sample count consumed by each optimizer step. `--my_exit_tokens` is intentionally omitted for SFT because SFT stops by `--epoch_count`; `my_exit_tokens` is part of the pretraining token-limit schedule.
 
 Training samples use next-token labels, so the dataloader needs `ctx_len + 1` token ids per SFT document. A shorter document is padded in memory with `--sft_pad_token_id` and mask `0`; a longer document raises an error. For predictable fixed-length training, build data with `--ctx-len CTX_LEN --pack` or `--ctx-len CTX_LEN --pad`; preprocessing writes `CTX_LEN + 1` token documents, then train with `--ctx_len CTX_LEN`. For RWKV7 x070, keep `ctx_len` divisible by 16.
 
@@ -524,25 +525,26 @@ The 0.4B checkpoint listed in the example is `L24-D1024` with `dim_ffn=4096`, `v
 SFT masked-training implementation:
 
 1. Offline preprocessing writes two aligned binidx datasets. `PREFIX.bin/.idx` stores token ids, while `PREFIX.mask.bin/.idx` stores the same-length `0/1` loss mask.
-2. `train.py` enters SFT mode with `--data_type sft_binidx`. This mode does not use the pretraining magic-prime schedule. It preserves user-provided `--epoch_steps` and `--epoch_count`, and sets Lightning `max_epochs` to `epoch_count`.
+2. `train.py` enters SFT mode with `--data_type sft_binidx`. This mode does not use the pretraining magic-prime schedule. It preserves user-provided `--epoch_steps` and `--epoch_count`, and sets Lightning `max_epochs` to `epoch_count`. When `--accumulate_grad_batches G` is enabled, `epoch_steps` still means optimizer steps; the dataloader provides `epoch_steps * G` micro-batches per epoch.
 3. `src/dataset.py::MyDataset` loads the token prefix from `--data_file` and the mask prefix from `--data_file.mask` by default. `--sft_mask_file` can override the mask prefix. Initialization validates matching document counts and identical per-document sizes.
 4. Each SFT document may contain at most `ctx_len + 1` tokens. Short documents are padded in memory with `--sft_pad_token_id` and mask `0`; long documents raise an error instead of being silently truncated.
 5. The dataset returns `(x, y, loss_mask)`: `x = token_ids[:-1]`, `y = token_ids[1:]`, and `loss_mask = raw_mask[1:]`. The mask is shifted so it marks whether each next-token target contributes to loss.
 6. `src/model.py::training_step` dispatches by batch shape. Pretraining batches `(x, y)` keep the existing fused CE path. SFT batches `(x, y, loss_mask)` use `src/sft_loss.py::masked_cross_entropy`.
 7. `masked_cross_entropy` computes per-token CE, averages only positions with `loss_mask=1`, and returns a differentiable zero loss if the mask is empty.
+8. Gradient accumulation is executed by Lightning through `--accumulate_grad_batches`; the SFT dataset uses the same value for epoch length, full-pass step calculation, and step-checkpoint mid-epoch resume offsets. Resuming from `rwkv-step-N.pth` skips `N * accumulate_grad_batches` micro-batches, not just `N` micro-batches.
 
 Validation coverage:
 
-- Default unit tests in `tests/test_sft_training.py` cover sidecar loading, mask shifting, padding, invalid masks, too-long documents, SFT epoch scheduling, and masked CE math.
+- Default unit tests in `tests/test_sft_training.py` cover sidecar loading, mask shifting, padding, invalid masks, too-long documents, SFT epoch scheduling, dataset length/resume offsets under gradient accumulation, and masked CE math.
 - `tests/test_sft_binidx.py` covers authoritative Jinja rendering, think/no-think rules, Chinese UTF-8 spans, tool calls, packing, padding, recursive directory input, concurrent JSONL loading, and CLI parsing.
 - `RWKV_RUN_CUDA_SFT_SMOKE=1` loads a real RWKV7 checkpoint, builds a tiny SFT binidx dataset, and runs CUDA forward/backward with masked SFT loss.
-- `RWKV_RUN_TRAIN_PY_SFT_SMOKE=1` launches `train.py` for one SFT step and covers Lightning, DeepSpeed, optimizer, and multi-card torchrun.
+- `RWKV_RUN_TRAIN_PY_SFT_SMOKE=1` launches `train.py` for one SFT step and covers Lightning, DeepSpeed, optimizer, and multi-card torchrun. Set `RWKV_SFT_SMOKE_ACCUMULATE_GRAD_BATCHES=2` or a similar value to cover the gradient-accumulation path.
 - `RWKV_RUN_TRAIN_PY_SFT_RESUME_SMOKE=1` saves `rwkv-step-1.pth` and resumes from it, covering SFT checkpoint resume and DeepSpeed sharded checkpoint loading.
 
 Current validation results:
 
-- Local default regression: `115 passed, 3 skipped`.
-- SFT training targeted coverage: `src.dataset`, `src.sft_loss`, and testable `train.py` helper surface are `100%`.
+- Local default regression: `125 passed, 4 skipped`.
+- SFT training targeted coverage: `src.dataset`, `src.sft_loss`, and the testable `train.py` helper surface total `99%`.
 - SFT preprocessing coverage: `src.sft_binidx`, `data.make_sft_binidx`, and `data.tokenizer.rwkv_tokenizer` total `99%`.
 - Server 8xH800:
   - `RWKV_RUN_CUDA_SFT_SMOKE=1` -> `3 passed, 2 skipped`.
@@ -574,6 +576,7 @@ DATA_FILE=/mnt/data/datasets/sft_train_ctx8192 \
 NUM_NODES=1 \
 DEVICES=8 \
 MICRO_BSZ=1 \
+ACCUMULATE_GRAD_BATCHES=1 \
 N_PASS=1 \
 python - <<'PY'
 import math, os
@@ -581,14 +584,18 @@ from src.binidx import MMapIndexedDataset
 
 docs = len(MMapIndexedDataset(os.environ["DATA_FILE"]))
 real_bsz = int(os.environ["NUM_NODES"]) * int(os.environ["DEVICES"]) * int(os.environ["MICRO_BSZ"])
-epoch_steps = math.ceil(docs / real_bsz)
+accumulate = int(os.environ["ACCUMULATE_GRAD_BATCHES"])
+effective_bsz = real_bsz * accumulate
+epoch_steps = math.ceil(docs / effective_bsz)
 
 print(f"documents={docs}")
 print(f"real_bsz={real_bsz}")
+print(f"accumulate_grad_batches={accumulate}")
+print(f"effective_bsz={effective_bsz}")
 print(f"EPOCH_STEPS={epoch_steps}")
 print(f"EPOCH_COUNT={int(os.environ['N_PASS'])}")
-print(f"samples_per_epoch={epoch_steps * real_bsz}")
-print(f"extra_repeated_per_epoch={epoch_steps * real_bsz - docs}")
+print(f"samples_per_epoch={epoch_steps * effective_bsz}")
+print(f"extra_repeated_per_epoch={epoch_steps * effective_bsz - docs}")
 PY
 ```
 
@@ -602,6 +609,7 @@ CTX_LEN=8192 \
 N_NODE=1 \
 GPU_PER_NODE=8 \
 MICRO_BSZ=1 \
+ACCUMULATE_GRAD_BATCHES=4 \
 EPOCH_STEPS=12500 \
 EPOCH_COUNT=1 \
 STRATEGY=deepspeed_stage_3_offload \
@@ -621,11 +629,11 @@ Key parameters:
 - `LOAD_MODEL`: initial 13.3B checkpoint, or a saved `rwkv-step-N.pth` / `rwkv-N.pth` checkpoint for resume. DeepSpeed checkpoint directories are supported when the strategy is DeepSpeed.
 - `DATA_FILE`: SFT binidx prefix, without `.bin` or `.idx`. The script expects `DATA_FILE.bin`, `DATA_FILE.idx`, `DATA_FILE.mask.bin`, and `DATA_FILE.mask.idx`.
 - `CTX_LEN`: training context length. It must match the preprocessing `--ctx-len`; the binidx documents should contain `CTX_LEN + 1` tokens.
-- `N_NODE`, `GPU_PER_NODE`, `MICRO_BSZ`: define current real batch size: `real_bsz = N_NODE * GPU_PER_NODE * MICRO_BSZ`.
-- `EPOCH_STEPS`: optimizer steps per SFT epoch. For one full pass, use `ceil(num_sft_documents / real_bsz)`.
+- `N_NODE`, `GPU_PER_NODE`, `MICRO_BSZ`: define the real global batch size for one forward pass: `real_bsz = N_NODE * GPU_PER_NODE * MICRO_BSZ`.
+- `ACCUMULATE_GRAD_BATCHES`: gradient accumulation steps. SFT commonly uses this to increase effective batch size when `MICRO_BSZ=1`; `effective_bsz = real_bsz * ACCUMULATE_GRAD_BATCHES`.
+- `EPOCH_STEPS`: optimizer steps per SFT epoch. For one full pass, use `ceil(num_sft_documents / effective_bsz)`.
 - `EPOCH_COUNT`: number of SFT passes. For `N` passes over the SFT data, keep `EPOCH_STEPS` from the one-pass formula and set `EPOCH_COUNT=N`.
 - `GRAD_CP`: activation checkpointing. `1` enables block-level checkpointing to save VRAM; `0` disables it and is faster if memory allows.
-- Gradient accumulation: not wired in this script/code path yet. Do not multiply `real_bsz` by an accumulation factor.
 - `STRATEGY`: defaults to `deepspeed_stage_3_offload` for lower VRAM. Use `deepspeed_stage_3` for pure ZeRO-3 if memory allows.
 - `LR_INIT`, `LR_FINAL`, `WARMUP_STEPS`, `WEIGHT_DECAY`: SFT learning-rate schedule and regularization.
 - `EPOCH_SAVE`, `SAVE_EVERY_N_STEPS`, `KEEP_LAST_N_CHECKPOINTS`: checkpoint cadence and retention.

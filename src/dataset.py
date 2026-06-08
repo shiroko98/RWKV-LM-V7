@@ -36,7 +36,11 @@ class MyDataset(Dataset):
         self.data_size = len(self.data._bin_buffer) // self.data._index._dtype_size
         rank_zero_info(f"Data has {self.data_size} tokens.")
 
-        self.samples_per_epoch = args.epoch_steps * args.real_bsz
+        self.accumulate_grad_batches = int(getattr(args, "accumulate_grad_batches", 1) or 1)
+        default_samples_per_epoch = args.epoch_steps * args.real_bsz
+        if self.data_type == "sft_binidx":
+            default_samples_per_epoch *= self.accumulate_grad_batches
+        self.samples_per_epoch = int(getattr(args, "samples_per_epoch", default_samples_per_epoch))
         rank_zero_info(f"########## train stage {args.train_stage} ##########")
         self.global_rank = int(os.environ.get("RANK", 0))
         self.world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -69,6 +73,8 @@ class MyDataset(Dataset):
             raise ValueError(f"Unsupported data_type: {self.data_type}")
 
     def __len__(self):
+        if self.data_type == "sft_binidx":
+            return self.args.epoch_steps * self.accumulate_grad_batches * self.args.micro_bsz
         return self.args.epoch_steps * self.args.micro_bsz
 
     def __getitem__(self, idx):
@@ -78,7 +84,10 @@ class MyDataset(Dataset):
         world_size = self.world_size
         # print(f"epoch {epoch} idx {idx} rank {rank}/{world_size}")
 
-        logical_idx = idx + self.step_offset * args.micro_bsz
+        step_offset = self.step_offset
+        if getattr(self, "data_type", getattr(args, "data_type", "binidx")) == "sft_binidx":
+            step_offset *= self.accumulate_grad_batches
+        logical_idx = idx + step_offset * args.micro_bsz
         sample_index = epoch * self.samples_per_epoch + (logical_idx * world_size) + rank
 
         data_type = getattr(self, "data_type", getattr(args, "data_type", "binidx"))

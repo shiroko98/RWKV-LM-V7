@@ -95,6 +95,7 @@ def _base_sft_args(prefix: Path, dims: dict[str, int], ctx_len: int) -> SimpleNa
         resume_epoch=0,
         resume_step_offset=0,
         micro_bsz=1,
+        accumulate_grad_batches=1,
     )
 
 
@@ -130,8 +131,8 @@ def _train_py_command(
         str(epoch_count),
         "--micro_bsz",
         "1",
-        "--my_exit_tokens",
-        "0",
+        "--accumulate_grad_batches",
+        os.environ.get("RWKV_SFT_SMOKE_ACCUMULATE_GRAD_BATCHES", "1"),
         "--vocab_size",
         str(dims["vocab_size"]),
         "--n_layer",

@@ -297,6 +297,7 @@ python train.py \
   --epoch_steps 1000 \
   --epoch_count 1 \
   --micro_bsz 1 \
+  --accumulate_grad_batches 1 \
   --vocab_size 65536 \
   --n_layer 24 \
   --n_embd 1024 \
@@ -318,7 +319,7 @@ python train.py \
   --grad_cp 1
 ```
 
-这个通用示例里，`--accelerator gpu` 表示用 CUDA GPU 训练，`--devices 1` 表示当前节点使用 1 张 GPU。如果要在单节点做多卡 DeepSpeed，把 `--devices` 改成 GPU 数量，比如 `--devices 8`；当 `strategy` 包含 `deepspeed`、`num_nodes=1` 且 `devices > 1` 时，`train.py` 会自动用 `torchrun` 重启多卡进程。SFT 调度使用的全局 batch 是 `real_bsz = num_nodes * devices * micro_bsz`。这里故意不写 `--my_exit_tokens`，因为 SFT 由 `--epoch_count` 控制停止；`my_exit_tokens` 是预训练 token-limit 调度的一部分。
+这个通用示例里，`--accelerator gpu` 表示用 CUDA GPU 训练，`--devices 1` 表示当前节点使用 1 张 GPU。如果要在单节点做多卡 DeepSpeed，把 `--devices` 改成 GPU 数量，比如 `--devices 8`；当 `strategy` 包含 `deepspeed`、`num_nodes=1` 且 `devices > 1` 时，`train.py` 会自动用 `torchrun` 重启多卡进程。SFT 调度里，`real_bsz = num_nodes * devices * micro_bsz` 表示每次 forward 的全局样本数，`effective_bsz = real_bsz * accumulate_grad_batches` 表示每个 optimizer step 消耗的样本数。这里故意不写 `--my_exit_tokens`，因为 SFT 由 `--epoch_count` 控制停止；`my_exit_tokens` 是预训练 token-limit 调度的一部分。
 
 训练端使用 next-token label，所以每个 SFT document 需要提供 `ctx_len + 1` 个 token。document 比这个短时，dataloader 会在内存里用 `--sft_pad_token_id` padding，并把 padding mask 设为 `0`；document 更长时会直接报错。为了让训练长度稳定，建议预处理时使用 `--ctx-len CTX_LEN --pack` 或 `--ctx-len CTX_LEN --pad`，预处理会自动写出 `CTX_LEN + 1` 个 token，训练时再设置 `--ctx_len CTX_LEN`。RWKV7 x070 的 `ctx_len` 需要能被 16 整除。
 
@@ -327,25 +328,26 @@ python train.py \
 SFT mask 训练的实现框架：
 
 1. 离线数据处理阶段只负责生成两套完全对齐的 binidx：主数据 `PREFIX.bin/.idx` 存 token id，sidecar `PREFIX.mask.bin/.idx` 存同长度的 `0/1` loss mask。
-2. `train.py` 通过 `--data_type sft_binidx` 进入 SFT 分支。这个分支不使用预训练的 magic-prime 调度，而是保留用户传入的 `--epoch_steps` 和 `--epoch_count`，并把 Lightning `max_epochs` 设为 `epoch_count`，所以 SFT 会按指定 epoch 数正常结束。
+2. `train.py` 通过 `--data_type sft_binidx` 进入 SFT 分支。这个分支不使用预训练的 magic-prime 调度，而是保留用户传入的 `--epoch_steps` 和 `--epoch_count`，并把 Lightning `max_epochs` 设为 `epoch_count`，所以 SFT 会按指定 epoch 数正常结束。启用 `--accumulate_grad_batches G` 时，`epoch_steps` 仍然表示 optimizer step 数；dataloader 会为每个 epoch 提供 `epoch_steps * G` 个 micro-batch。
 3. `src/dataset.py` 的 `MyDataset` 会加载 `--data_file` 指向的 token binidx，同时默认加载 `--data_file.mask`。如果你传了 `--sft_mask_file`，就用显式 mask 前缀。初始化时会检查 token 和 mask 的 document 数量、每个 document 长度必须完全一致。
 4. 每个 SFT document 最长允许 `ctx_len + 1` 个 token。短 document 会在内存中用 `--sft_pad_token_id` padding 到 `ctx_len + 1`，padding mask 始终为 `0`；长 document 直接报错，避免静默截断破坏 mask。
 5. dataloader 返回三元组 `(x, y, loss_mask)`：`x = token_ids[:-1]`，`y = token_ids[1:]`，`loss_mask = raw_mask[1:]`。mask 右移是为了和 next-token label 对齐，也就是 mask 标记的是“这个 target token 是否参与 loss”。
 6. `src/model.py` 的 `training_step` 根据 batch 长度分流：普通预训练 `(x, y)` 继续走原来的 fused CE 快路径；SFT `(x, y, loss_mask)` 走 `src/sft_loss.py::masked_cross_entropy`。这样 SFT 不影响预训练性能路径。
 7. `masked_cross_entropy` 先用标准 CE 得到每个 token 的 loss，再只对 `loss_mask=1` 的位置求平均。如果一个 batch 的 mask 全为 `0`，返回可反传的 0 loss，避免除零和梯度图断裂。
+8. 梯度累计由 Lightning 的 `--accumulate_grad_batches` 执行；SFT dataset 会同步使用这个参数来计算 epoch 长度、完整数据遍历步数和 step checkpoint 的 mid-epoch 恢复偏移。也就是说，从 `rwkv-step-N.pth` 恢复时会跳过 `N * accumulate_grad_batches` 个 micro-batch，而不是只跳过 `N` 个 micro-batch。
 
 测试流程和覆盖内容：
 
-- 默认 CPU/单进程单测：`tests/test_sft_training.py` 覆盖 mask sidecar 加载、mask shift、padding、坏 mask、过长 document、SFT epoch 调度和 masked CE 数学正确性。
+- 默认 CPU/单进程单测：`tests/test_sft_training.py` 覆盖 mask sidecar 加载、mask shift、padding、坏 mask、过长 document、SFT epoch 调度、梯度累计下的 dataset 长度/续训偏移和 masked CE 数学正确性。
 - 数据处理回归：`tests/test_sft_binidx.py` 覆盖权威 Jinja 渲染、think/no-think 规则、中文 UTF-8 span、工具调用、packing、padding、递归目录、多 JSONL 并发读取和 CLI 参数。
 - CUDA smoke 第一档：`RWKV_RUN_CUDA_SFT_SMOKE=1` 会在服务器加载真实 RWKV7 checkpoint，构造 tiny SFT binidx，跑 CUDA forward/backward，验证 masked SFT loss 可以反传。
-- CUDA smoke 第二档：`RWKV_RUN_TRAIN_PY_SFT_SMOKE=1` 会启动 `train.py` 跑 1 个 SFT step，覆盖 Lightning、DeepSpeed、optimizer、多卡 torchrun 链路。
+- CUDA smoke 第二档：`RWKV_RUN_TRAIN_PY_SFT_SMOKE=1` 会启动 `train.py` 跑 1 个 SFT step，覆盖 Lightning、DeepSpeed、optimizer、多卡 torchrun 链路。可用 `RWKV_SFT_SMOKE_ACCUMULATE_GRAD_BATCHES=2` 之类的环境变量额外覆盖梯度累计路径。
 - CUDA smoke 第三档：`RWKV_RUN_TRAIN_PY_SFT_RESUME_SMOKE=1` 会保存 `rwkv-step-1.pth` 并从它恢复，覆盖 SFT 断点续训和 DeepSpeed 分片 checkpoint 加载。
 
 当前已验证结果：
 
-- 本地默认回归：`115 passed, 3 skipped`。
-- SFT 训练相关 targeted 覆盖率：`src.dataset`、`src.sft_loss`、可单测的 `train.py` helper surface 为 `100%`。
+- 本地默认回归：`125 passed, 4 skipped`。
+- SFT 训练相关 targeted 覆盖率：`src.dataset`、`src.sft_loss`、可单测的 `train.py` helper surface 合计 `99%`。
 - SFT 数据处理覆盖率：`src.sft_binidx`、`data.make_sft_binidx`、`data.tokenizer.rwkv_tokenizer` 合计 `99%`。
 - 服务器 8xH800：
   - `RWKV_RUN_CUDA_SFT_SMOKE=1` -> `3 passed, 2 skipped`。
@@ -377,6 +379,7 @@ DATA_FILE=/mnt/data/datasets/sft_train_ctx8192 \
 NUM_NODES=1 \
 DEVICES=8 \
 MICRO_BSZ=1 \
+ACCUMULATE_GRAD_BATCHES=1 \
 N_PASS=1 \
 python - <<'PY'
 import math, os
@@ -384,14 +387,18 @@ from src.binidx import MMapIndexedDataset
 
 docs = len(MMapIndexedDataset(os.environ["DATA_FILE"]))
 real_bsz = int(os.environ["NUM_NODES"]) * int(os.environ["DEVICES"]) * int(os.environ["MICRO_BSZ"])
-epoch_steps = math.ceil(docs / real_bsz)
+accumulate = int(os.environ["ACCUMULATE_GRAD_BATCHES"])
+effective_bsz = real_bsz * accumulate
+epoch_steps = math.ceil(docs / effective_bsz)
 
 print(f"documents={docs}")
 print(f"real_bsz={real_bsz}")
+print(f"accumulate_grad_batches={accumulate}")
+print(f"effective_bsz={effective_bsz}")
 print(f"EPOCH_STEPS={epoch_steps}")
 print(f"EPOCH_COUNT={int(os.environ['N_PASS'])}")
-print(f"samples_per_epoch={epoch_steps * real_bsz}")
-print(f"extra_repeated_per_epoch={epoch_steps * real_bsz - docs}")
+print(f"samples_per_epoch={epoch_steps * effective_bsz}")
+print(f"extra_repeated_per_epoch={epoch_steps * effective_bsz - docs}")
 PY
 ```
 
@@ -405,6 +412,7 @@ CTX_LEN=8192 \
 N_NODE=1 \
 GPU_PER_NODE=8 \
 MICRO_BSZ=1 \
+ACCUMULATE_GRAD_BATCHES=4 \
 EPOCH_STEPS=12500 \
 EPOCH_COUNT=1 \
 STRATEGY=deepspeed_stage_3_offload \
@@ -424,11 +432,11 @@ bash run_13b_sft_zero3_offload.sh
 - `LOAD_MODEL`：初始 13.3B checkpoint；也可以指向保存出的 `rwkv-step-N.pth` / `rwkv-N.pth` 做断点续训。DeepSpeed checkpoint 目录需要配合 DeepSpeed strategy 恢复。
 - `DATA_FILE`：SFT binidx 前缀，不带 `.bin` 或 `.idx`。脚本会检查 `DATA_FILE.bin`、`DATA_FILE.idx`、`DATA_FILE.mask.bin`、`DATA_FILE.mask.idx`。
 - `CTX_LEN`：训练上下文长度，需要和预处理 `--ctx-len` 一致；预处理产物里的 document 应该是 `CTX_LEN + 1` 个 token。
-- `N_NODE`、`GPU_PER_NODE`、`MICRO_BSZ`：决定当前真实 batch size：`real_bsz = N_NODE * GPU_PER_NODE * MICRO_BSZ`。
-- `EPOCH_STEPS`：每个 SFT epoch 的 optimizer step 数。完整跑一遍建议用 `ceil(num_sft_documents / real_bsz)`。
+- `N_NODE`、`GPU_PER_NODE`、`MICRO_BSZ`：决定每次 forward 的真实全局 batch size：`real_bsz = N_NODE * GPU_PER_NODE * MICRO_BSZ`。
+- `ACCUMULATE_GRAD_BATCHES`：梯度累计步数。SFT 常用它在 `MICRO_BSZ=1` 的情况下提高有效 batch；有效 batch 为 `effective_bsz = real_bsz * ACCUMULATE_GRAD_BATCHES`。
+- `EPOCH_STEPS`：每个 SFT epoch 的 optimizer step 数。完整跑一遍建议用 `ceil(num_sft_documents / effective_bsz)`。
 - `EPOCH_COUNT`：跑几遍 SFT 数据。想跑 `N` 遍时，`EPOCH_STEPS` 按一遍数据计算，`EPOCH_COUNT=N`。
 - `GRAD_CP`：激活检查点。`1` 表示对 block 开启 checkpointing，省显存但更慢；显存足够时可设 `0`。
-- 梯度累计：当前脚本和代码路径还没有接入 gradient accumulation，所以计算 `real_bsz` 时不要再乘累计步数。
 - `STRATEGY`：默认 `deepspeed_stage_3_offload`，更省显存；显存足够时可以用 `deepspeed_stage_3` 做纯 ZeRO-3。
 - `LR_INIT`、`LR_FINAL`、`WARMUP_STEPS`、`WEIGHT_DECAY`：SFT 学习率计划和正则参数。
 - `EPOCH_SAVE`、`SAVE_EVERY_N_STEPS`、`KEEP_LAST_N_CHECKPOINTS`：checkpoint 保存频率和保留数量。

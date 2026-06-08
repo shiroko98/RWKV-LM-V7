@@ -43,8 +43,8 @@ PROJ_DIR="${PROJ_DIR:-/mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zer
 # SFT schedule.
 #
 # EPOCH_STEPS is optimizer steps per SFT epoch. If each packed document is one sample, a common starting point is:
-#   ceil(num_documents / (NUM_NODES * GPU_PER_NODE * MICRO_BSZ))
-# If EPOCH_STEPS * real_bsz is larger than the document count, the SFT dataset wraps around deterministically.
+#   ceil(num_documents / (NUM_NODES * GPU_PER_NODE * MICRO_BSZ * ACCUMULATE_GRAD_BATCHES))
+# If EPOCH_STEPS * effective_bsz is larger than the document count, the SFT dataset wraps around deterministically.
 #
 #######################################################################################################################
 
@@ -55,6 +55,7 @@ SAVE_EVERY_N_STEPS="${SAVE_EVERY_N_STEPS:-0}"
 KEEP_LAST_N_CHECKPOINTS="${KEEP_LAST_N_CHECKPOINTS:-3}"
 
 MICRO_BSZ="${MICRO_BSZ:-1}"
+ACCUMULATE_GRAD_BATCHES="${ACCUMULATE_GRAD_BATCHES:-1}"
 LR_INIT="${LR_INIT:-1e-5}"
 LR_FINAL="${LR_FINAL:-1e-6}"
 WARMUP_STEPS="${WARMUP_STEPS:-10}"
@@ -101,8 +102,8 @@ fi
 
 python train.py --load_model "$LOAD_MODEL" --wandb "${WANDB_PROJECT:-}" --proj_dir "$PROJ_DIR" --my_testing "$MODEL_TYPE" \
  --ctx_len "$CTX_LEN" --train_stage 0 --epoch_steps "$EPOCH_STEPS" --epoch_count "$EPOCH_COUNT" --epoch_begin "${EPOCH_BEGIN:-0}" \
- --data_file "$DATA_FILE" --my_exit_tokens 0 --magic_prime 0 \
- --num_nodes "$N_NODE" --micro_bsz "$MICRO_BSZ" --n_layer "$N_LAYER" --n_embd "$N_EMBD" --dim_ffn "$DIM_FFN" --kernel "$KERNEL" \
+ --data_file "$DATA_FILE" --magic_prime 0 \
+ --num_nodes "$N_NODE" --micro_bsz "$MICRO_BSZ" --accumulate_grad_batches "$ACCUMULATE_GRAD_BATCHES" --n_layer "$N_LAYER" --n_embd "$N_EMBD" --dim_ffn "$DIM_FFN" --kernel "$KERNEL" \
  --lr_init "$LR_INIT" --lr_final "$LR_FINAL" --warmup_steps "$WARMUP_STEPS" --beta1 0.9 --beta2 0.99 --adam_eps 1e-18 \
  --data_type "sft_binidx" --vocab_size "$VOCAB_SIZE" \
  --weight_decay "$WEIGHT_DECAY" --epoch_save "$EPOCH_SAVE" --save_every_n_steps "$SAVE_EVERY_N_STEPS" --keep_last_n_checkpoints "$KEEP_LAST_N_CHECKPOINTS" \

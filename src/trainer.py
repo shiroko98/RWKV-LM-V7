@@ -123,8 +123,9 @@ class train_callback(pl.Callback):
         lr = args.lr_init
 
         if args.my_exit_tokens != 0: # cosine decay
-            real_tokens = real_step * args.ctx_len * args.real_bsz
-            warmup_tokens = w_step * args.ctx_len * args.real_bsz
+            step_bsz = getattr(args, "effective_bsz", args.real_bsz)
+            real_tokens = real_step * args.ctx_len * step_bsz
+            warmup_tokens = w_step * args.ctx_len * step_bsz
             progress = (real_tokens - warmup_tokens) / (abs(args.my_exit_tokens) - warmup_tokens)
             progress = max(0, min(1, progress))
             lr_final_factor = args.lr_final / args.lr_init                
@@ -158,7 +159,8 @@ class train_callback(pl.Callback):
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         args = self.args
-        token_per_step = args.ctx_len * args.real_bsz
+        token_per_micro_batch = args.ctx_len * args.real_bsz
+        token_per_optimizer_step = args.ctx_len * getattr(args, "effective_bsz", args.real_bsz)
         real_step = trainer.global_step + args.epoch_begin * args.epoch_steps
 
         if trainer.is_global_zero:  # logging
@@ -166,7 +168,7 @@ class train_callback(pl.Callback):
             kt_s = 0
             try:
                 t_cost = (t_now - trainer.my_time_ns) / 1e9
-                kt_s = token_per_step / t_cost / 1000
+                kt_s = token_per_micro_batch / t_cost / 1000
                 self.log("REAL it/s", 1.0 / t_cost, prog_bar=True, on_step=True)
                 self.log("Kt/s", kt_s, prog_bar=True, on_step=True)
             except:
@@ -180,7 +182,7 @@ class train_callback(pl.Callback):
             self.log("loss", trainer.my_epoch_loss, prog_bar=True, on_step=True)
 
             if len(args.wandb) > 0:
-                lll = {"loss": trainer.my_loss, "lr": trainer.my_lr, "wd": trainer.my_wd, "Gtokens": real_step * token_per_step / 1e9}
+                lll = {"loss": trainer.my_loss, "lr": trainer.my_lr, "wd": trainer.my_wd, "Gtokens": real_step * token_per_optimizer_step / 1e9}
                 if kt_s > 0:
                     lll["kt/s"] = kt_s
                 trainer.my_wandb.log(lll, step=int(real_step))

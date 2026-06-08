@@ -81,6 +81,36 @@ def configure_training_limits(args):
         args.max_epochs = -1
 
 
+def normalize_accumulate_grad_batches(args):
+    value = getattr(args, "accumulate_grad_batches", 1)
+    if value is None:
+        value = 1
+    try:
+        value = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("accumulate_grad_batches must be a positive integer.") from exc
+    if value <= 0:
+        raise ValueError("accumulate_grad_batches must be a positive integer.")
+    args.accumulate_grad_batches = value
+    return value
+
+
+def configure_batch_sizes(args):
+    accumulation = normalize_accumulate_grad_batches(args)
+    if args.data_type == "sft_binidx":
+        args.effective_bsz = args.real_bsz * accumulation
+    else:
+        args.effective_bsz = args.real_bsz
+
+
+def configure_samples_per_epoch(args):
+    accumulation = normalize_accumulate_grad_batches(args)
+    if args.data_type == "sft_binidx":
+        args.samples_per_epoch = args.epoch_steps * args.real_bsz * accumulation
+    else:
+        args.samples_per_epoch = args.epoch_steps * args.real_bsz
+
+
 if __name__ == "__main__":  # pragma: no cover
     import os
     import subprocess
@@ -211,6 +241,7 @@ if __name__ == "__main__":  # pragma: no cover
     args.max_epochs = -1  # pretrain continues forever unless my_exit_tokens stops it
     args.betas = (args.beta1, args.beta2)
     args.real_bsz = int(args.num_nodes) * int(args.devices) * args.micro_bsz
+    configure_batch_sizes(args)
     os.environ["DEEPSPEED_TIMEOUT"] = str(args.dist_timeout_sec)
     os.environ["RWKV_MY_TESTING"] = args.my_testing
     os.environ["RWKV_KERNEL"] = args.kernel
@@ -228,6 +259,7 @@ if __name__ == "__main__":  # pragma: no cover
 
     configure_epoch_schedule(args)
     configure_training_limits(args)
+    configure_samples_per_epoch(args)
 
     if args.train_stage >= 2:  # find latest saved model
         list_p = []
@@ -273,7 +305,7 @@ if __name__ == "__main__":  # pragma: no cover
             f"epoch={args.resume_epoch} step_offset={args.resume_step_offset}/{args.epoch_steps} ##########"
         )
 
-    samples_per_epoch = args.epoch_steps * args.real_bsz
+    samples_per_epoch = args.samples_per_epoch
     tokens_per_epoch = samples_per_epoch * args.ctx_len
     try:
         deepspeed_version = deepspeed.__version__
@@ -284,7 +316,7 @@ if __name__ == "__main__":  # pragma: no cover
         f"""
 ############################################################################
 #
-# RWKV-7 {args.precision.upper()} on {args.num_nodes}x{args.devices} {args.accelerator.upper()}, bsz {args.num_nodes}x{args.devices}x{args.micro_bsz}={args.real_bsz}, {args.strategy} {'with grad_cp' if args.grad_cp > 0 else ''}
+# RWKV-7 {args.precision.upper()} on {args.num_nodes}x{args.devices} {args.accelerator.upper()}, bsz {args.num_nodes}x{args.devices}x{args.micro_bsz}={args.real_bsz}, accumulate_grad_batches {args.accumulate_grad_batches}, effective_bsz {args.effective_bsz}, {args.strategy} {'with grad_cp' if args.grad_cp > 0 else ''}
 #
 # Data = {args.data_file} ({args.data_type}), ProjDir = {args.proj_dir}
 #

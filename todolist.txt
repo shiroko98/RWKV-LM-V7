@@ -9,6 +9,7 @@ Completed
 - Added regression coverage for grouped multi-JSONL best-fit packing and CLI parsing.
 - Clarified README / README_CN concurrency semantics: groups are serial, reads within one group are bounded by `min(group_size, num_workers, files_in_group)`, and output writes remain single-threaded appends.
 - Expanded the 13.3B SFT README / README_CN example around `run_13b_sft_zero3_offload.sh`, including data preparation, `EPOCH_STEPS` calculation, activation checkpointing, the absence of gradient accumulation, and key environment variables.
+- Removed `--my_exit_tokens 0` from the generic SFT training example and clarified `--accelerator gpu` / `--devices N` single-node multi-GPU DeepSpeed behavior.
 
 Current status
 - Branch `new_sft` created from `ops-train`.

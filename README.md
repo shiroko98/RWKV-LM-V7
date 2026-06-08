@@ -494,7 +494,6 @@ python train.py \
   --epoch_steps 1000 \
   --epoch_count 1 \
   --micro_bsz 1 \
-  --my_exit_tokens 0 \
   --vocab_size 65536 \
   --n_layer 24 \
   --n_embd 1024 \
@@ -515,6 +514,8 @@ python train.py \
   --strategy deepspeed_stage_2 \
   --grad_cp 1
 ```
+
+In this generic example, `--accelerator gpu` tells Lightning to train on CUDA GPUs, and `--devices 1` means one GPU in the current node. For multi-GPU DeepSpeed on one node, set `--devices` to the GPU count, for example `--devices 8`; `train.py` will automatically relaunch itself with `torchrun` when `strategy` contains `deepspeed`, `num_nodes=1`, and `devices > 1`. The global batch used by SFT scheduling is `real_bsz = num_nodes * devices * micro_bsz`. `--my_exit_tokens` is intentionally omitted for SFT because SFT stops by `--epoch_count`; `my_exit_tokens` is part of the pretraining token-limit schedule.
 
 Training samples use next-token labels, so the dataloader needs `ctx_len + 1` token ids per SFT document. A shorter document is padded in memory with `--sft_pad_token_id` and mask `0`; a longer document raises an error. For predictable fixed-length training, build data with `--ctx-len CTX_LEN --pack` or `--ctx-len CTX_LEN --pad`; preprocessing writes `CTX_LEN + 1` token documents, then train with `--ctx_len CTX_LEN`. For RWKV7 x070, keep `ctx_len` divisible by 16.
 

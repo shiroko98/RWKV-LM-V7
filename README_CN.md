@@ -297,7 +297,6 @@ python train.py \
   --epoch_steps 1000 \
   --epoch_count 1 \
   --micro_bsz 1 \
-  --my_exit_tokens 0 \
   --vocab_size 65536 \
   --n_layer 24 \
   --n_embd 1024 \
@@ -318,6 +317,8 @@ python train.py \
   --strategy deepspeed_stage_2 \
   --grad_cp 1
 ```
+
+这个通用示例里，`--accelerator gpu` 表示用 CUDA GPU 训练，`--devices 1` 表示当前节点使用 1 张 GPU。如果要在单节点做多卡 DeepSpeed，把 `--devices` 改成 GPU 数量，比如 `--devices 8`；当 `strategy` 包含 `deepspeed`、`num_nodes=1` 且 `devices > 1` 时，`train.py` 会自动用 `torchrun` 重启多卡进程。SFT 调度使用的全局 batch 是 `real_bsz = num_nodes * devices * micro_bsz`。这里故意不写 `--my_exit_tokens`，因为 SFT 由 `--epoch_count` 控制停止；`my_exit_tokens` 是预训练 token-limit 调度的一部分。
 
 训练端使用 next-token label，所以每个 SFT document 需要提供 `ctx_len + 1` 个 token。document 比这个短时，dataloader 会在内存里用 `--sft_pad_token_id` padding，并把 padding mask 设为 `0`；document 更长时会直接报错。为了让训练长度稳定，建议预处理时使用 `--ctx-len CTX_LEN --pack` 或 `--ctx-len CTX_LEN --pad`，预处理会自动写出 `CTX_LEN + 1` 个 token，训练时再设置 `--ctx_len CTX_LEN`。RWKV7 x070 的 `ctx_len` 需要能被 16 整除。
 

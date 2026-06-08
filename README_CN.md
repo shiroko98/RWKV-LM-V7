@@ -222,7 +222,7 @@ python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
 
 使用 `--out-prefix` 或别名 `--output-prefix` 可以指定输出 binidx 的命名前缀。例如 `--out-prefix data/sft_train` 会写出 `data/sft_train.bin`、`data/sft_train.idx`、`data/sft_train.mask.bin`、`data/sft_train.mask.idx`。传入多个位置参数时必须显式指定输出前缀，因为脚本无法从多个源路径自动推导唯一名字；单个文件默认使用去掉 `.jsonl` 后缀的文件名，单个文件夹默认使用文件夹路径作为前缀。
 
-`--num-workers` 会用在两个阶段。默认路径的读取阶段以“一个 JSONL 文件”为一个任务，所以多个 JSONL 可以并发读取；单个大 JSONL 在读取阶段不会被多个 worker 拆分读取。`--pack-strategy best-fit-decreasing` 为了控制内存，会按 JSONL shard 顺序逐个读取和 packing，不并发加载多个 shard，但 shard 内的模板渲染和 tokenization 仍会按样本并发执行。输出仍按确定的样本顺序或 shard 顺序写入，所以相同输入、`--seed`、`--shuffle` 设置会得到可复现结果。当前所有文本文件按 UTF-8 读取，JSONL 额外兼容 UTF-8 BOM，中文内容会按 UTF-8 字节映射到 token span，不会在 mask 推导中丢失。
+`--num-workers` 会用在两个阶段。默认路径的读取阶段以“一个 JSONL 文件”为一个任务，所以多个 JSONL 可以并发读取；单个大 JSONL 在读取阶段不会被多个 worker 拆分读取。`--pack-strategy best-fit-decreasing` 会按有界 JSONL shard group 读取和 packing。`--pack-shard-group-size` 默认是 `1`，保持之前一次只处理一个 shard 的内存占用；调大后，每个 group 可以并发读取多个 JSONL，并在 group 内跨文件做 best-fit packing。每个 group 内的模板渲染和 tokenization 仍会按样本并发执行。输出仍按确定的样本顺序或 shard group 顺序写入，所以相同输入、`--seed`、`--shuffle` 设置和 group size 会得到可复现结果。当前所有文本文件按 UTF-8 读取，JSONL 额外兼容 UTF-8 BOM，中文内容会按 UTF-8 字节映射到 token span，不会在 mask 推导中丢失。
 
 整体流程可以抽象为：
 
@@ -234,7 +234,7 @@ python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
 6. 最后一轮 assistant 会被规范化为始终包含 think 标签。如果原始内容已有 think 结束标签，就保留原始 think；如果没有，就在最终回复前补一个空 think 块。历史 assistant、系统、用户、工具返回都只作为上下文。
 7. loss mask 从“最后一轮 assistant 的可训练后缀”推导：assistant 内容边界之前全部为 `0`。样本里真实存在的 think 内容参与训练；无 thinking 样本自动补出的空 think 块只作为格式上下文，仍然是 `0`；可见回复、最终工具调用、assistant 结束段和真实样本结束段为 `1`。
 8. 文本只 tokenize 一次。代码用 UTF-8 字节跨度记录每个 token 对应的字符区间，再把字符级可训练区间投影为 token 级 mask。这样中文、多字节符号和特殊片段都走同一套规则。
-9. 如果不传 `--pack`、`--pad`、`--pack-length` 或 `--pad-length`，每条重复后的源样本会写成一个变长 binidx document，并同步写入一个同长度的 mask document，不会自动 padding。每个独立 document 末尾仍然会有真实的 `EOD_TOKEN`，并且这个 EOD 参与训练。`--ctx-len`、`--pack-length` 和 `--pad-length` 都是 token 数，不是字符数。推荐用 `--ctx-len N --pack` 或 `--ctx-len N --pad`，实际写出长度会自动使用 `N + 1`，用于匹配训练端 next-token label。使用 `--pack` / `--pack-length` 时，样本默认按输入顺序做不可拆分 packing：多个完整样本可以合并到同一个固定长度 document，样本之间的分隔换行 mask 为 `0`；如果当前 document 放不下下一条完整样本，就先把当前 document 右侧 padding 后写出，再新开 document。`--pack-strategy best-fit-decreasing` 会先按样本 token 长度从大到小排序，再用 best-fit 近似装箱，仍然不拆样本，但会重排样本以减少 padding；这个策略按单个 JSONL shard 独立处理，避免多文件或目录输入时把所有 tokenized 样本一次性放进内存，所有 shard 处理完后仍写成同一组 `PREFIX` binidx + mask 输出。使用 `--pad` / `--pad-length` 时不做 packing：每条源样本独立 padding 到固定长度。过长样本会在 tokenize 后、packing/padding 前按目标 token 长度过滤丢弃，不会终止整个构建。
+9. 如果不传 `--pack`、`--pad`、`--pack-length` 或 `--pad-length`，每条重复后的源样本会写成一个变长 binidx document，并同步写入一个同长度的 mask document，不会自动 padding。每个独立 document 末尾仍然会有真实的 `EOD_TOKEN`，并且这个 EOD 参与训练。`--ctx-len`、`--pack-length` 和 `--pad-length` 都是 token 数，不是字符数。推荐用 `--ctx-len N --pack` 或 `--ctx-len N --pad`，实际写出长度会自动使用 `N + 1`，用于匹配训练端 next-token label。使用 `--pack` / `--pack-length` 时，样本默认按输入顺序做不可拆分 packing：多个完整样本可以合并到同一个固定长度 document，样本之间的分隔换行 mask 为 `0`；如果当前 document 放不下下一条完整样本，就先把当前 document 右侧 padding 后写出，再新开 document。`--pack-strategy best-fit-decreasing` 会先按样本 token 长度从大到小排序，再用 best-fit 近似装箱，仍然不拆样本，但会重排样本以减少 padding；这个策略按 JSONL shard group 独立处理。`--pack-shard-group-size 1` 表示每组一个 JSONL；更大的值允许在有界批次内跨文件 best-fit，提高 packing 利用率，同时避免把全量 tokenized 样本一次性放进内存。所有 group 处理完后仍写成同一组 `PREFIX` binidx + mask 输出。使用 `--pad` / `--pad-length` 时不做 packing：每条源样本独立 padding 到固定长度。过长样本会在 tokenize 后、packing/padding 前按目标 token 长度过滤丢弃，不会终止整个构建。
 10. 输出包含主 token 数据集和 mask sidecar：`PREFIX.bin`、`PREFIX.idx`、`PREFIX.mask.bin`、`PREFIX.mask.idx`。SFT 训练时主数据集提供 token，mask sidecar 提供哪些 token 参与 loss。
 
 参数含义：
@@ -248,7 +248,8 @@ python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
 - `--num-workers`：并发读取、渲染和 tokenize 的 worker 数，默认 `1`。
 - `--ctx-len`：训练上下文 token 数；配合 `--pack` 或 `--pad` 时，预处理长度自动使用 `ctx_len + 1`。
 - `--pack`：启用顺序样本不拆分 packing，长度为 `ctx_len + 1`；不设置时默认关闭。
-- `--pack-strategy`：packing 策略，默认 `ordered` 保持样本顺序；`best-fit-decreasing` 会在每个 JSONL shard 内按长度重排做近似最优打包，减少 padding，并把所有 shard 追加到同一组输出文件。
+- `--pack-strategy`：packing 策略，默认 `ordered` 保持样本顺序；`best-fit-decreasing` 会在每个 JSONL shard group 内按长度重排做近似最优打包，减少 padding，并把所有 group 追加到同一组输出文件。
+- `--pack-shard-group-size`：每个 best-fit group 包含多少个 JSONL shard，默认 `1`；调大后可在有界 group 内并发读取多个 JSONL，并跨文件 packing。
 - `--pad`：启用逐样本 padding，长度为 `ctx_len + 1`；不设置时默认关闭，不能和 `--pack` 同时使用。
 - `--pack-length`：兼容旧用法，显式指定固定长度 packing 目标 token 数。
 - `--pad-length`：兼容旧用法，显式指定逐样本 padding 目标 token 数；不能和 `--pack-length` 同时使用。

@@ -921,6 +921,75 @@ def test_build_binidx_dataset_best_fit_decreasing_packs_each_jsonl_shard_then_me
     ]
 
 
+def test_build_binidx_dataset_best_fit_decreasing_can_group_jsonl_shards(
+    tmp_path,
+    monkeypatch,
+):
+    class FakeTokenizer:
+        def encode(self, text):
+            if text == EOD_TOKEN:
+                return [0]
+            if text == "\n":
+                return [99]
+            raise AssertionError(f"unexpected encode call: {text!r}")
+
+    fake_documents = {
+        "large-a": EncodedDocument(input_ids=[1] * 5, loss_mask=[1] * 5),
+        "large-b": EncodedDocument(input_ids=[2] * 5, loss_mask=[1] * 5),
+        "small-a": EncodedDocument(input_ids=[3] * 3, loss_mask=[1] * 3),
+        "small-b": EncodedDocument(input_ids=[4] * 3, loss_mask=[1] * 3),
+    }
+
+    def fake_build_documents_from_sources(sources, **_kwargs):
+        for source in sources:
+            yield fake_documents[source.text]
+
+    monkeypatch.setattr(sft_binidx, "TRIE_TOKENIZER", lambda *_args, **_kwargs: FakeTokenizer())
+    monkeypatch.setattr(sft_binidx, "load_chat_template", lambda _path: object())
+    monkeypatch.setattr(sft_binidx, "build_documents_from_sources", fake_build_documents_from_sources)
+
+    first_path = tmp_path / "first.jsonl"
+    second_path = tmp_path / "second.jsonl"
+    first_path.write_text("large-a\nlarge-b\n", encoding="utf-8")
+    second_path.write_text("small-a\nsmall-b\n", encoding="utf-8")
+    output_prefix = str(tmp_path / "grouped")
+
+    stats = build_binidx_dataset(
+        [str(first_path), str(second_path)],
+        output_prefix=output_prefix,
+        vocab_path="fake-vocab.txt",
+        template_path="fake-template.jinja",
+        n_epoch=1,
+        seed=123,
+        pack_length=9,
+        shuffle=False,
+        pack_strategy="best-fit-decreasing",
+        pack_shard_group_size=2,
+        num_workers=2,
+    )
+
+    token_ds = MMapIndexedDataset(output_prefix)
+    mask_ds = MMapIndexedDataset(output_prefix + ".mask")
+    token_documents = [token_ds[index].astype(int).tolist() for index in range(len(token_ds))]
+    mask_documents = [mask_ds[index].astype(int).tolist() for index in range(len(mask_ds))]
+
+    assert stats["source_files"] == 2
+    assert stats["source_lines"] == 4
+    assert stats["source_documents"] == 4
+    assert stats["filtered_documents"] == 0
+    assert stats["documents"] == 2
+    assert stats["pack_strategy"] == "best-fit-decreasing"
+    assert stats["pack_shard_group_size"] == 2
+    assert token_documents == [
+        [1, 1, 1, 1, 1, 99, 3, 3, 3],
+        [2, 2, 2, 2, 2, 99, 4, 4, 4],
+    ]
+    assert mask_documents == [
+        [1, 1, 1, 1, 1, 0, 1, 1, 1],
+        [1, 1, 1, 1, 1, 0, 1, 1, 1],
+    ]
+
+
 def test_collect_filtered_documents_drops_too_long_samples_after_tokenization():
     documents = [
         EncodedDocument(input_ids=[1, 2], loss_mask=[1, 1]),
@@ -1650,6 +1719,8 @@ def test_arg_parser_defaults_and_overrides():
             "--pack",
             "--pack-strategy",
             "best-fit-decreasing",
+            "--pack-shard-group-size",
+            "4",
             "--pack-length",
             "64",
             "--add-generation-prompt",
@@ -1671,6 +1742,7 @@ def test_arg_parser_defaults_and_overrides():
     assert overridden.pack is True
     assert overridden.pad is False
     assert overridden.pack_strategy == "best-fit-decreasing"
+    assert overridden.pack_shard_group_size == 4
     assert overridden.pack_length == 64
     assert overridden.pad_length is None
     assert overridden.add_generation_prompt is True

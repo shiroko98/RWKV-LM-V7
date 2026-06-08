@@ -1,5 +1,13 @@
 2026-06-03 new_sft branch bootstrap
 
+2026-06-08 SFT best-fit packing shard groups
+
+Completed
+- Added `--pack-shard-group-size` for `best-fit-decreasing` packing.
+- Default remains `1`, preserving the previous one-JSONL-at-a-time memory profile.
+- Larger values group multiple JSONL shards, read them concurrently with `--num-workers`, best-fit pack across the group, and append all groups into one token binidx plus mask sidecar.
+- Added regression coverage for grouped multi-JSONL best-fit packing and CLI parsing.
+
 Current status
 - Branch `new_sft` created from `ops-train`.
 - Mainline training path currently only supports pretrain with `binidx` data and full-token loss.

@@ -23,6 +23,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pack", action="store_true", default=False)
     parser.add_argument("--pad", action="store_true", default=False)
     parser.add_argument("--pack-strategy", choices=["ordered", "best-fit-decreasing"], default="ordered")
+    parser.add_argument("--pack-shard-group-size", type=int, default=1)
     parser.add_argument("--pack-length", type=int, default=None)
     parser.add_argument("--pad-length", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=1)
@@ -50,6 +51,8 @@ def main(argv=None):
         parser.error("--pad cannot be used with --pad-length.")
     if args.ctx_len is not None and args.ctx_len <= 0:
         parser.error("--ctx-len must be a positive integer.")
+    if args.pack_shard_group_size <= 0:
+        parser.error("--pack-shard-group-size must be a positive integer.")
     if args.pack_length is not None and args.pack_length <= 0:
         parser.error("--pack-length must be a positive integer.")
     if args.pad_length is not None and args.pad_length <= 0:
@@ -78,6 +81,7 @@ def main(argv=None):
         num_workers=args.num_workers,
         shuffle=args.shuffle,
         pack_strategy=args.pack_strategy,
+        pack_shard_group_size=args.pack_shard_group_size,
         current_date=args.current_date,
         current_location=args.current_location,
     )

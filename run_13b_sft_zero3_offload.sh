@@ -11,6 +11,7 @@ set -euo pipefail
 #     --ctx-len 8192 \
 #     --pack \
 #     --pack-strategy best-fit-decreasing \
+#     --pack-shard-group-size 8 \
 #     --num-workers 32 \
 #     --shuffle
 #

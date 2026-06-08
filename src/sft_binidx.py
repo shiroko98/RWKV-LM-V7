@@ -963,9 +963,13 @@ def write_best_fit_decreasing_sharded_documents(
     current_location: str | None = None,
     num_workers: int = 1,
     shuffle: bool = True,
+    pack_shard_group_size: int = 1,
     token_dtype=np.uint16,
     mask_dtype=np.uint8,
 ):
+    if pack_shard_group_size <= 0:
+        raise ValueError("pack_shard_group_size must be a positive integer.")
+
     token_builder = MMapIndexedDatasetBuilder(data_file_path(output_prefix), dtype=token_dtype)
     mask_prefix = mask_prefix_path(output_prefix)
     mask_builder = MMapIndexedDatasetBuilder(data_file_path(mask_prefix), dtype=mask_dtype)
@@ -982,8 +986,9 @@ def write_best_fit_decreasing_sharded_documents(
         "filtered_documents": 0,
     }
 
-    for input_path in input_paths:
-        sources = load_non_empty_source_lines(input_path)
+    for start in range(0, len(input_paths), pack_shard_group_size):
+        input_group = input_paths[start:start + pack_shard_group_size]
+        sources = load_jsonl_sources(input_group, num_workers=num_workers)
         shuffled_sources = shuffled_epoch_sources(sources, n_epoch, rng, shuffle=shuffle)
         documents = build_documents_from_sources(
             shuffled_sources,
@@ -1052,9 +1057,12 @@ def build_binidx_dataset(
     num_workers: int = 1,
     shuffle: bool = True,
     pack_strategy: str = "ordered",
+    pack_shard_group_size: int = 1,
 ):
     if num_workers <= 0:
         raise ValueError("num_workers must be a positive integer.")
+    if pack_shard_group_size <= 0:
+        raise ValueError("pack_shard_group_size must be a positive integer.")
     if pack_length is not None and pad_length is not None:
         raise ValueError("pack_length and pad_length are mutually exclusive.")
     if pack_strategy not in {"ordered", "best-fit-decreasing"}:
@@ -1078,6 +1086,7 @@ def build_binidx_dataset(
             current_location=current_location,
             num_workers=num_workers,
             shuffle=shuffle,
+            pack_shard_group_size=pack_shard_group_size,
         )
     else:
         sources = load_jsonl_sources(input_paths, num_workers=num_workers)
@@ -1124,4 +1133,5 @@ def build_binidx_dataset(
     stats["num_workers"] = num_workers
     stats["shuffle"] = shuffle
     stats["pack_strategy"] = pack_strategy
+    stats["pack_shard_group_size"] = pack_shard_group_size
     return stats

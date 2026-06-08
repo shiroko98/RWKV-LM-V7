@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -78,8 +79,26 @@ def _build_tiny_sft_binidx(tmp_path: Path, pad_length: int) -> Path:
     return prefix
 
 
-def _base_sft_args(prefix: Path, dims: dict[str, int], ctx_len: int) -> SimpleNamespace:
-    return SimpleNamespace(
+def _build_accum_equiv_sft_binidx(tmp_path: Path, pad_length: int, docs: int, vocab_size: int) -> Path:
+    from src.sft_binidx import EncodedDocument, write_documents
+
+    prefix = tmp_path / "accum_equiv_sft"
+    max_token_id = max(32, vocab_size - 16)
+    encoded_docs = []
+    for doc_id in range(docs):
+        input_ids = [10 + ((doc_id * 997 + pos * 17) % (max_token_id - 10)) for pos in range(pad_length)]
+        encoded_docs.append(
+            EncodedDocument(
+                input_ids=input_ids,
+                loss_mask=[0] + [1] * (pad_length - 1),
+            )
+        )
+    write_documents(str(prefix), encoded_docs)
+    return prefix
+
+
+def _base_sft_args(prefix: Path, dims: dict[str, int], ctx_len: int, **overrides) -> SimpleNamespace:
+    args = SimpleNamespace(
         vocab_size=dims["vocab_size"],
         data_file=str(prefix),
         data_type="sft_binidx",
@@ -97,6 +116,9 @@ def _base_sft_args(prefix: Path, dims: dict[str, int], ctx_len: int) -> SimpleNa
         micro_bsz=1,
         accumulate_grad_batches=1,
     )
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
 
 
 def _train_py_command(
@@ -292,6 +314,97 @@ def test_cuda_sft_checkpoint_forward_backward(tmp_path, monkeypatch):
     assert torch.isfinite(loss.detach()).item()
     loss.backward()
     assert any(param.grad is not None for param in model.parameters())
+
+
+@pytest.mark.cuda
+@pytest.mark.slow
+def test_cuda_sft_gradient_accumulation_loss_matches_large_batch(tmp_path, monkeypatch):
+    model_path = _require_cuda_smoke("RWKV_RUN_CUDA_SFT_ACCUM_EQUIV_SMOKE")
+    pad_length = int(os.environ.get("RWKV_SFT_ACCUM_EQUIV_PAD_LENGTH", os.environ.get("RWKV_SFT_SMOKE_PAD_LENGTH", "257")))
+    ctx_len = pad_length - 1
+    accum_steps = int(os.environ.get("RWKV_SFT_ACCUM_EQUIV_STEPS", "2"))
+    assert accum_steps >= 2
+    assert ctx_len > 0 and ctx_len % 16 == 0, "ctx_len must be positive and divisible by the RWKV7 chunk length 16"
+
+    state = _load_state_dict(model_path)
+    dims = _infer_rwkv7_dims(state)
+    prefix = _build_accum_equiv_sft_binidx(tmp_path, pad_length, accum_steps, dims["vocab_size"])
+
+    monkeypatch.setenv("RWKV_MY_TESTING", os.environ.get("RWKV_SFT_SMOKE_MY_TESTING", "x070"))
+    monkeypatch.setenv("RWKV_KERNEL", os.environ.get("RWKV_SFT_SMOKE_KERNEL", ""))
+    monkeypatch.setenv("RWKV_JIT_ON", "1")
+    monkeypatch.setenv("RWKV_CTXLEN", str(ctx_len))
+    monkeypatch.setenv("RWKV_HEAD_SIZE", str(dims["head_size"]))
+    monkeypatch.setenv("RWKV_HEAD_L2WRAP_CE_CHUNK", "0")
+    monkeypatch.setenv("RWKV_FLOAT_MODE", "bf16")
+
+    from src.dataset import MyDataset
+    from src.model import RWKV
+
+    model_args = SimpleNamespace(
+        **dims,
+        dim_att=dims["n_embd"],
+        my_testing=os.environ["RWKV_MY_TESTING"],
+        grad_cp=0,
+        ctx_len=ctx_len,
+    )
+    model = RWKV(model_args).to(device="cuda", dtype=torch.bfloat16)
+    model.load_state_dict(state, strict=True)
+    model.eval()
+
+    dataset = MyDataset(_base_sft_args(prefix, dims, ctx_len, epoch_steps=accum_steps))
+    examples = [dataset[idx] for idx in range(accum_steps)]
+    large_batch = tuple(torch.stack([example[field] for example in examples]).cuda(non_blocking=True) for field in range(3))
+
+    with torch.no_grad():
+        large_batch_loss = model.training_step(large_batch, 0).detach().float()
+        accumulated_loss_sum = torch.zeros((), device="cuda", dtype=torch.float32)
+        weighted_loss_sum = torch.zeros((), device="cuda", dtype=torch.float32)
+        mask_count_sum = torch.zeros((), device="cuda", dtype=torch.float32)
+        mask_counts = []
+        micro_losses = []
+
+        for example in examples:
+            micro_batch = tuple(t.unsqueeze(0).cuda(non_blocking=True) for t in example)
+            micro_loss = model.training_step(micro_batch, 0).detach().float()
+            mask_count = micro_batch[2].sum().detach().float()
+            assert mask_count.item() > 0
+            accumulated_loss_sum += micro_loss
+            weighted_loss_sum += micro_loss * mask_count
+            mask_count_sum += mask_count
+            mask_counts.append(mask_count.item())
+            micro_losses.append(micro_loss.item())
+
+        accumulated_loss = accumulated_loss_sum / accum_steps
+        weighted_accumulated_loss = weighted_loss_sum / mask_count_sum
+
+    loss_value = large_batch_loss.item()
+    accumulated_value = accumulated_loss.item()
+    weighted_value = weighted_accumulated_loss.item()
+    accumulated_diff = abs(loss_value - accumulated_value)
+    weighted_diff = abs(loss_value - weighted_value)
+    atol = float(os.environ.get("RWKV_SFT_ACCUM_EQUIV_ATOL", "1e-2"))
+    rtol = float(os.environ.get("RWKV_SFT_ACCUM_EQUIV_RTOL", "1e-3"))
+    allowed = atol + rtol * abs(loss_value)
+    summary = {
+        "pad_length": pad_length,
+        "ctx_len": ctx_len,
+        "accum_steps": accum_steps,
+        "large_batch_loss": loss_value,
+        "accumulated_micro_loss": accumulated_value,
+        "token_weighted_accumulated_loss": weighted_value,
+        "accumulated_diff": accumulated_diff,
+        "token_weighted_diff": weighted_diff,
+        "allowed_diff": allowed,
+        "mask_counts": mask_counts,
+        "micro_losses": micro_losses,
+    }
+    summary_file = os.environ.get("RWKV_SFT_ACCUM_EQUIV_SUMMARY_FILE", "")
+    if summary_file:
+        Path(summary_file).expanduser().write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    assert accumulated_diff <= allowed, json.dumps(summary, indent=2)
+    assert weighted_diff <= allowed, json.dumps(summary, indent=2)
 
 
 @pytest.mark.cuda

@@ -451,6 +451,11 @@ RWKV_RUN_CUDA_SFT_SMOKE=1 \
 pytest -q tests/test_sft_cuda_smoke.py
 
 RWKV_SFT_SMOKE_MODEL=model/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
+RWKV_RUN_CUDA_SFT_ACCUM_EQUIV_SMOKE=1 \
+RWKV_SFT_ACCUM_EQUIV_SUMMARY_FILE=/tmp/rwkv_sft_accum_equiv.json \
+pytest -q tests/test_sft_cuda_smoke.py::test_cuda_sft_gradient_accumulation_loss_matches_large_batch
+
+RWKV_SFT_SMOKE_MODEL=model/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
 RWKV_RUN_TRAIN_PY_SFT_SMOKE=1 \
 pytest -q tests/test_sft_cuda_smoke.py
 
@@ -465,7 +470,7 @@ RWKV_SFT_SMOKE_STRATEGY=deepspeed_stage_3_offload \
 pytest -q tests/test_sft_cuda_smoke.py::test_train_py_sft_deepspeed_checkpoint_converts_to_pth
 ```
 
-第一条命令在进程内跑 CUDA forward/backward，验证 SFT masked loss。第二条命令启动 `train.py` 跑 1 个 SFT step，额外覆盖 Lightning、DeepSpeed 和 optimizer 链路。第三条命令会先保存 `rwkv-step-1.pth`，再从这个 step checkpoint 恢复，覆盖 SFT 断点续训；使用 DeepSpeed strategy 时，也会覆盖 DeepSpeed 分片 checkpoint 的加载。第四条命令会先产出一个 tiny SFT DeepSpeed checkpoint，然后调用合并脚本把分片 checkpoint 目录转成单文件 `.pth`，再加载并和原 ZeRO checkpoint 重构结果做等价性比较。多卡服务器可以加 `RWKV_SFT_SMOKE_DEVICES=8`，`train.py` 会自动用 torchrun 重启多卡 DeepSpeed；也可以设置 `RWKV_SFT_SMOKE_STRATEGY=deepspeed_stage_3` 或 `deepspeed_stage_3_offload` 来验证不同分片模式。
+第一条命令在进程内跑 CUDA forward/backward，验证 SFT masked loss。第二条命令对比同一批合成 SFT 样本在“大 batch 一次 forward”和“拆成多个 micro-batch 后按梯度累计口径聚合”时的 masked loss 精度，默认对比 `micro_bsz=2, accumulate=1` 与 `micro_bsz=1, accumulate=2` 的 loss，容差为 `RWKV_SFT_ACCUM_EQUIV_ATOL=1e-2`、`RWKV_SFT_ACCUM_EQUIV_RTOL=1e-3`，并可把差值写到 `RWKV_SFT_ACCUM_EQUIV_SUMMARY_FILE`。第三条命令启动 `train.py` 跑 1 个 SFT step，额外覆盖 Lightning、DeepSpeed 和 optimizer 链路。第四条命令会先保存 `rwkv-step-1.pth`，再从这个 step checkpoint 恢复，覆盖 SFT 断点续训；使用 DeepSpeed strategy 时，也会覆盖 DeepSpeed 分片 checkpoint 的加载。第五条命令会先产出一个 tiny SFT DeepSpeed checkpoint，然后调用合并脚本把分片 checkpoint 目录转成单文件 `.pth`，再加载并和原 ZeRO checkpoint 重构结果做等价性比较。多卡服务器可以加 `RWKV_SFT_SMOKE_DEVICES=8`，`train.py` 会自动用 torchrun 重启多卡 DeepSpeed；也可以设置 `RWKV_SFT_SMOKE_STRATEGY=deepspeed_stage_3` 或 `deepspeed_stage_3_offload` 来验证不同分片模式。
 
 如果要直接测试已有 checkpoint 目录的 pth 合并，而不是先训练 tiny checkpoint：
 

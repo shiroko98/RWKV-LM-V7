@@ -342,6 +342,25 @@ Validation
 - `git diff --check` -> passed with line-ending normalization warnings only.
 - `git diff -- data\SFT\sample\chat_template.jinja` -> empty.
 
+2026-06-08 SFT gradient accumulation loss equivalence smoke
+
+Completed
+- Added an optional server-side CUDA smoke:
+  `tests/test_sft_cuda_smoke.py::test_cuda_sft_gradient_accumulation_loss_matches_large_batch`.
+- The smoke builds a synthetic SFT binidx dataset with equal trainable-token counts per sample, loads a real RWKV7 checkpoint, and compares masked loss from one large batch against split micro-batches under gradient-accumulation aggregation.
+- Default comparison is `micro_bsz=2, accumulate=1` versus `micro_bsz=1, accumulate=2`; `RWKV_SFT_ACCUM_EQUIV_STEPS` can increase the accumulation count.
+- The smoke is gated by `RWKV_RUN_CUDA_SFT_ACCUM_EQUIV_SMOKE=1`, and can write a JSON summary through `RWKV_SFT_ACCUM_EQUIV_SUMMARY_FILE`.
+- README / README_CN now include the server command and tolerance knobs.
+
+Validation
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_cuda_smoke.py --tb=short` -> 2 passed, 5 skipped.
+- `D:\anaconda\envs\model\python.exe -m py_compile tests\test_sft_cuda_smoke.py` -> passed.
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_training.py tests\test_deepspeed_checkpointing.py tests\test_sft_cuda_smoke.py --cov=src.dataset --cov=src.sft_loss --cov=train --cov-report=term-missing --tb=short` -> 36 passed, 5 skipped, targeted training coverage 99%.
+- `D:\anaconda\envs\model\python.exe -m compileall -q src tests train.py` -> passed.
+- `D:\anaconda\envs\model\python.exe -m pytest -q --tb=short` -> 125 passed, 5 skipped.
+- `git diff --check` -> passed with line-ending normalization warnings only.
+- `git diff -- data\SFT\sample\chat_template.jinja` -> empty.
+
 2026-06-05 SFT sample-preserving packing
 
 Completed

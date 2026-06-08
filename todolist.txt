@@ -7,6 +7,7 @@ Completed
 - Default remains `1`, preserving the previous one-JSONL-at-a-time memory profile.
 - Larger values group multiple JSONL shards, read them concurrently with `--num-workers`, best-fit pack across the group, and append all groups into one token binidx plus mask sidecar.
 - Added regression coverage for grouped multi-JSONL best-fit packing and CLI parsing.
+- Clarified README / README_CN concurrency semantics: groups are serial, reads within one group are bounded by `min(group_size, num_workers, files_in_group)`, and output writes remain single-threaded appends.
 
 Current status
 - Branch `new_sft` created from `ops-train`.

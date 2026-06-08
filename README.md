@@ -419,7 +419,33 @@ python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
 
 Use `--out-prefix` or its alias `--output-prefix` to choose the output binidx prefix. For example, `--out-prefix data/sft_train` writes `data/sft_train.bin`, `data/sft_train.idx`, `data/sft_train.mask.bin`, and `data/sft_train.mask.idx`. When passing more than one positional input path, the prefix is required because there is no single source name to infer it from. A single file defaults to that file name without `.jsonl`; a single directory defaults to the directory path as the prefix.
 
-`--num-workers` is used in two places. On the default path, each JSONL file is one read task, so multiple files can be read concurrently; one large file is not split across workers at the read stage. `--pack-strategy best-fit-decreasing` reads and packs JSONL shards in bounded groups. `--pack-shard-group-size` defaults to `1`, which preserves the previous one-shard-at-a-time memory profile; raising it lets each group read multiple JSONL shards concurrently and best-fit pack across that group. Template rendering and tokenization inside each group are still parallelized across source samples. Output order remains deterministic, so the same inputs, `--seed`, shuffle setting, and group size produce reproducible datasets. Text files are read as UTF-8; JSONL also accepts a UTF-8 BOM. Chinese and other multi-byte text are mapped through UTF-8 byte spans, so mask projection does not lose non-ASCII content.
+`--num-workers` is used in two places. On the default path, each JSONL file is one read task, so multiple files can be read concurrently; one large file is not split across workers at the read stage. `--pack-strategy best-fit-decreasing` reads and packs JSONL shards in bounded groups. `--pack-shard-group-size` defaults to `1`, which preserves the previous one-shard-at-a-time memory profile; raising it lets each group read multiple JSONL shards concurrently and best-fit pack across that group. Groups themselves are processed serially: group 2 starts only after group 1 has been read, tokenized, packed, and appended to the output builders. Inside a group, JSONL read concurrency is `min(group_size, num_workers, files_in_group)`. For example, `--pack-shard-group-size 8 --num-workers 32` reads at most 8 JSONL files at the same time; `--pack-shard-group-size 64 --num-workers 32` reads at most 32 files at once and queues the remaining files. Template rendering and tokenization inside each group are still parallelized across source samples, up to `num_workers`. Output writes remain single-threaded append operations into one token binidx plus one mask sidecar. Output order remains deterministic, so the same inputs, `--seed`, shuffle setting, and group size produce reproducible datasets. Text files are read as UTF-8; JSONL also accepts a UTF-8 BOM. Chinese and other multi-byte text are mapped through UTF-8 byte spans, so mask projection does not lose non-ASCII content.
+
+Example best-fit commands:
+
+```bash
+# Recommended bounded multi-file packing:
+# groups are serial; each group has at most 8 JSONL files; reads use at most 8 workers here.
+python data/make_sft_binidx.py /mnt/data/datasets/sft_jsonl \
+  --out-prefix /mnt/data/datasets/sft_train_ctx8192 \
+  --ctx-len 8192 \
+  --pack \
+  --pack-strategy best-fit-decreasing \
+  --pack-shard-group-size 8 \
+  --num-workers 32 \
+  --shuffle
+
+# Larger group, same worker cap:
+# each group has up to 64 JSONL files; at most 32 files are read concurrently, the rest queue.
+python data/make_sft_binidx.py /mnt/data/datasets/sft_jsonl \
+  --out-prefix /mnt/data/datasets/sft_train_ctx8192 \
+  --ctx-len 8192 \
+  --pack \
+  --pack-strategy best-fit-decreasing \
+  --pack-shard-group-size 64 \
+  --num-workers 32 \
+  --shuffle
+```
 
 The high-level flow is:
 

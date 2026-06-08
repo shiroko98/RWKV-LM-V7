@@ -222,7 +222,33 @@ python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
 
 使用 `--out-prefix` 或别名 `--output-prefix` 可以指定输出 binidx 的命名前缀。例如 `--out-prefix data/sft_train` 会写出 `data/sft_train.bin`、`data/sft_train.idx`、`data/sft_train.mask.bin`、`data/sft_train.mask.idx`。传入多个位置参数时必须显式指定输出前缀，因为脚本无法从多个源路径自动推导唯一名字；单个文件默认使用去掉 `.jsonl` 后缀的文件名，单个文件夹默认使用文件夹路径作为前缀。
 
-`--num-workers` 会用在两个阶段。默认路径的读取阶段以“一个 JSONL 文件”为一个任务，所以多个 JSONL 可以并发读取；单个大 JSONL 在读取阶段不会被多个 worker 拆分读取。`--pack-strategy best-fit-decreasing` 会按有界 JSONL shard group 读取和 packing。`--pack-shard-group-size` 默认是 `1`，保持之前一次只处理一个 shard 的内存占用；调大后，每个 group 可以并发读取多个 JSONL，并在 group 内跨文件做 best-fit packing。每个 group 内的模板渲染和 tokenization 仍会按样本并发执行。输出仍按确定的样本顺序或 shard group 顺序写入，所以相同输入、`--seed`、`--shuffle` 设置和 group size 会得到可复现结果。当前所有文本文件按 UTF-8 读取，JSONL 额外兼容 UTF-8 BOM，中文内容会按 UTF-8 字节映射到 token span，不会在 mask 推导中丢失。
+`--num-workers` 会用在两个阶段。默认路径的读取阶段以“一个 JSONL 文件”为一个任务，所以多个 JSONL 可以并发读取；单个大 JSONL 在读取阶段不会被多个 worker 拆分读取。`--pack-strategy best-fit-decreasing` 会按有界 JSONL shard group 读取和 packing。`--pack-shard-group-size` 默认是 `1`，保持之前一次只处理一个 shard 的内存占用；调大后，每个 group 可以并发读取多个 JSONL，并在 group 内跨文件做 best-fit packing。group 之间仍然串行：group 1 完成读取、tokenize、packing 并追加写入后，才会开始 group 2。group 内 JSONL 读取并发数是 `min(group_size, num_workers, 当前 group 文件数)`。例如 `--pack-shard-group-size 8 --num-workers 32` 最多同时读取 8 个 JSONL；`--pack-shard-group-size 64 --num-workers 32` 最多同时读取 32 个 JSONL，剩余文件排队。每个 group 内的模板渲染和 tokenization 仍会按样本并发执行，最多使用 `num_workers` 个 worker。输出写入仍是单线程 append 到同一套 token binidx 和 mask sidecar。输出仍按确定的样本顺序或 shard group 顺序写入，所以相同输入、`--seed`、`--shuffle` 设置和 group size 会得到可复现结果。当前所有文本文件按 UTF-8 读取，JSONL 额外兼容 UTF-8 BOM，中文内容会按 UTF-8 字节映射到 token span，不会在 mask 推导中丢失。
+
+best-fit 命令示例：
+
+```bash
+# 推荐的有界多文件 packing：
+# group 之间串行；每个 group 最多 8 个 JSONL；这里读取阶段最多实际用到 8 个 worker。
+python data/make_sft_binidx.py /mnt/data/datasets/sft_jsonl \
+  --out-prefix /mnt/data/datasets/sft_train_ctx8192 \
+  --ctx-len 8192 \
+  --pack \
+  --pack-strategy best-fit-decreasing \
+  --pack-shard-group-size 8 \
+  --num-workers 32 \
+  --shuffle
+
+# 更大的 group，同样的 worker 上限：
+# 每个 group 最多 64 个 JSONL；最多 32 个文件并发读取，剩下的文件排队。
+python data/make_sft_binidx.py /mnt/data/datasets/sft_jsonl \
+  --out-prefix /mnt/data/datasets/sft_train_ctx8192 \
+  --ctx-len 8192 \
+  --pack \
+  --pack-strategy best-fit-decreasing \
+  --pack-shard-group-size 64 \
+  --num-workers 32 \
+  --shuffle
+```
 
 整体流程可以抽象为：
 

@@ -486,6 +486,8 @@ For SFT, `--epoch_steps` and `--epoch_count` are user-controlled. `epoch_steps` 
 
 To run exactly one full pass over the SFT binidx dataset, set `--sft_one_pass 1`. The trainer reads only `DATA_FILE.idx` to count documents, computes `epoch_steps = ceil(num_documents / effective_bsz)`, and sets `epoch_count=1`; `effective_bsz = num_nodes * devices * micro_bsz * accumulate_grad_batches`. If the rounded-up final step needs extra samples, the dataset wraps deterministically from the beginning, and the startup log reports the repeated tail sample count.
 
+When you want to control the training length manually, pass `--epoch_steps` and `--epoch_count` directly:
+
 ```bash
 python train.py \
   --load_model model/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
@@ -519,7 +521,40 @@ python train.py \
   --grad_cp 1
 ```
 
-In this generic example, `--accelerator gpu` tells Lightning to train on CUDA GPUs, and `--devices 1` means one GPU in the current node. For multi-GPU DeepSpeed on one node, set `--devices` to the GPU count, for example `--devices 8`; `train.py` will automatically relaunch itself with `torchrun` when `strategy` contains `deepspeed`, `num_nodes=1`, and `devices > 1`. In SFT scheduling, `real_bsz = num_nodes * devices * micro_bsz` is the global sample count per forward pass, and `effective_bsz = real_bsz * accumulate_grad_batches` is the sample count consumed by each optimizer step. `--my_exit_tokens` is intentionally omitted for SFT because SFT stops by `--epoch_count`; `my_exit_tokens` is part of the pretraining token-limit schedule.
+If you only want one full pass, let the trainer compute the step count with `--sft_one_pass 1`. In direct `train.py` usage you may omit `--epoch_steps` / `--epoch_count` because their integer defaults are overridden; do not pass empty strings:
+
+```bash
+python train.py \
+  --load_model model/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
+  --proj_dir out/sft-0.4b-one-pass \
+  --data_file data/sft_train \
+  --data_type sft_binidx \
+  --ctx_len 4096 \
+  --sft_one_pass 1 \
+  --micro_bsz 1 \
+  --accumulate_grad_batches 4 \
+  --vocab_size 65536 \
+  --n_layer 24 \
+  --n_embd 1024 \
+  --dim_ffn 4096 \
+  --head_size 64 \
+  --d_decay_lora 64 \
+  --d_aaa_lora 64 \
+  --d_mv_lora 32 \
+  --d_gate_lora 128 \
+  --my_testing x070 \
+  --lr_init 1e-5 \
+  --lr_final 1e-5 \
+  --warmup_steps 10 \
+  --weight_decay 0 \
+  --accelerator gpu \
+  --devices 1 \
+  --precision bf16 \
+  --strategy deepspeed_stage_2 \
+  --grad_cp 1
+```
+
+In this generic example, `--accelerator gpu` tells Lightning to train on CUDA GPUs, and `--devices 1` means one GPU in the current node. For multi-GPU DeepSpeed on one node, set `--devices` to the GPU count, for example `--devices 8`; `train.py` will automatically relaunch itself with `torchrun` when `strategy` contains `deepspeed`, `num_nodes=1`, and `devices > 1`. In SFT scheduling, `real_bsz = num_nodes * devices * micro_bsz` is the global sample count per forward pass, and `effective_bsz = real_bsz * accumulate_grad_batches` is the sample count consumed by each optimizer step. `--my_exit_tokens` is intentionally omitted for SFT because SFT stops by `--epoch_count` or `--sft_one_pass`; `my_exit_tokens` is part of the pretraining token-limit schedule.
 
 Training samples use next-token labels, so the dataloader needs `ctx_len + 1` token ids per SFT document. A shorter document is padded in memory with `--sft_pad_token_id` and mask `0`; a longer document raises an error. For predictable fixed-length training, build data with `--ctx-len CTX_LEN --pack` or `--ctx-len CTX_LEN --pad`; preprocessing writes `CTX_LEN + 1` token documents, then train with `--ctx_len CTX_LEN`. For RWKV7 x070, keep `ctx_len` divisible by 16.
 
@@ -547,13 +582,16 @@ Validation coverage:
 
 Current validation results:
 
-- Local default regression: `125 passed, 4 skipped`.
-- SFT training targeted coverage: `src.dataset`, `src.sft_loss`, and the testable `train.py` helper surface total `99%`.
+- Local default regression: `129 passed, 6 skipped`.
+- SFT training targeted: `40 passed, 6 skipped`; `src.dataset`, `src.sft_loss`, and the testable `train.py` helper surface total `99%`, with the `train.py` helper surface at `100%`.
 - SFT preprocessing coverage: `src.sft_binidx`, `data.make_sft_binidx`, and `data.tokenizer.rwkv_tokenizer` total `99%`.
+- 13.3B launcher syntax check: `bash -n run_13b_sft_zero3_offload.sh` passed.
 - Server 8xH800:
   - `RWKV_RUN_CUDA_SFT_SMOKE=1` -> `3 passed, 2 skipped`.
   - `RWKV_RUN_TRAIN_PY_SFT_SMOKE=1` + `RWKV_SFT_SMOKE_DEVICES=8` + `deepspeed_stage_2` -> `3 passed, 2 skipped`.
   - `RWKV_RUN_TRAIN_PY_SFT_RESUME_SMOKE=1` + `RWKV_SFT_SMOKE_DEVICES=8` + `deepspeed_stage_3_offload` -> `3 passed, 2 skipped`.
+  - `RWKV_RUN_CUDA_SFT_ACCUM_EQUIV_SMOKE=1` -> `1 passed in 14.74s`.
+  - `RWKV_RUN_TRAIN_PY_SFT_DP_ZERO_ACCUM_EQUIV_SMOKE=1` + `RWKV_SFT_SMOKE_DEVICES=8` + `deepspeed_stage_3_offload` -> `1 passed in 81.06s`.
   - `RWKV_RUN_TRAIN_PY_SFT_MERGE_SMOKE=1` + `RWKV_SFT_SMOKE_DEVICES=8` + `deepspeed_stage_3_offload` -> `1 passed in 284.01s`.
 
 13.3B SFT launcher:
@@ -605,6 +643,8 @@ PY
 
 Step 3: launch 13.3B SFT on 8 H800 GPUs:
 
+Use this form when you want manual control over one or more passes. Compute `EPOCH_STEPS` for one pass, then set `EPOCH_COUNT=N` for `N` passes:
+
 ```bash
 LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b.pth \
 DATA_FILE=/mnt/data/datasets/sft_train_ctx8192 \
@@ -629,6 +669,30 @@ WANDB_PROJECT=RWKV-13B-SFT \
 bash run_13b_sft_zero3_offload.sh
 ```
 
+For exactly one full pass, the lower-friction form is `SFT_ONE_PASS=1`. `train.py` overrides the script's placeholder `EPOCH_STEPS/EPOCH_COUNT` values:
+
+```bash
+LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b.pth \
+DATA_FILE=/mnt/data/datasets/sft_train_ctx8192 \
+PROJ_DIR=/mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-one-pass \
+CTX_LEN=8192 \
+N_NODE=1 \
+GPU_PER_NODE=8 \
+MICRO_BSZ=1 \
+ACCUMULATE_GRAD_BATCHES=4 \
+SFT_ONE_PASS=1 \
+STRATEGY=deepspeed_stage_3_offload \
+GRAD_CP=1 \
+LR_INIT=1e-5 \
+LR_FINAL=1e-6 \
+WARMUP_STEPS=10 \
+EPOCH_SAVE=1 \
+SAVE_EVERY_N_STEPS=0 \
+KEEP_LAST_N_CHECKPOINTS=3 \
+WANDB_PROJECT=RWKV-13B-SFT \
+bash run_13b_sft_zero3_offload.sh
+```
+
 Key parameters:
 
 - `LOAD_MODEL`: initial 13.3B checkpoint, or a saved `rwkv-step-N.pth` / `rwkv-N.pth` checkpoint for resume. DeepSpeed checkpoint directories are supported when the strategy is DeepSpeed.
@@ -638,7 +702,7 @@ Key parameters:
 - `ACCUMULATE_GRAD_BATCHES`: gradient accumulation steps. SFT commonly uses this to increase effective batch size when `MICRO_BSZ=1`; `effective_bsz = real_bsz * ACCUMULATE_GRAD_BATCHES`.
 - `EPOCH_STEPS`: optimizer steps per SFT epoch. For one full pass, use `ceil(num_sft_documents / effective_bsz)`.
 - `EPOCH_COUNT`: number of SFT passes. For `N` passes over the SFT data, keep `EPOCH_STEPS` from the one-pass formula and set `EPOCH_COUNT=N`.
-- `SFT_ONE_PASS`: set to `1` to let `train.py` read `DATA_FILE.idx` and override the schedule with `epoch_steps=ceil(num_documents / effective_bsz)` and `epoch_count=1`. This is the low-friction option when you want exactly one full pass.
+- `SFT_ONE_PASS`: set to `1` to let `train.py` read `DATA_FILE.idx` and override the schedule with `epoch_steps=ceil(num_documents / effective_bsz)` and `epoch_count=1`. This is the low-friction option when you want exactly one full pass. Direct `train.py` usage may omit `--epoch_steps/--epoch_count`; this launcher still passes integer placeholders, but you do not need to care about their defaults in one-pass mode.
 - `GRAD_CP`: activation checkpointing. `1` enables block-level checkpointing to save VRAM; `0` disables it and is faster if memory allows.
 - `STRATEGY`: defaults to `deepspeed_stage_3_offload` for lower VRAM. Use `deepspeed_stage_3` for pure ZeRO-3 if memory allows.
 - `LR_INIT`, `LR_FINAL`, `WARMUP_STEPS`, `WEIGHT_DECAY`: SFT learning-rate schedule and regularization.

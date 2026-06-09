@@ -1,5 +1,20 @@
 2026-06-03 new_sft branch bootstrap
 
+2026-06-09 SFT README command refresh
+
+Completed
+- Updated README / README_CN with the latest SFT training behavior:
+- direct manual `train.py` command with explicit `--epoch_steps` / `--epoch_count`;
+- direct one-pass `train.py --sft_one_pass 1` command where `epoch_steps/epoch_count` defaults are overridden;
+- 13.3B launcher commands for both manual multi-pass scheduling and automatic one-pass scheduling;
+- latest gradient accumulation, DP/ZeRO accumulation equivalence, and DeepSpeed pth merge smoke commands and observed results.
+- Clarified `run_13b_sft_zero3_offload.sh` comments: when `SFT_ONE_PASS=1`, `EPOCH_STEPS/EPOCH_COUNT` are integer placeholders and `train.py` overrides them from `DATA_FILE.idx`.
+
+Validation completed
+- `bash -n run_13b_sft_zero3_offload.sh` passed.
+- `git diff --check` passed with only repository line-ending warnings.
+- `git diff -- data/SFT/sample/chat_template.jinja` was empty.
+
 2026-06-08 SFT best-fit packing shard groups
 
 Completed

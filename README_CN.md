@@ -289,6 +289,8 @@ python data/make_sft_binidx.py /mnt/data/datasets/sft_jsonl \
 
 如果想完整跑一遍 SFT binidx 数据，可以设置 `--sft_one_pass 1`。训练脚本会只读取 `DATA_FILE.idx` 的 document 数，自动计算 `epoch_steps = ceil(num_documents / effective_bsz)`，并把 `epoch_count` 设为 `1`；其中 `effective_bsz = num_nodes * devices * micro_bsz * accumulate_grad_batches`。向上取整后如果样本数不足一个完整 step，dataset 会按原有确定性顺序从开头 wrap，启动日志会打印重复的尾部样本数。
 
+手动指定训练长度时，直接写 `--epoch_steps` 和 `--epoch_count`：
+
 ```bash
 python train.py \
   --load_model model/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
@@ -322,7 +324,40 @@ python train.py \
   --grad_cp 1
 ```
 
-这个通用示例里，`--accelerator gpu` 表示用 CUDA GPU 训练，`--devices 1` 表示当前节点使用 1 张 GPU。如果要在单节点做多卡 DeepSpeed，把 `--devices` 改成 GPU 数量，比如 `--devices 8`；当 `strategy` 包含 `deepspeed`、`num_nodes=1` 且 `devices > 1` 时，`train.py` 会自动用 `torchrun` 重启多卡进程。SFT 调度里，`real_bsz = num_nodes * devices * micro_bsz` 表示每次 forward 的全局样本数，`effective_bsz = real_bsz * accumulate_grad_batches` 表示每个 optimizer step 消耗的样本数。这里故意不写 `--my_exit_tokens`，因为 SFT 由 `--epoch_count` 控制停止；`my_exit_tokens` 是预训练 token-limit 调度的一部分。
+如果只想完整跑一遍数据，让训练脚本自动计算 step，可以写 `--sft_one_pass 1`。这种直接调用 `train.py` 的方式可以不写 `--epoch_steps` / `--epoch_count`，因为它们有整数默认值并会被覆盖；不要传空字符串：
+
+```bash
+python train.py \
+  --load_model model/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
+  --proj_dir out/sft-0.4b-one-pass \
+  --data_file data/sft_train \
+  --data_type sft_binidx \
+  --ctx_len 4096 \
+  --sft_one_pass 1 \
+  --micro_bsz 1 \
+  --accumulate_grad_batches 4 \
+  --vocab_size 65536 \
+  --n_layer 24 \
+  --n_embd 1024 \
+  --dim_ffn 4096 \
+  --head_size 64 \
+  --d_decay_lora 64 \
+  --d_aaa_lora 64 \
+  --d_mv_lora 32 \
+  --d_gate_lora 128 \
+  --my_testing x070 \
+  --lr_init 1e-5 \
+  --lr_final 1e-5 \
+  --warmup_steps 10 \
+  --weight_decay 0 \
+  --accelerator gpu \
+  --devices 1 \
+  --precision bf16 \
+  --strategy deepspeed_stage_2 \
+  --grad_cp 1
+```
+
+这个通用示例里，`--accelerator gpu` 表示用 CUDA GPU 训练，`--devices 1` 表示当前节点使用 1 张 GPU。如果要在单节点做多卡 DeepSpeed，把 `--devices` 改成 GPU 数量，比如 `--devices 8`；当 `strategy` 包含 `deepspeed`、`num_nodes=1` 且 `devices > 1` 时，`train.py` 会自动用 `torchrun` 重启多卡进程。SFT 调度里，`real_bsz = num_nodes * devices * micro_bsz` 表示每次 forward 的全局样本数，`effective_bsz = real_bsz * accumulate_grad_batches` 表示每个 optimizer step 消耗的样本数。这里故意不写 `--my_exit_tokens`，因为 SFT 由 `--epoch_count` 或 `--sft_one_pass` 控制停止；`my_exit_tokens` 是预训练 token-limit 调度的一部分。
 
 训练端使用 next-token label，所以每个 SFT document 需要提供 `ctx_len + 1` 个 token。document 比这个短时，dataloader 会在内存里用 `--sft_pad_token_id` padding，并把 padding mask 设为 `0`；document 更长时会直接报错。为了让训练长度稳定，建议预处理时使用 `--ctx-len CTX_LEN --pack` 或 `--ctx-len CTX_LEN --pad`，预处理会自动写出 `CTX_LEN + 1` 个 token，训练时再设置 `--ctx_len CTX_LEN`。RWKV7 x070 的 `ctx_len` 需要能被 16 整除。
 
@@ -350,13 +385,16 @@ SFT mask 训练的实现框架：
 
 当前已验证结果：
 
-- 本地默认回归：`125 passed, 4 skipped`。
-- SFT 训练相关 targeted 覆盖率：`src.dataset`、`src.sft_loss`、可单测的 `train.py` helper surface 合计 `99%`。
+- 本地默认回归：`129 passed, 6 skipped`。
+- SFT 训练相关 targeted：`40 passed, 6 skipped`；`src.dataset`、`src.sft_loss`、可单测的 `train.py` helper surface 合计 `99%`，其中 `train.py` helper surface 为 `100%`。
 - SFT 数据处理覆盖率：`src.sft_binidx`、`data.make_sft_binidx`、`data.tokenizer.rwkv_tokenizer` 合计 `99%`。
+- 13.3B 启动脚本语法检查：`bash -n run_13b_sft_zero3_offload.sh` 通过。
 - 服务器 8xH800：
   - `RWKV_RUN_CUDA_SFT_SMOKE=1` -> `3 passed, 2 skipped`。
   - `RWKV_RUN_TRAIN_PY_SFT_SMOKE=1` + `RWKV_SFT_SMOKE_DEVICES=8` + `deepspeed_stage_2` -> `3 passed, 2 skipped`。
   - `RWKV_RUN_TRAIN_PY_SFT_RESUME_SMOKE=1` + `RWKV_SFT_SMOKE_DEVICES=8` + `deepspeed_stage_3_offload` -> `3 passed, 2 skipped`。
+  - `RWKV_RUN_CUDA_SFT_ACCUM_EQUIV_SMOKE=1` -> `1 passed in 14.74s`。
+  - `RWKV_RUN_TRAIN_PY_SFT_DP_ZERO_ACCUM_EQUIV_SMOKE=1` + `RWKV_SFT_SMOKE_DEVICES=8` + `deepspeed_stage_3_offload` -> `1 passed in 81.06s`。
   - `RWKV_RUN_TRAIN_PY_SFT_MERGE_SMOKE=1` + `RWKV_SFT_SMOKE_DEVICES=8` + `deepspeed_stage_3_offload` -> `1 passed in 284.01s`。
 
 13.3B SFT 启动脚本：
@@ -408,6 +446,8 @@ PY
 
 第三步：在 8 张 H800 上启动 13.3B SFT：
 
+如果你要手动控制一遍或多遍数据，用下面这种写法。`EPOCH_STEPS` 按“一遍数据”算，想跑 `N` 遍就把 `EPOCH_COUNT=N`：
+
 ```bash
 LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b.pth \
 DATA_FILE=/mnt/data/datasets/sft_train_ctx8192 \
@@ -432,6 +472,30 @@ WANDB_PROJECT=RWKV-13B-SFT \
 bash run_13b_sft_zero3_offload.sh
 ```
 
+如果只想完整跑一遍数据，推荐直接让脚本传 `SFT_ONE_PASS=1`，这时 `train.py` 会覆盖脚本里传入的 `EPOCH_STEPS/EPOCH_COUNT` 占位值：
+
+```bash
+LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b.pth \
+DATA_FILE=/mnt/data/datasets/sft_train_ctx8192 \
+PROJ_DIR=/mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-one-pass \
+CTX_LEN=8192 \
+N_NODE=1 \
+GPU_PER_NODE=8 \
+MICRO_BSZ=1 \
+ACCUMULATE_GRAD_BATCHES=4 \
+SFT_ONE_PASS=1 \
+STRATEGY=deepspeed_stage_3_offload \
+GRAD_CP=1 \
+LR_INIT=1e-5 \
+LR_FINAL=1e-6 \
+WARMUP_STEPS=10 \
+EPOCH_SAVE=1 \
+SAVE_EVERY_N_STEPS=0 \
+KEEP_LAST_N_CHECKPOINTS=3 \
+WANDB_PROJECT=RWKV-13B-SFT \
+bash run_13b_sft_zero3_offload.sh
+```
+
 关键参数说明：
 
 - `LOAD_MODEL`：初始 13.3B checkpoint；也可以指向保存出的 `rwkv-step-N.pth` / `rwkv-N.pth` 做断点续训。DeepSpeed checkpoint 目录需要配合 DeepSpeed strategy 恢复。
@@ -441,7 +505,7 @@ bash run_13b_sft_zero3_offload.sh
 - `ACCUMULATE_GRAD_BATCHES`：梯度累计步数。SFT 常用它在 `MICRO_BSZ=1` 的情况下提高有效 batch；有效 batch 为 `effective_bsz = real_bsz * ACCUMULATE_GRAD_BATCHES`。
 - `EPOCH_STEPS`：每个 SFT epoch 的 optimizer step 数。完整跑一遍建议用 `ceil(num_sft_documents / effective_bsz)`。
 - `EPOCH_COUNT`：跑几遍 SFT 数据。想跑 `N` 遍时，`EPOCH_STEPS` 按一遍数据计算，`EPOCH_COUNT=N`。
-- `SFT_ONE_PASS`：设为 `1` 时，脚本仍会传入 `EPOCH_STEPS/EPOCH_COUNT`，但 `train.py` 会自动读取 `DATA_FILE.idx` 的 document 数并覆盖为 `ceil(num_documents / effective_bsz)` 和 `epoch_count=1`，适合只想完整跑一遍数据的场景。
+- `SFT_ONE_PASS`：设为 `1` 时，脚本仍会传入 `EPOCH_STEPS/EPOCH_COUNT` 作为整数占位值，但 `train.py` 会自动读取 `DATA_FILE.idx` 的 document 数并覆盖为 `ceil(num_documents / effective_bsz)` 和 `epoch_count=1`，适合只想完整跑一遍数据的场景。直接调用 `train.py` 时可以省略 `--epoch_steps/--epoch_count`；通过这个脚本调用时不用管它们的默认值。
 - `GRAD_CP`：激活检查点。`1` 表示对 block 开启 checkpointing，省显存但更慢；显存足够时可设 `0`。
 - `STRATEGY`：默认 `deepspeed_stage_3_offload`，更省显存；显存足够时可以用 `deepspeed_stage_3` 做纯 ZeRO-3。
 - `LR_INIT`、`LR_FINAL`、`WARMUP_STEPS`、`WEIGHT_DECAY`：SFT 学习率计划和正则参数。

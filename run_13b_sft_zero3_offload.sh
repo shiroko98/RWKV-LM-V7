@@ -46,6 +46,10 @@ PROJ_DIR="${PROJ_DIR:-/mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zer
 #   ceil(num_documents / (NUM_NODES * GPU_PER_NODE * MICRO_BSZ * ACCUMULATE_GRAD_BATCHES))
 # If EPOCH_STEPS * effective_bsz is larger than the document count, the SFT dataset wraps around deterministically.
 #
+# Set SFT_ONE_PASS=1 when you want train.py to compute that one-pass schedule automatically from DATA_FILE.idx.
+# In that mode EPOCH_STEPS / EPOCH_COUNT are still passed as integer placeholders, but train.py overrides them with:
+#   epoch_steps = ceil(num_documents / effective_bsz), epoch_count = 1
+#
 #######################################################################################################################
 
 EPOCH_STEPS="${EPOCH_STEPS:-1000}"

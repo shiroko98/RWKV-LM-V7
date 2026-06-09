@@ -18,13 +18,14 @@ import sys
 import types
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any
 
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+from src.sft_prompt import resolve_prompt_from_args
 
 CONVERT_SCRIPT_PATH = REPO_ROOT / "scripts" / "convert_deepspeed_checkpoint_to_pth.py"
 CONVERT_SPEC = importlib.util.spec_from_file_location("convert_deepspeed_checkpoint_to_pth", CONVERT_SCRIPT_PATH)
@@ -43,13 +44,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exclude-frozen-parameters", action="store_true", help="Pass exclude_frozen_parameters=True to the DeepSpeed loader when supported")
     parser.add_argument("--summary-file", default="", help="Optional path to write a JSON summary of the comparison")
     parser.add_argument("--strict-forward", action="store_true", help="Fail if forward equivalence cannot be checked")
-    parser.add_argument("--prompt", default="The Eiffel tower is in the city of", help="Prompt used for the forward-pass equivalence check")
+    parser.add_argument("--prompt", default="你好，请用一句话介绍 RWKV。", help="User prompt for the forward-pass equivalence check. By default it is rendered through --chat-template.")
+    parser.add_argument("--chat-template", default=str(REPO_ROOT / "data" / "SFT" / "sample" / "chat_template.jinja"), help="Chat template used to render --prompt before the forward-pass check")
+    parser.add_argument("--raw-prompt", action="store_true", help="Use --prompt directly without chat-template rendering")
+    parser.add_argument("--system-prompt", default="", help="Optional system message content used when rendering --prompt through the chat template")
+    parser.add_argument("--current-date", default="", help="Optional current_date field injected into the rendered system message")
+    parser.add_argument("--current-location", default="", help="Optional current_location field injected into the rendered system message")
+    parser.add_argument("--add-generation-prompt", action=argparse.BooleanOptionalAction, default=True, help="When rendering chat messages, append the assistant generation prompt")
+    parser.add_argument("--enable-thinking", action="store_true", help="When rendering chat messages, open a <think> block in the assistant generation prompt")
+    parser.add_argument("--no-add-thinking", action="store_true", help="When rendering chat messages, do not add an empty <think> block")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Device for the forward equivalence check")
     parser.add_argument("--max-abs-tol", type=float, default=0.0, help="Maximum allowed absolute difference for tensor equality")
     parser.add_argument("--max-rel-tol", type=float, default=0.0, help="Maximum allowed relative difference for tensor equality")
     parser.add_argument("--demo-model-path", default="", help="Deprecated compatibility flag. Ignored.")
     parser.add_argument("--demo-vocab-path", default="", help="Optional tokenizer vocab path override for the demo-derived runtime")
     return parser.parse_args()
+
+
+def resolve_prompt(args: argparse.Namespace) -> str:
+    return resolve_prompt_from_args(args)
 
 
 def load_reconstructed_state_dict(args: argparse.Namespace) -> "OrderedDict[str, torch.Tensor]":
@@ -187,7 +200,8 @@ def compare_forward_outputs(args: argparse.Namespace, state_dict: "OrderedDict[s
     reconstructed_model = build_demo_model(module, state_dict, args.device, convert_script.DTYPE_MAP[args.dtype])
     converted_model = build_demo_model(module, converted_state, args.device, convert_script.DTYPE_MAP[args.dtype])
 
-    input_tokens = tokenizer.encode(args.prompt)
+    prompt = resolve_prompt(args)
+    input_tokens = tokenizer.encode(prompt)
     input_tensor = torch.tensor(input_tokens, dtype=torch.long, device=args.device).reshape(1, -1)
 
     with torch.no_grad():

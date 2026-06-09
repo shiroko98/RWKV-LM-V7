@@ -1,4 +1,6 @@
 import importlib.util
+import sys
+from argparse import Namespace
 from collections import OrderedDict
 from pathlib import Path
 
@@ -84,3 +86,60 @@ def test_load_demo_module_uses_repo_runtime_module():
     assert hasattr(module, "configure_runtime")
     assert hasattr(module, "RWKV")
     assert hasattr(module, "RWKV_TOKENIZER")
+
+
+def test_resolve_prompt_renders_user_prompt_with_chat_template():
+    args = Namespace(
+        raw_prompt=False,
+        prompt="你好",
+        chat_template=str(REPO_ROOT / "data" / "SFT" / "sample" / "chat_template.jinja"),
+        system_prompt="系统提示",
+        current_date="2026-06-09",
+        current_location="Shanghai",
+        add_generation_prompt=True,
+        enable_thinking=False,
+        no_add_thinking=False,
+    )
+
+    prompt = equiv_script.resolve_prompt(args)
+
+    assert "<|im_start|>System: 系统提示" in prompt
+    assert "<|im_start|>User: 你好<|im_end|>" in prompt
+    assert prompt.endswith("<|im_start|>Assistant: <think>\n\n</think>\n\n")
+
+
+def test_parse_args_uses_plain_prompt_not_message_files(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "test_converted_checkpoint_equivalence.py",
+            "--checkpoint-dir",
+            "zero_ckpt",
+            "--converted-file",
+            "model.pth",
+            "--prompt",
+            "你好",
+        ],
+    )
+
+    args = equiv_script.parse_args()
+
+    assert args.prompt == "你好"
+    assert args.raw_prompt is False
+    assert not hasattr(args, "messages_file")
+    assert not hasattr(args, "messages_json")
+
+
+def test_resolve_prompt_can_use_raw_prompt_and_rejects_thinking_conflict():
+    args = Namespace(raw_prompt=True, prompt="raw text", enable_thinking=True, no_add_thinking=True)
+    assert equiv_script.resolve_prompt(args) == "raw text"
+
+    args.raw_prompt = False
+    args.chat_template = str(REPO_ROOT / "data" / "SFT" / "sample" / "chat_template.jinja")
+    args.system_prompt = ""
+    args.current_date = ""
+    args.current_location = ""
+    args.add_generation_prompt = True
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        equiv_script.resolve_prompt(args)

@@ -1,5 +1,25 @@
 2026-06-03 new_sft branch bootstrap
 
+2026-06-09 Chat-template rendered converted-checkpoint demo
+
+Completed
+- Added `src.sft_prompt` for shared prompt rendering from a plain user `--prompt`.
+- Updated `scripts/run_converted_rwkv_demo.py` so `--prompt` is treated as user input by default.
+- The demo now internally builds a one-turn chat message and renders it with `data/SFT/sample/chat_template.jinja` before tokenization and generation. No external message JSON or message file is required.
+- Added `--raw-prompt` for the old plain next-token continuation behavior.
+- Added optional `--system-prompt`, `--current-date`, `--current-location`, `--enable-thinking`, and `--no-add-thinking` prompt-rendering controls.
+- Updated `scripts/test_converted_checkpoint_equivalence.py` to use the same chat-template-rendered prompt behavior for forward equivalence checks.
+- Updated README / README_CN converted-checkpoint inference and equivalence commands.
+
+Validation completed
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_prompt.py --cov=src.sft_prompt --cov-report=term-missing --tb=short` -> 6 passed, `src.sft_prompt.py` 100% coverage.
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_run_converted_rwkv_demo.py tests\test_converted_checkpoint_equivalence.py tests\test_sft_prompt.py tests\test_convert_deepspeed_checkpoint_to_pth.py --tb=short` -> 27 passed.
+- `D:\anaconda\envs\model\python.exe scripts\run_converted_rwkv_demo.py --help` passed and shows `--prompt`, `--chat-template`, `--raw-prompt`; no message file input.
+- `D:\anaconda\envs\model\python.exe scripts\test_converted_checkpoint_equivalence.py --help` passed and shows the same prompt-rendering controls.
+- `D:\anaconda\envs\model\python.exe -m compileall -q src scripts tests` passed.
+- `git diff --check` passed with only repository line-ending warnings.
+- `git diff -- data/SFT/sample/chat_template.jinja` was empty.
+
 2026-06-09 SFT preprocessing progress bar
 
 Completed

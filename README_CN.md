@@ -610,7 +610,8 @@ python scripts/test_converted_checkpoint_equivalence.py \
   --converted-file /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.bf16.pth \
   --dtype bf16 \
   --strict-forward \
-  --prompt "User: 你好\nAssistant:" \
+  --chat-template data/SFT/sample/chat_template.jinja \
+  --prompt "你好，请用一句话介绍 RWKV。" \
   --device cuda \
   --demo-vocab-path rwkv_vocab_v20260603.txt \
   --summary-file /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.equiv.json
@@ -618,13 +619,14 @@ python scripts/test_converted_checkpoint_equivalence.py \
 
 ### 8. 合并后推理测试命令
 
-`scripts/run_converted_rwkv_demo.py` 是轻量 next-token / generation demo，会从 `.pth` 自动推断层数、hidden size、LoRA 维度和 head size，不需要手动写 13.3B 结构参数。SFT 数据处理默认使用 `rwkv_vocab_v20260603.txt`，所以推理测试也建议显式传同一个 vocab：
+`scripts/run_converted_rwkv_demo.py` 是轻量 generation demo，会从 `.pth` 自动推断层数、hidden size、LoRA 维度和 head size，不需要手动写 13.3B 结构参数。默认情况下，`--prompt` 表示用户输入，脚本会在内部构造一轮 `user` 消息并用 `data/SFT/sample/chat_template.jinja` 渲染成真正送入模型的 prompt；不需要传入 messages 文件或 messages JSON。SFT 数据处理默认使用 `rwkv_vocab_v20260603.txt`，所以推理测试也建议显式传同一个 vocab：
 
 ```bash
 python scripts/run_converted_rwkv_demo.py \
   --model-path /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.bf16.pth \
   --vocab-path rwkv_vocab_v20260603.txt \
-  --prompt "User: 你好，请用一句话介绍 RWKV。\nAssistant:" \
+  --chat-template data/SFT/sample/chat_template.jinja \
+  --prompt "你好，请用一句话介绍 RWKV。" \
   --device cuda \
   --dtype auto \
   --topk 10 \
@@ -634,7 +636,7 @@ python scripts/run_converted_rwkv_demo.py \
   --sample
 ```
 
-这个 demo 只是验证合并后的 checkpoint 能加载、能 forward、能生成；它不会自动套用 `data/SFT/sample/chat_template.jinja`。如果要做严格 chat 评测，输入 prompt 应该由同一个 chat template 渲染后再传给推理程序。
+这个 demo 只是验证合并后的 checkpoint 能加载、能 forward、能按 SFT chat template 生成。需要指定系统消息时可以加 `--system-prompt`、`--current-date`、`--current-location`；如果只是想做普通 next-token continuation，不经过 chat template，可以加 `--raw-prompt`。
 
 ### 9. 服务器 smoke 测试命令
 

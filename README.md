@@ -212,15 +212,16 @@ If `max_abs_diff=0.0` and `topk_match=True`, the converted checkpoint matches ex
 
 ### Run Inference on a Converted Single-File Checkpoint
 
-Use [scripts/run_converted_rwkv_demo.py](/D:/codes/RWKV-LM-V7-12B-train/scripts/run_converted_rwkv_demo.py):
+Use [scripts/run_converted_rwkv_demo.py](/D:/codes/RWKV-LM-V7-12B-train/scripts/run_converted_rwkv_demo.py). By default, `--prompt` is the user input text. The script builds the one-turn chat message internally and renders it with `--chat-template`; no external message JSON file is needed.
 
 ```bash
 python scripts/run_converted_rwkv_demo.py \
   --model-path /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/12b-zero3-offload/rwkv-step-20.bf16.pth \
-  --vocab-path /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/data/tokenizer/rwkv_vocab_v20230424.txt \
+  --vocab-path rwkv_vocab_v20260603.txt \
+  --chat-template data/SFT/sample/chat_template.jinja \
   --device cuda \
   --dtype auto \
-  --prompt "The Eiffel tower is in the city of" \
+  --prompt "你好，请用一句话介绍 RWKV。" \
   --topk 10 \
   --max-new-tokens 32
 ```
@@ -230,10 +231,11 @@ Sampling example:
 ```bash
 python scripts/run_converted_rwkv_demo.py \
   --model-path /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/12b-zero3-offload/rwkv-step-20.bf16.pth \
-  --vocab-path /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/data/tokenizer/rwkv_vocab_v20230424.txt \
+  --vocab-path rwkv_vocab_v20260603.txt \
+  --chat-template data/SFT/sample/chat_template.jinja \
   --device cuda \
   --dtype auto \
-  --prompt "The Eiffel tower is in the city of" \
+  --prompt "你好，请用一句话介绍 RWKV。" \
   --max-new-tokens 64 \
   --sample \
   --temperature 1.0 \
@@ -251,6 +253,19 @@ This demo automatically infers:
 - `D_GATE_LORA`
 
 from the checkpoint itself, so you do not need to hardcode 13.3B layout values by hand.
+
+For old plain next-token continuation checks, bypass the chat template explicitly:
+
+```bash
+python scripts/run_converted_rwkv_demo.py \
+  --model-path /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/12b-zero3-offload/rwkv-step-20.bf16.pth \
+  --vocab-path /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/data/tokenizer/rwkv_vocab_v20230424.txt \
+  --raw-prompt \
+  --prompt "The Eiffel tower is in the city of" \
+  --device cuda \
+  --dtype auto \
+  --topk 10
+```
 
 ### Legacy `rwkv_v7_demo.py`
 
@@ -807,7 +822,8 @@ python scripts/test_converted_checkpoint_equivalence.py \
   --converted-file /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.bf16.pth \
   --dtype bf16 \
   --strict-forward \
-  --prompt "User: 你好\nAssistant:" \
+  --chat-template data/SFT/sample/chat_template.jinja \
+  --prompt "你好，请用一句话介绍 RWKV。" \
   --device cuda \
   --demo-vocab-path rwkv_vocab_v20260603.txt \
   --summary-file /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.equiv.json
@@ -815,13 +831,14 @@ python scripts/test_converted_checkpoint_equivalence.py \
 
 ### 8. Run an inference smoke test
 
-`scripts/run_converted_rwkv_demo.py` is a lightweight next-token / generation demo. It infers layer count, hidden size, LoRA dimensions, and head size from the `.pth`, so you do not need to pass 13.3B shape parameters manually. SFT preprocessing defaults to `rwkv_vocab_v20260603.txt`, so pass the same vocab explicitly for inference checks:
+`scripts/run_converted_rwkv_demo.py` is a lightweight generation demo. It infers layer count, hidden size, LoRA dimensions, and head size from the `.pth`, so you do not need to pass 13.3B shape parameters manually. By default, `--prompt` is treated as the user input; the script builds a one-turn `user` message internally and renders it with `data/SFT/sample/chat_template.jinja` before feeding it to the model. SFT preprocessing defaults to `rwkv_vocab_v20260603.txt`, so pass the same vocab explicitly for inference checks:
 
 ```bash
 python scripts/run_converted_rwkv_demo.py \
   --model-path /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.bf16.pth \
   --vocab-path rwkv_vocab_v20260603.txt \
-  --prompt "User: 你好，请用一句话介绍 RWKV。\nAssistant:" \
+  --chat-template data/SFT/sample/chat_template.jinja \
+  --prompt "你好，请用一句话介绍 RWKV。" \
   --device cuda \
   --dtype auto \
   --topk 10 \
@@ -831,7 +848,7 @@ python scripts/run_converted_rwkv_demo.py \
   --sample
 ```
 
-This demo only validates that the converted checkpoint loads, runs forward, and can generate. It does not automatically apply `data/SFT/sample/chat_template.jinja`; for strict chat evaluation, render the prompt with the same chat template first, then pass the rendered text to the inference program.
+This demo validates that the converted checkpoint loads, runs forward, and generates through the SFT chat template. Add `--system-prompt`, `--current-date`, or `--current-location` when you need those system fields. Add `--raw-prompt` only when you want plain next-token continuation without chat-template rendering.
 
 ### 9. Server smoke-test commands
 

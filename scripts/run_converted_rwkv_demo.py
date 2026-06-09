@@ -10,7 +10,6 @@ import sys
 import types
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any
 
 import torch
 from torch.nn import functional as F
@@ -20,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src import rwkv_v7_demo_runtime as runtime
+from src.sft_prompt import resolve_prompt_from_args
 
 DTYPE_MAP = {
     "auto": None,
@@ -33,7 +33,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True, help="Path to a converted single-file RWKV checkpoint such as rwkv-step-20.bf16.pth")
     parser.add_argument("--vocab-path", default=str(REPO_ROOT / "data" / "tokenizer" / "rwkv_vocab_v20230424.txt"), help="Tokenizer vocab path")
-    parser.add_argument("--prompt", default="The Eiffel tower is in the city of", help="Prompt for next-token prediction or generation")
+    parser.add_argument("--prompt", default="你好，请用一句话介绍 RWKV。", help="User prompt. By default it is rendered through --chat-template before inference.")
+    parser.add_argument("--chat-template", default=str(REPO_ROOT / "data" / "SFT" / "sample" / "chat_template.jinja"), help="Chat template used to render --prompt before inference")
+    parser.add_argument("--raw-prompt", action="store_true", help="Use --prompt directly without chat-template rendering")
+    parser.add_argument("--system-prompt", default="", help="Optional system message content used when rendering --prompt through the chat template")
+    parser.add_argument("--current-date", default="", help="Optional current_date field injected into the rendered system message")
+    parser.add_argument("--current-location", default="", help="Optional current_location field injected into the rendered system message")
+    parser.add_argument("--add-generation-prompt", action=argparse.BooleanOptionalAction, default=True, help="When rendering chat messages, append the assistant generation prompt")
+    parser.add_argument("--enable-thinking", action="store_true", help="When rendering chat messages, open a <think> block in the assistant generation prompt")
+    parser.add_argument("--no-add-thinking", action="store_true", help="When rendering chat messages, do not add an empty <think> block")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Inference device")
     parser.add_argument("--dtype", choices=sorted(DTYPE_MAP), default="auto", help="Runtime dtype. 'auto' follows the checkpoint dtype.")
     parser.add_argument("--topk", type=int, default=10, help="How many next-token candidates to print")
@@ -42,6 +50,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=0.0, help="Top-p nucleus sampling cutoff when --sample is enabled. 0 disables it.")
     parser.add_argument("--sample", action="store_true", help="Sample tokens instead of greedy argmax when generating")
     return parser.parse_args()
+
+
+def resolve_prompt(args: argparse.Namespace) -> str:
+    return resolve_prompt_from_args(args)
 
 
 def torch_load_state_dict(path: Path) -> "OrderedDict[str, torch.Tensor]":
@@ -224,6 +236,11 @@ def main() -> int:
     if not vocab_path.is_file():
         print(f"[demo] vocab file not found: {vocab_path}", file=sys.stderr)
         return 2
+    try:
+        prompt = resolve_prompt(args)
+    except Exception as exc:
+        print(f"[demo] failed to build prompt: {exc}", file=sys.stderr)
+        return 2
 
     print(f"[demo] model:  {model_path}")
     print(f"[demo] vocab:  {vocab_path}")
@@ -249,8 +266,8 @@ def main() -> int:
     if args.device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    prompt_tokens = tokenizer.encode(args.prompt)
-    print(f"\nPrompt:\n{args.prompt}")
+    prompt_tokens = tokenizer.encode(prompt)
+    print(f"\nPrompt:\n{prompt}")
     print(f"\nPrompt tokens ({len(prompt_tokens)}):\n{prompt_tokens}")
 
     result = generate(

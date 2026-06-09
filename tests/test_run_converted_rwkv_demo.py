@@ -1,7 +1,10 @@
 import importlib.util
+import sys
+from argparse import Namespace
 from collections import OrderedDict
 from pathlib import Path
 
+import pytest
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -46,6 +49,63 @@ def test_infer_runtime_dtype_prefers_checkpoint_dtype_in_auto_mode():
 
     assert demo_script.infer_runtime_dtype(state_dict, "auto") == torch.bfloat16
     assert demo_script.infer_runtime_dtype(state_dict, "fp32") == torch.float32
+
+
+def test_resolve_prompt_renders_user_prompt_with_chat_template():
+    args = Namespace(
+        raw_prompt=False,
+        prompt="你好",
+        chat_template=str(REPO_ROOT / "data" / "SFT" / "sample" / "chat_template.jinja"),
+        system_prompt="系统提示",
+        current_date="2026-06-09",
+        current_location="Shanghai",
+        add_generation_prompt=True,
+        enable_thinking=False,
+        no_add_thinking=False,
+    )
+
+    prompt = demo_script.resolve_prompt(args)
+
+    assert "<|im_start|>System: 系统提示" in prompt
+    assert "Current date: 2026-06-09" in prompt
+    assert "Current location: Shanghai" in prompt
+    assert "<|im_start|>User: 你好<|im_end|>" in prompt
+    assert prompt.endswith("<|im_start|>Assistant: <think>\n\n</think>\n\n")
+
+
+def test_parse_args_uses_plain_prompt_not_message_files(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_converted_rwkv_demo.py",
+            "--model-path",
+            "model.pth",
+            "--prompt",
+            "你好",
+        ],
+    )
+
+    args = demo_script.parse_args()
+
+    assert args.prompt == "你好"
+    assert args.raw_prompt is False
+    assert not hasattr(args, "messages_file")
+    assert not hasattr(args, "messages_json")
+
+
+def test_resolve_prompt_can_use_raw_prompt_and_rejects_thinking_conflict():
+    args = Namespace(raw_prompt=True, prompt="raw text", enable_thinking=True, no_add_thinking=True)
+    assert demo_script.resolve_prompt(args) == "raw text"
+
+    args.raw_prompt = False
+    args.chat_template = str(REPO_ROOT / "data" / "SFT" / "sample" / "chat_template.jinja")
+    args.system_prompt = ""
+    args.current_date = ""
+    args.current_location = ""
+    args.add_generation_prompt = True
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        demo_script.resolve_prompt(args)
 
 
 def test_runtime_block_only_creates_ln0_for_first_layer():

@@ -86,6 +86,18 @@ class FilterStats:
     filtered: int = 0
 
 
+class SFTDocumentBuildError(ValueError):
+    def __init__(self, event: dict[str, object]):
+        self.event = event
+        location = f"{event.get('source_path', '<unknown>')}:{event.get('line_number', '?')}"
+        error_type = event.get("error_type", "Error")
+        error_message = event.get("error_message", "")
+        super().__init__(f"Failed to build SFT document from {location}: {error_type}: {error_message}")
+
+    def __reduce__(self):
+        return (type(self), (self.event,))
+
+
 def _tojson_filter(obj, ensure_ascii=False):
     return json.dumps(obj, ensure_ascii=ensure_ascii)
 
@@ -260,6 +272,132 @@ def last_assistant_message(messages: Sequence[dict]) -> dict | None:
 
 def _assistant_has_existing_think(content: str) -> bool:
     return "</think>" in content
+
+
+def _preview_text(value, *, limit: int = 240) -> str:
+    text = visible_text(value).replace("\r\n", "\n").replace("\r", "\n")
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "...<truncated>"
+
+
+def _summarize_message_for_error(message: dict, index: int) -> dict[str, object]:
+    if not isinstance(message, dict):
+        return {
+            "index": index,
+            "role": type(message).__name__,
+            "keys": [],
+            "content_type": type(message).__name__,
+            "content_length": len(str(message)),
+            "content_preview": _preview_text(message),
+            "has_think_close": False,
+            "has_reasoning_content": False,
+            "reasoning_content_length": 0,
+            "tool_calls_count": 0,
+        }
+    content = visible_text(message.get("content"))
+    reasoning_content = message.get("reasoning_content")
+    reasoning_text = reasoning_content if isinstance(reasoning_content, str) else ""
+    summary: dict[str, object] = {
+        "index": index,
+        "role": message.get("role"),
+        "keys": sorted(str(key) for key in message.keys()),
+        "content_type": type(message.get("content")).__name__,
+        "content_length": len(content),
+        "content_preview": _preview_text(content),
+        "has_think_close": "</think>" in content,
+        "has_reasoning_content": isinstance(reasoning_content, str),
+        "reasoning_content_length": len(reasoning_text),
+        "tool_calls_count": len(message.get("tool_calls") or []),
+    }
+    if reasoning_text:
+        summary["reasoning_content_preview"] = _preview_text(reasoning_text)
+    if message.get("name"):
+        summary["name"] = message.get("name")
+    return summary
+
+
+def _summarize_messages_for_error(messages: Sequence[dict], *, edge_count: int = 8) -> list[dict[str, object]]:
+    if len(messages) <= edge_count * 2:
+        selected = list(enumerate(messages))
+    else:
+        selected = list(enumerate(messages[:edge_count]))
+        selected.append((-1, {"role": "<omitted>", "content": f"{len(messages) - edge_count * 2} messages omitted"}))
+        selected.extend((index, message) for index, message in enumerate(messages[-edge_count:], start=len(messages) - edge_count))
+    return [_summarize_message_for_error(message, index) for index, message in selected]
+
+
+def _summarize_record_for_error(record: dict | None) -> dict[str, object]:
+    if record is None:
+        return {}
+    messages = record.get("messages")
+    message_list = messages if isinstance(messages, list) else []
+    assistant_indexes = [
+        index for index, message in enumerate(message_list)
+        if isinstance(message, dict) and message.get("role") == "assistant"
+    ]
+    user_indexes = [
+        index for index, message in enumerate(message_list)
+        if isinstance(message, dict) and message.get("role") == "user"
+    ]
+    return {
+        "top_level_keys": sorted(str(key) for key in record.keys()),
+        "message_count": len(message_list),
+        "roles": [
+            message.get("role") if isinstance(message, dict) else type(message).__name__
+            for message in message_list
+        ],
+        "last_user_index": user_indexes[-1] if user_indexes else None,
+        "last_assistant_index": assistant_indexes[-1] if assistant_indexes else None,
+        "tools_count": len(record.get("tools") or []),
+        "messages": _summarize_messages_for_error(message_list),
+    }
+
+
+def _source_error_event(
+    source: JsonlSourceLine,
+    exc: BaseException,
+    *,
+    record: dict | None = None,
+) -> dict[str, object]:
+    event: dict[str, object] = {
+        "stage": "render-tokenize",
+        "source_path": source.source_path,
+        "line_number": source.line_number,
+        "error_type": type(exc).__name__,
+        "error_message": str(exc),
+        "source_text": source.text,
+    }
+    if record is None:
+        event["raw_line_preview"] = _preview_text(source.text, limit=1000)
+    else:
+        event["record"] = record
+        event["record_summary"] = _summarize_record_for_error(record)
+    return event
+
+
+def _emit_exception_error(
+    error_callback,
+    exc: BaseException,
+    *,
+    source: JsonlSourceLine | None = None,
+) -> None:
+    if error_callback is None:
+        return
+    if isinstance(exc, SFTDocumentBuildError):
+        error_callback(exc.event)
+        return
+    event: dict[str, object] = {
+        "stage": "render-tokenize",
+        "error_type": type(exc).__name__,
+        "error_message": str(exc),
+    }
+    if source is not None:
+        event["source_path"] = source.source_path
+        event["line_number"] = source.line_number
+        event["source_text"] = source.text
+        event["raw_line_preview"] = _preview_text(source.text, limit=1000)
+    error_callback(event)
 
 
 def _messages_before_last_assistant(messages: Sequence[dict]) -> list[dict]:
@@ -845,6 +983,7 @@ def normalize_input_paths(input_jsonl: str | Sequence[str]) -> list[str]:
 
 
 ProgressCallback = Callable[[dict[str, object]], None]
+ErrorCallback = Callable[[dict[str, object]], None]
 
 
 def load_jsonl_sources(
@@ -936,19 +1075,21 @@ def _build_document_from_source_line(
     current_date: str | None = None,
     current_location: str | None = None,
 ) -> EncodedDocument:
+    record = None
     try:
         record = json.loads(source.text)
     except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"Invalid JSON in {source.source_path}:{source.line_number}: {exc.msg}"
-        ) from exc
-    return build_document_from_record(
-        record,
-        tokenizer=tokenizer,
-        template=template,
-        current_date=current_date,
-        current_location=current_location,
-    )
+        raise SFTDocumentBuildError(_source_error_event(source, exc)) from exc
+    try:
+        return build_document_from_record(
+            record,
+            tokenizer=tokenizer,
+            template=template,
+            current_date=current_date,
+            current_location=current_location,
+        )
+    except Exception as exc:
+        raise SFTDocumentBuildError(_source_error_event(source, exc, record=record)) from exc
 
 _PROCESS_TOKENIZER: TRIE_TOKENIZER | None = None
 _PROCESS_TEMPLATE = None
@@ -1020,6 +1161,7 @@ def build_documents_from_sources(
     worker_chunksize: int = 64,
     process_pool: ProcessPoolExecutor | None = None,
     progress_callback: ProgressCallback | None = None,
+    error_callback: ErrorCallback | None = None,
     progress_total: int | None = None,
     progress_group_index: int | None = None,
     progress_group_count: int | None = None,
@@ -1039,13 +1181,17 @@ def build_documents_from_sources(
     if num_workers <= 1:
         done = 0
         for source in sources:
-            document = _build_document_from_source_line(
-                source,
-                tokenizer=tokenizer,
-                template=template,
-                current_date=current_date,
-                current_location=current_location,
-            )
+            try:
+                document = _build_document_from_source_line(
+                    source,
+                    tokenizer=tokenizer,
+                    template=template,
+                    current_date=current_date,
+                    current_location=current_location,
+                )
+            except Exception as exc:
+                _emit_exception_error(error_callback, exc, source=source)
+                raise
             done += 1
             _emit_document_progress(
                 progress_callback,
@@ -1077,17 +1223,21 @@ def build_documents_from_sources(
             sources,
             chunksize=worker_chunksize,
         )
-        for source, document in zip(sources, mapped_documents):
-            done += 1
-            _emit_document_progress(
-                progress_callback,
-                done=done,
-                total=progress_total,
-                source=source,
-                group_index=progress_group_index,
-                group_count=progress_group_count,
-            )
-            yield document
+        try:
+            for source, document in zip(sources, mapped_documents):
+                done += 1
+                _emit_document_progress(
+                    progress_callback,
+                    done=done,
+                    total=progress_total,
+                    source=source,
+                    group_index=progress_group_index,
+                    group_count=progress_group_count,
+                )
+                yield document
+        except Exception as exc:
+            _emit_exception_error(error_callback, exc)
+            raise
     finally:
         if close_executor:
             executor.shutdown()
@@ -1291,6 +1441,7 @@ def write_best_fit_decreasing_sharded_documents(
     token_dtype=np.uint16,
     mask_dtype=np.uint8,
     progress_callback: ProgressCallback | None = None,
+    error_callback: ErrorCallback | None = None,
 ):
     if pack_shard_group_size <= 0:
         raise ValueError("pack_shard_group_size must be a positive integer.")
@@ -1401,6 +1552,7 @@ def write_best_fit_decreasing_sharded_documents(
                 worker_chunksize=worker_chunksize,
                 process_pool=document_pool,
                 progress_callback=progress_callback,
+                error_callback=error_callback,
                 progress_total=len(shuffled_sources),
                 progress_group_index=group_index,
                 progress_group_count=group_count,
@@ -1507,6 +1659,7 @@ def build_binidx_dataset(
     worker_chunksize: int = 64,
     pack_cache_dir: str | None = None,
     progress_callback: ProgressCallback | None = None,
+    error_callback: ErrorCallback | None = None,
 ):
     if num_workers <= 0:
         raise ValueError("num_workers must be a positive integer.")
@@ -1543,6 +1696,7 @@ def build_binidx_dataset(
             worker_chunksize=worker_chunksize,
             pack_cache_dir=pack_cache_dir,
             progress_callback=progress_callback,
+            error_callback=error_callback,
         )
     else:
         tokenizer = TRIE_TOKENIZER(vocab_path, strict_length=True)
@@ -1558,6 +1712,7 @@ def build_binidx_dataset(
             num_workers=num_workers,
             worker_chunksize=worker_chunksize,
             progress_callback=progress_callback,
+            error_callback=error_callback,
             progress_total=len(shuffled_sources),
         )
 

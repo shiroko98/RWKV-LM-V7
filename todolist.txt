@@ -19,6 +19,21 @@ Validation completed
 - `git diff --check` passed with only repository line-ending warnings.
 - `git diff -- data/SFT/sample/chat_template.jinja` was empty.
 
+2026-06-09 SFT preprocessing error logging
+
+Completed
+- Added optional `--error-log` to `data/make_sft_binidx.py`.
+- Error logging is disabled by default and does not skip bad samples; preprocessing still stops on the first error.
+- On JSON parse, template render, tokenization, or mask-boundary errors, the main process writes one JSONL event with source path, line number, error type/message, raw source text, parsed full record when available, and a compact record summary.
+- Multiprocessing workers carry the exact failing sample back to the main process; worker processes do not write the error log directly.
+- Kept `data/SFT/sample/chat_template.jinja` untouched.
+
+Validation completed
+- Targeted error-log tests passed locally:
+  `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_binidx.py::test_build_documents_from_sources_logs_full_record_on_render_errors tests\test_sft_binidx.py::test_build_documents_from_sources_logs_worker_errors_with_exact_source tests\test_sft_binidx.py::test_cli_main_writes_error_log_with_full_record --tb=short`
+- Full preprocessing regression and coverage passed locally:
+  `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_binidx.py --cov=src.sft_binidx --cov=data.make_sft_binidx --cov=data.tokenizer.rwkv_tokenizer --cov-report=term-missing --tb=short` -> 84 passed, total 96%; `src.sft_binidx.py` 95%, `data.make_sft_binidx.py` 98%.
+
 2026-06-09 Chat-template rendered converted-checkpoint demo
 
 Completed

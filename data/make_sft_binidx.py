@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
+from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -88,6 +90,29 @@ class ProgressBar:
         return "..." + source[-(limit - 3):]
 
 
+class ErrorLog:
+    def __init__(self, path: str | None):
+        self.path = Path(path) if path else None
+        self.file = None
+
+    def __enter__(self):
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.file = self.path.open("a", encoding="utf-8")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.file is not None:
+            self.file.close()
+        return False
+
+    def __call__(self, event: dict[str, object]):
+        if self.file is None:
+            return
+        self.file.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+        self.file.flush()
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Render chat-template SFT JSONL into binidx tokens plus a loss-mask sidecar dataset."
@@ -111,6 +136,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shuffle", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--progress-interval", type=float, default=0.2)
+    parser.add_argument("--error-log", type=str, default=None)
     parser.add_argument("--current-date", type=str, default=None)
     parser.add_argument("--current-location", type=str, default=None)
     parser.add_argument("--add-generation-prompt", action="store_true", default=False)
@@ -162,28 +188,30 @@ def main(argv=None):
         pad_length = args.ctx_len + 1
 
     progress_bar = ProgressBar(enabled=args.progress, interval=args.progress_interval)
-    try:
-        stats = build_binidx_dataset(
-            args.input_jsonl,
-            output_prefix=args.out_prefix,
-            vocab_path=args.vocab,
-            template_path=args.chat_template,
-            n_epoch=args.n_epoch,
-            seed=args.seed,
-            pack_length=pack_length,
-            pad_length=pad_length,
-            num_workers=args.num_workers,
-            shuffle=args.shuffle,
-            pack_strategy=args.pack_strategy,
-            pack_shard_group_size=args.pack_shard_group_size,
-            worker_chunksize=args.worker_chunksize,
-            pack_cache_dir=args.pack_cache_dir,
-            current_date=args.current_date,
-            current_location=args.current_location,
-            progress_callback=progress_bar,
-        )
-    finally:
-        progress_bar.finish()
+    with ErrorLog(args.error_log) as error_log:
+        try:
+            stats = build_binidx_dataset(
+                args.input_jsonl,
+                output_prefix=args.out_prefix,
+                vocab_path=args.vocab,
+                template_path=args.chat_template,
+                n_epoch=args.n_epoch,
+                seed=args.seed,
+                pack_length=pack_length,
+                pad_length=pad_length,
+                num_workers=args.num_workers,
+                shuffle=args.shuffle,
+                pack_strategy=args.pack_strategy,
+                pack_shard_group_size=args.pack_shard_group_size,
+                worker_chunksize=args.worker_chunksize,
+                pack_cache_dir=args.pack_cache_dir,
+                current_date=args.current_date,
+                current_location=args.current_location,
+                progress_callback=progress_bar,
+                error_callback=error_log,
+            )
+        finally:
+            progress_bar.finish()
 
     print(
         "### Built SFT binidx dataset: "

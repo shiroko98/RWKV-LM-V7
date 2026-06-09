@@ -263,10 +263,13 @@ python data/make_sft_binidx.py /mnt/data/Datas/SFT_RWKV7_13B/sharded_cleaned \
   --worker-chunksize 64 \
   --no-shuffle \
   --pack-cache-dir /mnt/data/Datasets/SFT_RWKV7_13B.cache \
+  --error-log /mnt/data/Datasets/SFT_RWKV7_13B.errors.jsonl \
   --progress
 ```
 
 如果内存足够，可以把 `--pack-shard-group-size` 试到 `16`、`32` 或 `64`。更大的 group 会让 best-fit 有更多样本可组合，也能让读取阶段并发更多 JSONL，但 group 内 tokenized 样本会暂存在内存中，过大可能撑爆内存。你之前的 `--pack-shard-group-size 1 --num-workers 32` 只有渲染/tokenize 阶段能用 32 个进程，读取阶段每次只有 1 个 JSONL，packing 也只能在单文件内优化；它最省内存，但通常不是最快。
+
+如果需要定位坏 JSON、模板渲染异常或 mask 边界异常，可以加 `--error-log PATH`。它默认不开启；开启后仍然是“遇错停止”，不会跳过坏样本，只会在停止前由主进程追加一条 JSONL 错误记录。日志只记录出错样本，不记录成功样本；每条错误包含 `source_path`、`line_number`、错误类型和错误消息、原始 `source_text`、解析后的完整 `record`，以及便于快速扫结构的 `record_summary`。多进程模式下 worker 不直接写日志，而是把准确的错误样本带回主进程统一写入，避免并发输出互相打架。
 
 整体流程可以抽象为：
 
@@ -293,6 +296,7 @@ python data/make_sft_binidx.py /mnt/data/Datas/SFT_RWKV7_13B/sharded_cleaned \
 - `--worker-chunksize`：多进程渲染/tokenize 每个任务批量处理的样本数，默认 `64`；样本很短时可以调大减少调度开销，样本很长或希望进度更细时可以调小。
 - `--progress` / `--no-progress`：是否显示单行刷新进度条，默认开启；进度条写到 stderr，最终统计仍写到 stdout。
 - `--progress-interval`：进度条最小刷新间隔秒数，默认 `0.2`；设为 `0` 会每条样本都刷新。
+- `--error-log`：错误样本 JSONL 日志路径，默认不写；启用后只在异常时追加完整出错样本和摘要，处理仍会停止。
 - `--ctx-len`：训练上下文 token 数；配合 `--pack` 或 `--pad` 时，预处理长度自动使用 `ctx_len + 1`。
 - `--pack`：启用顺序样本不拆分 packing，长度为 `ctx_len + 1`；不设置时默认关闭。
 - `--pack-strategy`：packing 策略，默认 `ordered` 保持样本顺序；`best-fit-decreasing` 会在每个 JSONL shard group 内按长度重排做近似最优打包，减少 padding，并把所有 group 追加到同一组输出文件。

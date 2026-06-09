@@ -475,10 +475,13 @@ python data/make_sft_binidx.py /mnt/data/Datas/SFT_RWKV7_13B/sharded_cleaned \
   --worker-chunksize 64 \
   --no-shuffle \
   --pack-cache-dir /mnt/data/Datasets/SFT_RWKV7_13B.cache \
+  --error-log /mnt/data/Datasets/SFT_RWKV7_13B.errors.jsonl \
   --progress
 ```
 
 If memory allows, try `--pack-shard-group-size 16`, `32`, or `64`. Larger groups give best-fit more samples to combine and allow more concurrent JSONL reads, but tokenized samples inside a group are held in memory. Your earlier `--pack-shard-group-size 1 --num-workers 32` uses 32 processes only during render/tokenize; the read stage still handles one JSONL at a time, and best-fit can only optimize within that single file. It is the lowest-memory setting, but usually not the fastest.
+
+To diagnose bad JSON, template-rendering failures, or mask-boundary failures, add `--error-log PATH`. It is disabled by default. When enabled, preprocessing still stops on the first error; it does not skip bad samples. Before stopping, the main process appends one JSONL error record containing `source_path`, `line_number`, the error type and message, raw `source_text`, the parsed full `record`, and a compact `record_summary`. Successful samples are not logged. In multiprocessing mode, workers never write this file directly; they send the exact failing sample back to the main process, which writes the log centrally.
 
 The high-level flow is:
 
@@ -505,6 +508,7 @@ Main parameters:
 - `--worker-chunksize`: number of samples per render/tokenize worker task. Default is `64`; increase it for many short samples to reduce scheduling overhead, or lower it for very long samples and finer progress.
 - `--progress` / `--no-progress`: whether to show the single-line progress bar. Default is enabled; progress is written to stderr while the final summary stays on stdout.
 - `--progress-interval`: minimum progress-bar refresh interval in seconds. Default is `0.2`; set `0` to refresh after every sample.
+- `--error-log`: JSONL path for failing samples. Disabled by default; when enabled, only exceptions are logged with the complete record and preprocessing still stops.
 - `--ctx-len`: training context length in tokens. With `--pack` or `--pad`, preprocessing uses `ctx_len + 1`.
 - `--pack`: enable ordered sample-preserving packing at `ctx_len + 1`. Disabled by default.
 - `--pack-strategy`: packing strategy. Defaults to `ordered`; `best-fit-decreasing` reorders by length inside each JSONL shard group, uses a best-fit approximation to reduce padding, and appends all groups into one output dataset.

@@ -15,7 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import src.sft_binidx as sft_binidx
-from data.make_sft_binidx import ProgressBar, build_arg_parser, main as make_sft_binidx_main
+from data.make_sft_binidx import ErrorLog, ProgressBar, build_arg_parser, main as make_sft_binidx_main
 from data.tokenizer.rwkv_tokenizer import TRIE, TRIE_TOKENIZER, parse_vocab_line
 from src.binidx import MMapIndexedDataset
 from src.sft_binidx import (
@@ -1659,6 +1659,126 @@ def test_build_documents_from_sources_reports_json_errors(tokenizer: TRIE_TOKENI
         )
 
 
+def test_build_documents_from_sources_logs_full_record_on_render_errors(
+    tokenizer: TRIE_TOKENIZER,
+    chat_template,
+):
+    record = {
+        "messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "reasoning_content": "先想一想", "content": "答案"},
+        ]
+    }
+    source = JsonlSourceLine(
+        text=json.dumps(record, ensure_ascii=False),
+        source_path="reasoning.jsonl",
+        line_number=7,
+    )
+    events = []
+
+    with pytest.raises(ValueError, match=r"reasoning\.jsonl:7"):
+        list(
+            build_documents_from_sources(
+                [source],
+                tokenizer=tokenizer,
+                template=chat_template,
+                error_callback=events.append,
+            )
+        )
+
+    assert len(events) == 1
+    event = events[0]
+    assert event["source_path"] == "reasoning.jsonl"
+    assert event["line_number"] == 7
+    assert event["error_type"] == "ValueError"
+    assert event["record"] == record
+    assert json.loads(event["source_text"]) == record
+    assert event["record_summary"]["roles"] == ["user", "assistant"]
+    assert event["record_summary"]["messages"][-1]["has_reasoning_content"] is True
+
+
+def test_build_documents_from_sources_logs_worker_errors_with_exact_source():
+    bad_record = {
+        "messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "reasoning_content": "并发 worker 里的错误", "content": "答案"},
+        ]
+    }
+    sources = [
+        JsonlSourceLine(
+            text=json.dumps({"messages": [{"role": "assistant", "content": "ok"}]}, ensure_ascii=False),
+            source_path="ok.jsonl",
+            line_number=1,
+        ),
+        JsonlSourceLine(
+            text=json.dumps(bad_record, ensure_ascii=False),
+            source_path="bad_worker.jsonl",
+            line_number=42,
+        ),
+    ]
+    events = []
+
+    with pytest.raises(ValueError, match=r"bad_worker\.jsonl:42"):
+        list(
+            build_documents_from_sources(
+                sources,
+                vocab_path=str(VOCAB_PATH),
+                template_path=str(TEMPLATE_PATH),
+                num_workers=2,
+                worker_chunksize=1,
+                error_callback=events.append,
+            )
+        )
+
+    assert len(events) == 1
+    assert events[0]["source_path"] == "bad_worker.jsonl"
+    assert events[0]["line_number"] == 42
+    assert events[0]["record"] == bad_record
+
+
+def test_error_log_and_error_summary_helpers_cover_edge_cases(tmp_path):
+    with ErrorLog(None) as disabled_log:
+        disabled_log({"ignored": True})
+
+    log_path = tmp_path / "nested" / "errors.jsonl"
+    with ErrorLog(str(log_path)) as error_log:
+        error_log({"b": "中文", "a": 1})
+    assert json.loads(log_path.read_text(encoding="utf-8")) == {"a": 1, "b": "中文"}
+
+    messages: list[object] = ["non-dict-message"]
+    messages.extend({"role": "user", "content": f"q-{index}"} for index in range(10))
+    messages.extend({"role": "assistant", "content": "x" * 300} for _ in range(9))
+    messages.append(
+        {
+            "role": "tool",
+            "name": "calc",
+            "content": "tool-output",
+            "reasoning_content": "r" * 300,
+            "tool_calls": [{"function": {"name": "noop", "arguments": {}}}],
+        }
+    )
+    summary = sft_binidx._summarize_record_for_error({"messages": messages, "tools": [{}]})
+    assert summary["message_count"] == len(messages)
+    assert summary["roles"][0] == "str"
+    assert summary["tools_count"] == 1
+    assert any(message["role"] == "<omitted>" for message in summary["messages"])
+    assert summary["messages"][0]["content_preview"] == "non-dict-message"
+    assert summary["messages"][-1]["name"] == "calc"
+    assert summary["messages"][-1]["reasoning_content_preview"].endswith("...<truncated>")
+
+    source = JsonlSourceLine(text="{bad json", source_path="broken.jsonl", line_number=5)
+    parse_event = sft_binidx._source_error_event(source, json.JSONDecodeError("bad", "{", 0))
+    assert parse_event["raw_line_preview"] == "{bad json"
+    assert parse_event["source_text"] == "{bad json"
+
+    generic_events = []
+    sft_binidx._emit_exception_error(generic_events.append, RuntimeError("boom"), source=source)
+    assert generic_events[0]["error_type"] == "RuntimeError"
+    assert generic_events[0]["source_path"] == "broken.jsonl"
+
+    sft_binidx._emit_exception_error(None, RuntimeError("ignored"), source=source)
+
+
 def test_build_binidx_dataset_rejects_invalid_worker_count(tmp_path):
     input_path = tmp_path / "sample.jsonl"
     input_path.write_text(
@@ -1834,6 +1954,44 @@ def test_cli_main_can_disable_progress_bar(tmp_path):
     assert stderr.getvalue() == ""
 
 
+def test_cli_main_writes_error_log_with_full_record(tmp_path):
+    record = {
+        "messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "reasoning_content": "CLI 错误日志", "content": "答案"},
+        ]
+    }
+    input_path = tmp_path / "cli_error_log.jsonl"
+    input_path.write_text(json.dumps(record, ensure_ascii=False) + "\n", encoding="utf-8")
+    output_prefix = tmp_path / "cli_error_log_out"
+    error_log = tmp_path / "errors.jsonl"
+
+    with pytest.raises(ValueError, match=r"cli_error_log\.jsonl:1"):
+        make_sft_binidx_main(
+            [
+                str(input_path),
+                "--out-prefix",
+                str(output_prefix),
+                "--vocab",
+                str(VOCAB_PATH),
+                "--chat-template",
+                str(TEMPLATE_PATH),
+                "--pack-length",
+                "128",
+                "--no-progress",
+                "--error-log",
+                str(error_log),
+            ]
+        )
+
+    events = [json.loads(line) for line in error_log.read_text(encoding="utf-8").splitlines()]
+    assert len(events) == 1
+    assert events[0]["source_path"] == str(input_path)
+    assert events[0]["line_number"] == 1
+    assert events[0]["record"] == record
+    assert events[0]["record_summary"]["messages"][-1]["reasoning_content_preview"] == "CLI 错误日志"
+
+
 def test_progress_bar_formats_unknown_total_group_and_shortened_paths():
     stream = io.StringIO()
     progress = ProgressBar(interval=0, stream=stream)
@@ -1895,6 +2053,7 @@ def test_arg_parser_defaults_and_overrides():
     assert args.pad_length is None
     assert args.progress is True
     assert args.progress_interval == 0.2
+    assert args.error_log is None
 
     overridden = parser.parse_args(
         [
@@ -1931,6 +2090,8 @@ def test_arg_parser_defaults_and_overrides():
             "--no-progress",
             "--progress-interval",
             "1.5",
+            "--error-log",
+            "errors.jsonl",
         ]
     )
     assert overridden.input_jsonl == ["sample.jsonl", "sample2.jsonl"]
@@ -1954,6 +2115,7 @@ def test_arg_parser_defaults_and_overrides():
     assert overridden.shuffle is False
     assert overridden.progress is False
     assert overridden.progress_interval == 1.5
+    assert overridden.error_log == "errors.jsonl"
 
 
 def test_cli_main_rejects_ambiguous_pack_and_pad_flags(tmp_path):

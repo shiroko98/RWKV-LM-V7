@@ -130,8 +130,19 @@ def _train_py_command(
     ctx_len: int,
     epoch_steps: int,
     epoch_count: int,
+    micro_bsz: int = 1,
+    accumulate_grad_batches: int | None = None,
+    devices: int | str | None = None,
+    strategy: str | None = None,
     extra_args: list[str] | None = None,
 ) -> list[str]:
+    if accumulate_grad_batches is None:
+        accumulate_grad_batches = int(os.environ.get("RWKV_SFT_SMOKE_ACCUMULATE_GRAD_BATCHES", "1"))
+    if devices is None:
+        devices = os.environ.get("RWKV_SFT_SMOKE_DEVICES", "1")
+    if strategy is None:
+        strategy = os.environ.get("RWKV_SFT_SMOKE_STRATEGY", "deepspeed_stage_2")
+
     command = [
         sys.executable,
         str(ROOT / "train.py"),
@@ -152,9 +163,9 @@ def _train_py_command(
         "--epoch_count",
         str(epoch_count),
         "--micro_bsz",
-        "1",
+        str(micro_bsz),
         "--accumulate_grad_batches",
-        os.environ.get("RWKV_SFT_SMOKE_ACCUMULATE_GRAD_BATCHES", "1"),
+        str(accumulate_grad_batches),
         "--vocab_size",
         str(dims["vocab_size"]),
         "--n_layer",
@@ -188,11 +199,11 @@ def _train_py_command(
         "--accelerator",
         "gpu",
         "--devices",
-        os.environ.get("RWKV_SFT_SMOKE_DEVICES", "1"),
+        str(devices),
         "--precision",
         "bf16",
         "--strategy",
-        os.environ.get("RWKV_SFT_SMOKE_STRATEGY", "deepspeed_stage_2"),
+        str(strategy),
         "--grad_cp",
         os.environ.get("RWKV_SFT_SMOKE_GRAD_CP", "1"),
         "--enable_progress_bar",
@@ -201,6 +212,16 @@ def _train_py_command(
     if extra_args:
         command.extend(extra_args)
     return command
+
+
+def _read_train_log_epoch_loss(proj_dir: Path) -> float:
+    log_path = proj_dir / "train_log.txt"
+    assert log_path.is_file(), f"missing train log: {log_path}"
+    lines = [line.strip() for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert lines, f"empty train log: {log_path}"
+    parts = lines[-1].split()
+    assert len(parts) >= 2, f"unexpected train log line: {lines[-1]}"
+    return float(parts[1])
 
 
 def _run_train_py(command: list[str], label: str) -> str:
@@ -432,6 +453,92 @@ def test_train_py_sft_cuda_one_step(tmp_path):
     _run_train_py(command, "train.py SFT CUDA smoke")
 
     assert (proj_dir / "train_log.txt").is_file()
+
+
+@pytest.mark.cuda
+@pytest.mark.slow
+def test_train_py_sft_deepspeed_accumulation_loss_matches_large_micro_batch(tmp_path):
+    model_path = _require_cuda_smoke("RWKV_RUN_TRAIN_PY_SFT_DP_ZERO_ACCUM_EQUIV_SMOKE")
+    pad_length = int(os.environ.get("RWKV_SFT_DP_ZERO_ACCUM_EQUIV_PAD_LENGTH", os.environ.get("RWKV_SFT_SMOKE_PAD_LENGTH", "257")))
+    ctx_len = pad_length - 1
+    assert ctx_len > 0 and ctx_len % 16 == 0, "ctx_len must be positive and divisible by the RWKV7 chunk length 16"
+
+    devices = int(os.environ.get("RWKV_SFT_SMOKE_DEVICES", "2"))
+    strategy = os.environ.get("RWKV_SFT_SMOKE_STRATEGY", "deepspeed_stage_3_offload")
+    if devices < 2:
+        pytest.skip("DP/ZeRO accumulation equivalence smoke requires RWKV_SFT_SMOKE_DEVICES >= 2")
+    if torch.cuda.device_count() < devices:
+        pytest.skip(f"only {torch.cuda.device_count()} CUDA device(s) visible, need {devices}")
+    if "deepspeed" not in strategy:
+        pytest.skip("DP/ZeRO accumulation equivalence smoke requires a DeepSpeed strategy")
+
+    state = _load_state_dict(model_path)
+    dims = _infer_rwkv7_dims(state)
+    prefix = _build_accum_equiv_sft_binidx(tmp_path, pad_length, docs=devices * 2, vocab_size=dims["vocab_size"])
+    large_proj_dir = tmp_path / "ds_large_micro_bsz"
+    accum_proj_dir = tmp_path / "ds_accum"
+
+    common_extra_args = [
+        "--epoch_save",
+        "0",
+        "--keep_last_n_checkpoints",
+        "0",
+    ]
+    large_command = _train_py_command(
+        load_model=model_path,
+        prefix=prefix,
+        proj_dir=large_proj_dir,
+        dims=dims,
+        ctx_len=ctx_len,
+        epoch_steps=1,
+        epoch_count=1,
+        micro_bsz=2,
+        accumulate_grad_batches=1,
+        devices=devices,
+        strategy=strategy,
+        extra_args=common_extra_args,
+    )
+    accum_command = _train_py_command(
+        load_model=model_path,
+        prefix=prefix,
+        proj_dir=accum_proj_dir,
+        dims=dims,
+        ctx_len=ctx_len,
+        epoch_steps=1,
+        epoch_count=1,
+        micro_bsz=1,
+        accumulate_grad_batches=2,
+        devices=devices,
+        strategy=strategy,
+        extra_args=common_extra_args,
+    )
+
+    _run_train_py(large_command, "train.py SFT DeepSpeed large micro-batch equivalence run")
+    _run_train_py(accum_command, "train.py SFT DeepSpeed accumulated micro-batch equivalence run")
+
+    large_loss = _read_train_log_epoch_loss(large_proj_dir)
+    accum_loss = _read_train_log_epoch_loss(accum_proj_dir)
+    diff = abs(large_loss - accum_loss)
+    atol = float(os.environ.get("RWKV_SFT_DP_ZERO_ACCUM_EQUIV_ATOL", "1e-2"))
+    rtol = float(os.environ.get("RWKV_SFT_DP_ZERO_ACCUM_EQUIV_RTOL", "1e-3"))
+    allowed = atol + rtol * abs(large_loss)
+    summary = {
+        "devices": devices,
+        "strategy": strategy,
+        "pad_length": pad_length,
+        "ctx_len": ctx_len,
+        "large_micro_bsz_loss": large_loss,
+        "accumulated_loss": accum_loss,
+        "loss_diff": diff,
+        "allowed_diff": allowed,
+        "large_proj_dir": str(large_proj_dir),
+        "accum_proj_dir": str(accum_proj_dir),
+    }
+    summary_file = os.environ.get("RWKV_SFT_DP_ZERO_ACCUM_EQUIV_SUMMARY_FILE", "")
+    if summary_file:
+        Path(summary_file).expanduser().write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    assert diff <= allowed, json.dumps(summary, indent=2)
 
 
 @pytest.mark.cuda

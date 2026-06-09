@@ -511,7 +511,9 @@ python train.py \
   --d_gate_lora 128 \
   --my_testing x070 \
   --lr_init 1e-5 \
-  --lr_final 1e-5 \
+  --lr_final 1e-6 \
+  --lr_wsd_decay_iters 0 \
+  --lr_wsd_decay_style cosine \
   --warmup_steps 10 \
   --weight_decay 0 \
   --accelerator gpu \
@@ -544,7 +546,9 @@ python train.py \
   --d_gate_lora 128 \
   --my_testing x070 \
   --lr_init 1e-5 \
-  --lr_final 1e-5 \
+  --lr_final 1e-6 \
+  --lr_wsd_decay_iters 0 \
+  --lr_wsd_decay_style cosine \
   --warmup_steps 10 \
   --weight_decay 0 \
   --accelerator gpu \
@@ -554,7 +558,7 @@ python train.py \
   --grad_cp 1
 ```
 
-In this generic example, `--accelerator gpu` tells Lightning to train on CUDA GPUs, and `--devices 1` means one GPU in the current node. For multi-GPU DeepSpeed on one node, set `--devices` to the GPU count, for example `--devices 8`; `train.py` will automatically relaunch itself with `torchrun` when `strategy` contains `deepspeed`, `num_nodes=1`, and `devices > 1`. In SFT scheduling, `real_bsz = num_nodes * devices * micro_bsz` is the global sample count per forward pass, and `effective_bsz = real_bsz * accumulate_grad_batches` is the sample count consumed by each optimizer step. `--my_exit_tokens` is intentionally omitted for SFT because SFT stops by `--epoch_count` or `--sft_one_pass`; `my_exit_tokens` is part of the pretraining token-limit schedule.
+In this generic example, `--accelerator gpu` tells Lightning to train on CUDA GPUs, and `--devices 1` means one GPU in the current node. For multi-GPU DeepSpeed on one node, set `--devices` to the GPU count, for example `--devices 8`; `train.py` will automatically relaunch itself with `torchrun` when `strategy` contains `deepspeed`, `num_nodes=1`, and `devices > 1`. In SFT scheduling, `real_bsz = num_nodes * devices * micro_bsz` is the global sample count per forward pass, and `effective_bsz = real_bsz * accumulate_grad_batches` is the sample count consumed by each optimizer step. `--my_exit_tokens` is intentionally omitted for SFT because SFT stops by `--epoch_count` or `--sft_one_pass`; `my_exit_tokens` is part of the pretraining token-limit schedule. `--lr_wsd_decay_iters 0` disables the SFT-specific final decay, so LR stays at `lr_init` after warmup. Set a positive value, for example `--lr_wsd_decay_iters 1000 --lr_wsd_decay_style cosine`, to decay from `lr_init` to `lr_final` over the final 1000 optimizer steps. `lr_wsd_decay_style` supports `none`, `linear`, and `cosine`.
 
 Training samples use next-token labels, so the dataloader needs `ctx_len + 1` token ids per SFT document. A shorter document is padded in memory with `--sft_pad_token_id` and mask `0`; a longer document raises an error. For predictable fixed-length training, build data with `--ctx-len CTX_LEN --pack` or `--ctx-len CTX_LEN --pad`; preprocessing writes `CTX_LEN + 1` token documents, then train with `--ctx_len CTX_LEN`. For RWKV7 x070, keep `ctx_len` divisible by 16.
 
@@ -571,6 +575,7 @@ SFT masked-training implementation:
 6. `src/model.py::training_step` dispatches by batch shape. Pretraining batches `(x, y)` keep the existing fused CE path. SFT batches `(x, y, loss_mask)` use `src/sft_loss.py::masked_cross_entropy`.
 7. `masked_cross_entropy` computes per-token CE, averages only positions with `loss_mask=1`, and returns a differentiable zero loss if the mask is empty.
 8. Gradient accumulation is executed by Lightning through `--accumulate_grad_batches`; the SFT dataset uses the same value for epoch length, full-pass step calculation, and step-checkpoint mid-epoch resume offsets. Resuming from `rwkv-step-N.pth` skips `N * accumulate_grad_batches` micro-batches, not just `N` micro-batches.
+9. SFT LR defaults to warmup-only scheduling and then stays at `lr_init`. When `--lr_wsd_decay_iters K` is enabled, the scheduler uses `total_steps = epoch_steps * epoch_count`, finds the final `K` optimizer steps, and decays from `lr_init` to `lr_final` using `--lr_wsd_decay_style linear|cosine`. This SFT WSD schedule is independent from `my_exit_tokens` and does not trigger the pretraining token-limit exit path.
 
 Validation coverage:
 
@@ -661,6 +666,8 @@ STRATEGY=deepspeed_stage_3_offload \
 GRAD_CP=1 \
 LR_INIT=1e-5 \
 LR_FINAL=1e-6 \
+LR_WSD_DECAY_ITERS=1000 \
+LR_WSD_DECAY_STYLE=cosine \
 WARMUP_STEPS=10 \
 EPOCH_SAVE=1 \
 SAVE_EVERY_N_STEPS=0 \
@@ -685,6 +692,8 @@ STRATEGY=deepspeed_stage_3_offload \
 GRAD_CP=1 \
 LR_INIT=1e-5 \
 LR_FINAL=1e-6 \
+LR_WSD_DECAY_ITERS=1000 \
+LR_WSD_DECAY_STYLE=cosine \
 WARMUP_STEPS=10 \
 EPOCH_SAVE=1 \
 SAVE_EVERY_N_STEPS=0 \
@@ -705,7 +714,7 @@ Key parameters:
 - `SFT_ONE_PASS`: set to `1` to let `train.py` read `DATA_FILE.idx` and override the schedule with `epoch_steps=ceil(num_documents / effective_bsz)` and `epoch_count=1`. This is the low-friction option when you want exactly one full pass. Direct `train.py` usage may omit `--epoch_steps/--epoch_count`; this launcher still passes integer placeholders, but you do not need to care about their defaults in one-pass mode.
 - `GRAD_CP`: activation checkpointing. `1` enables block-level checkpointing to save VRAM; `0` disables it and is faster if memory allows.
 - `STRATEGY`: defaults to `deepspeed_stage_3_offload` for lower VRAM. Use `deepspeed_stage_3` for pure ZeRO-3 if memory allows.
-- `LR_INIT`, `LR_FINAL`, `WARMUP_STEPS`, `WEIGHT_DECAY`: SFT learning-rate schedule and regularization.
+- `LR_INIT`, `LR_FINAL`, `WARMUP_STEPS`, `WEIGHT_DECAY`: SFT learning-rate schedule and regularization. With the default `LR_WSD_DECAY_ITERS=0`, LR stays at `LR_INIT` after warmup. Set `LR_WSD_DECAY_ITERS=K` to decay over the final `K` optimizer steps to `LR_FINAL` with `LR_WSD_DECAY_STYLE=cosine|linear`.
 - `EPOCH_SAVE`, `SAVE_EVERY_N_STEPS`, `KEEP_LAST_N_CHECKPOINTS`: checkpoint cadence and retention.
 - `PROJ_DIR`: output directory for logs and checkpoints.
 - `WANDB_PROJECT`: empty disables wandb; a non-empty value enables logging under that project.

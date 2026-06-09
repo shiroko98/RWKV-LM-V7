@@ -63,6 +63,8 @@ MICRO_BSZ="${MICRO_BSZ:-1}"
 ACCUMULATE_GRAD_BATCHES="${ACCUMULATE_GRAD_BATCHES:-1}"
 LR_INIT="${LR_INIT:-1e-5}"
 LR_FINAL="${LR_FINAL:-1e-6}"
+LR_WSD_DECAY_ITERS="${LR_WSD_DECAY_ITERS:-0}"
+LR_WSD_DECAY_STYLE="${LR_WSD_DECAY_STYLE:-cosine}"
 WARMUP_STEPS="${WARMUP_STEPS:-10}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0}"
 GRAD_CP="${GRAD_CP:-1}"
@@ -110,7 +112,7 @@ python train.py --load_model "$LOAD_MODEL" --wandb "${WANDB_PROJECT:-}" --proj_d
  --sft_one_pass "$SFT_ONE_PASS" \
  --data_file "$DATA_FILE" --magic_prime 0 \
  --num_nodes "$N_NODE" --micro_bsz "$MICRO_BSZ" --accumulate_grad_batches "$ACCUMULATE_GRAD_BATCHES" --n_layer "$N_LAYER" --n_embd "$N_EMBD" --dim_ffn "$DIM_FFN" --kernel "$KERNEL" \
- --lr_init "$LR_INIT" --lr_final "$LR_FINAL" --warmup_steps "$WARMUP_STEPS" --beta1 0.9 --beta2 0.99 --adam_eps 1e-18 \
+ --lr_init "$LR_INIT" --lr_final "$LR_FINAL" --lr_wsd_decay_iters "$LR_WSD_DECAY_ITERS" --lr_wsd_decay_style "$LR_WSD_DECAY_STYLE" --warmup_steps "$WARMUP_STEPS" --beta1 0.9 --beta2 0.99 --adam_eps 1e-18 \
  --data_type "sft_binidx" --vocab_size "$VOCAB_SIZE" \
  --weight_decay "$WEIGHT_DECAY" --epoch_save "$EPOCH_SAVE" --save_every_n_steps "$SAVE_EVERY_N_STEPS" --keep_last_n_checkpoints "$KEEP_LAST_N_CHECKPOINTS" \
  --head_size "$HEAD_SIZE" --head_chunk "$HEAD_CHUNK" \

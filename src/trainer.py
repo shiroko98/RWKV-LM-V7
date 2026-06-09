@@ -3,6 +3,7 @@ import torch
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
+from src.lr_schedule import compute_sft_wsd_lr, sft_wsd_decay_enabled
 
 NUMBERED_CKPT_PATTERN = re.compile(r"^rwkv(?:-step)?-(\d+)\.pth$")
 
@@ -75,6 +76,7 @@ def save_train_checkpoint(args, trainer, pl_module, file_name):
     if is_deepspeed_strategy(args.strategy):
         trainer.strategy.barrier()
 
+
 class train_callback(pl.Callback):
     def __init__(self, args):
         super().__init__()
@@ -120,9 +122,9 @@ class train_callback(pl.Callback):
 
         # LR schedule
         w_step = args.warmup_steps
-        lr = args.lr_init
+        lr = compute_sft_wsd_lr(args, trainer.global_step)
 
-        if args.my_exit_tokens != 0: # cosine decay
+        if not sft_wsd_decay_enabled(args) and args.my_exit_tokens != 0: # cosine decay
             step_bsz = getattr(args, "effective_bsz", args.real_bsz)
             real_tokens = real_step * args.ctx_len * step_bsz
             warmup_tokens = w_step * args.ctx_len * step_bsz

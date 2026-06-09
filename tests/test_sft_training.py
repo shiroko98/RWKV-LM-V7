@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
 
 import train
 from src import dataset as dataset_mod
+from src import lr_schedule
 from src import trainer as trainer_mod
 from src.sft_binidx import EncodedDocument, write_documents
 from src.sft_loss import masked_cross_entropy
@@ -379,6 +380,7 @@ def test_checkpoint_path_helpers_handle_empty_regular_and_unreadable_paths(tmp_p
 def test_train_callback_uses_lr_init_when_exit_tokens_disabled(tmp_path):
     callback = trainer_mod.train_callback(
         SimpleNamespace(
+            data_type="sft_binidx",
             strategy="",
             proj_dir=str(tmp_path),
             wandb="",
@@ -392,6 +394,8 @@ def test_train_callback_uses_lr_init_when_exit_tokens_disabled(tmp_path):
             real_bsz=1,
             lr_init=2e-4,
             lr_final=1e-5,
+            lr_wsd_decay_iters=0,
+            lr_wsd_decay_style="cosine",
             weight_decay=0.0,
         )
     )
@@ -407,4 +411,111 @@ def test_train_callback_uses_lr_init_when_exit_tokens_disabled(tmp_path):
 
     assert trainer.my_lr == pytest.approx(2e-4)
     assert trainer.optimizers[0].param_groups[0]["lr"] == pytest.approx(2e-4)
+    trainer.my_log.close()
+
+
+def test_sft_wsd_lr_schedule_supports_cosine_linear_and_default():
+    args = SimpleNamespace(
+        data_type="sft_binidx",
+        epoch_begin=0,
+        epoch_steps=10,
+        epoch_count=1,
+        lr_init=1e-4,
+        lr_final=1e-5,
+        lr_wsd_decay_iters=4,
+        lr_wsd_decay_style="cosine",
+    )
+
+    assert lr_schedule.compute_sft_wsd_lr(args, 0) == pytest.approx(1e-4)
+    assert lr_schedule.compute_sft_wsd_lr(args, 5) == pytest.approx(1e-4)
+    assert lr_schedule.compute_sft_wsd_lr(args, 6) == pytest.approx(1e-4)
+    assert lr_schedule.compute_sft_wsd_lr(args, 9) == pytest.approx(1e-5)
+
+    args.epoch_begin = 3
+    assert lr_schedule.compute_sft_wsd_lr(args, 9) == pytest.approx(1e-5)
+    args.epoch_begin = 0
+
+    args.lr_wsd_decay_style = "linear"
+    assert lr_schedule.compute_sft_wsd_lr(args, 8) == pytest.approx(4e-5)
+
+    args.lr_wsd_decay_style = "none"
+    assert lr_schedule.compute_sft_wsd_lr(args, 9) == pytest.approx(1e-4)
+
+    args.data_type = "binidx"
+    args.lr_wsd_decay_style = "cosine"
+    assert lr_schedule.compute_sft_wsd_lr(args, 9) == pytest.approx(1e-4)
+
+
+def test_sft_wsd_lr_schedule_validates_inputs():
+    args = SimpleNamespace(
+        data_type="sft_binidx",
+        epoch_begin=0,
+        epoch_steps=10,
+        epoch_count=1,
+        lr_init=1e-4,
+        lr_final=1e-5,
+        lr_wsd_decay_iters=-1,
+        lr_wsd_decay_style="cosine",
+    )
+    with pytest.raises(ValueError, match="lr_wsd_decay_iters"):
+        lr_schedule.compute_sft_wsd_lr(args, 0)
+
+    args.lr_wsd_decay_iters = 2
+    args.lr_wsd_decay_style = "bad"
+    with pytest.raises(ValueError, match="lr_wsd_decay_style"):
+        lr_schedule.compute_sft_wsd_lr(args, 0)
+
+    args.lr_wsd_decay_iters = 2
+    args.lr_wsd_decay_style = "cosine"
+    args.epoch_steps = 0
+    with pytest.raises(ValueError, match="positive epoch_steps"):
+        lr_schedule.compute_sft_wsd_lr(args, 0)
+
+
+def test_train_callback_applies_sft_wsd_lr_with_group_scale_and_warmup(tmp_path):
+    callback = trainer_mod.train_callback(
+        SimpleNamespace(
+            data_type="sft_binidx",
+            strategy="",
+            proj_dir=str(tmp_path),
+            wandb="",
+            my_timestamp="2026-06-09-12-00-00",
+            run_name="sft-wsd-lr-test",
+            epoch_begin=0,
+            epoch_steps=10,
+            epoch_count=1,
+            warmup_steps=10,
+            my_exit_tokens=0,
+            ctx_len=16,
+            real_bsz=1,
+            lr_init=1e-4,
+            lr_final=1e-5,
+            lr_wsd_decay_iters=10,
+            lr_wsd_decay_style="linear",
+            weight_decay=0.01,
+        )
+    )
+
+    trainer = SimpleNamespace(
+        global_step=5,
+        is_global_zero=True,
+        strategy=SimpleNamespace(config={}),
+        optimizers=[
+            SimpleNamespace(
+                param_groups=[
+                    {"weight_decay": 0.01, "my_lr_scale": 1.0},
+                    {"weight_decay": 0.0, "my_lr_scale": 2.0},
+                ]
+            )
+        ],
+    )
+
+    callback.on_train_batch_start(trainer, object(), None, 0)
+
+    expected_decay_lr = 1e-4 + (1e-5 - 1e-4) * (5 / 9)
+    expected_lr = expected_decay_lr * (0.01 + 0.99 * 5 / 10)
+    assert trainer.my_lr == pytest.approx(expected_lr)
+    assert trainer.optimizers[0].param_groups[0]["lr"] == pytest.approx(expected_lr)
+    assert trainer.optimizers[0].param_groups[1]["lr"] == pytest.approx(expected_lr * 2)
+    assert trainer.optimizers[0].param_groups[0]["weight_decay"] == pytest.approx(0.01)
     trainer.my_log.close()

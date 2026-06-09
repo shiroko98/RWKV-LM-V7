@@ -15,6 +15,24 @@ Validation completed
 - `git diff --check` passed with only repository line-ending warnings.
 - `git diff -- data/SFT/sample/chat_template.jinja` was empty.
 
+2026-06-09 SFT WSD LR scheduler
+
+Completed
+- Added SFT-only LR WSD final-decay knobs:
+- `--lr_wsd_decay_iters` controls how many final optimizer steps decay from `lr_init` to `lr_final`.
+- `--lr_wsd_decay_style` supports `none`, `linear`, and `cosine`.
+- Default `lr_wsd_decay_iters=0` preserves existing SFT behavior: warmup then constant `lr_init`.
+- The new SFT schedule is independent from `my_exit_tokens` and does not trigger the pretraining token-limit exit path.
+- Wired `LR_WSD_DECAY_ITERS` and `LR_WSD_DECAY_STYLE` into `run_13b_sft_zero3_offload.sh`.
+- Updated README / README_CN SFT examples and 13.3B launch commands.
+
+Validation completed
+- `conda run -n model python -m pytest -q tests/test_sft_training.py tests/test_deepspeed_checkpointing.py --cov=src.lr_schedule --cov=train --cov=src.dataset --cov=src.sft_loss --cov-report=term-missing` -> 41 passed, total 99%, `src.lr_schedule.py` 100%.
+- `conda run -n model python -m pytest -q` -> 132 passed, 6 skipped.
+- `bash -n run_13b_sft_zero3_offload.sh` passed.
+- `git diff --check` passed with only repository line-ending warnings.
+- `git diff -- data/SFT/sample/chat_template.jinja` was empty.
+
 2026-06-08 SFT best-fit packing shard groups
 
 Completed

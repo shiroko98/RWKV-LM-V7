@@ -314,7 +314,9 @@ python train.py \
   --d_gate_lora 128 \
   --my_testing x070 \
   --lr_init 1e-5 \
-  --lr_final 1e-5 \
+  --lr_final 1e-6 \
+  --lr_wsd_decay_iters 0 \
+  --lr_wsd_decay_style cosine \
   --warmup_steps 10 \
   --weight_decay 0 \
   --accelerator gpu \
@@ -347,7 +349,9 @@ python train.py \
   --d_gate_lora 128 \
   --my_testing x070 \
   --lr_init 1e-5 \
-  --lr_final 1e-5 \
+  --lr_final 1e-6 \
+  --lr_wsd_decay_iters 0 \
+  --lr_wsd_decay_style cosine \
   --warmup_steps 10 \
   --weight_decay 0 \
   --accelerator gpu \
@@ -357,7 +361,7 @@ python train.py \
   --grad_cp 1
 ```
 
-这个通用示例里，`--accelerator gpu` 表示用 CUDA GPU 训练，`--devices 1` 表示当前节点使用 1 张 GPU。如果要在单节点做多卡 DeepSpeed，把 `--devices` 改成 GPU 数量，比如 `--devices 8`；当 `strategy` 包含 `deepspeed`、`num_nodes=1` 且 `devices > 1` 时，`train.py` 会自动用 `torchrun` 重启多卡进程。SFT 调度里，`real_bsz = num_nodes * devices * micro_bsz` 表示每次 forward 的全局样本数，`effective_bsz = real_bsz * accumulate_grad_batches` 表示每个 optimizer step 消耗的样本数。这里故意不写 `--my_exit_tokens`，因为 SFT 由 `--epoch_count` 或 `--sft_one_pass` 控制停止；`my_exit_tokens` 是预训练 token-limit 调度的一部分。
+这个通用示例里，`--accelerator gpu` 表示用 CUDA GPU 训练，`--devices 1` 表示当前节点使用 1 张 GPU。如果要在单节点做多卡 DeepSpeed，把 `--devices` 改成 GPU 数量，比如 `--devices 8`；当 `strategy` 包含 `deepspeed`、`num_nodes=1` 且 `devices > 1` 时，`train.py` 会自动用 `torchrun` 重启多卡进程。SFT 调度里，`real_bsz = num_nodes * devices * micro_bsz` 表示每次 forward 的全局样本数，`effective_bsz = real_bsz * accumulate_grad_batches` 表示每个 optimizer step 消耗的样本数。这里故意不写 `--my_exit_tokens`，因为 SFT 由 `--epoch_count` 或 `--sft_one_pass` 控制停止；`my_exit_tokens` 是预训练 token-limit 调度的一部分。`--lr_wsd_decay_iters 0` 表示关闭 SFT 专用末段衰减，warmup 后保持 `lr_init`；如果设为正数，例如 `--lr_wsd_decay_iters 1000 --lr_wsd_decay_style cosine`，训练最后 1000 个 optimizer step 会按 cosine 从 `lr_init` 衰减到 `lr_final`。`lr_wsd_decay_style` 支持 `none`、`linear`、`cosine`。
 
 训练端使用 next-token label，所以每个 SFT document 需要提供 `ctx_len + 1` 个 token。document 比这个短时，dataloader 会在内存里用 `--sft_pad_token_id` padding，并把 padding mask 设为 `0`；document 更长时会直接报错。为了让训练长度稳定，建议预处理时使用 `--ctx-len CTX_LEN --pack` 或 `--ctx-len CTX_LEN --pad`，预处理会自动写出 `CTX_LEN + 1` 个 token，训练时再设置 `--ctx_len CTX_LEN`。RWKV7 x070 的 `ctx_len` 需要能被 16 整除。
 
@@ -374,6 +378,7 @@ SFT mask 训练的实现框架：
 6. `src/model.py` 的 `training_step` 根据 batch 长度分流：普通预训练 `(x, y)` 继续走原来的 fused CE 快路径；SFT `(x, y, loss_mask)` 走 `src/sft_loss.py::masked_cross_entropy`。这样 SFT 不影响预训练性能路径。
 7. `masked_cross_entropy` 先用标准 CE 得到每个 token 的 loss，再只对 `loss_mask=1` 的位置求平均。如果一个 batch 的 mask 全为 `0`，返回可反传的 0 loss，避免除零和梯度图断裂。
 8. 梯度累计由 Lightning 的 `--accumulate_grad_batches` 执行；SFT dataset 会同步使用这个参数来计算 epoch 长度、完整数据遍历步数和 step checkpoint 的 mid-epoch 恢复偏移。也就是说，从 `rwkv-step-N.pth` 恢复时会跳过 `N * accumulate_grad_batches` 个 micro-batch，而不是只跳过 `N` 个 micro-batch。
+9. SFT 学习率默认只做 warmup，warmup 后保持 `lr_init`。启用 `--lr_wsd_decay_iters K` 后，调度器会用 `total_steps = epoch_steps * epoch_count` 定位最后 `K` 个 optimizer step，并按 `--lr_wsd_decay_style linear|cosine` 从 `lr_init` 衰减到 `lr_final`；这个 SFT WSD 调度不依赖 `my_exit_tokens`，也不会触发预训练的 token-limit 退出逻辑。
 
 测试流程和覆盖内容：
 
@@ -464,6 +469,8 @@ STRATEGY=deepspeed_stage_3_offload \
 GRAD_CP=1 \
 LR_INIT=1e-5 \
 LR_FINAL=1e-6 \
+LR_WSD_DECAY_ITERS=1000 \
+LR_WSD_DECAY_STYLE=cosine \
 WARMUP_STEPS=10 \
 EPOCH_SAVE=1 \
 SAVE_EVERY_N_STEPS=0 \
@@ -488,6 +495,8 @@ STRATEGY=deepspeed_stage_3_offload \
 GRAD_CP=1 \
 LR_INIT=1e-5 \
 LR_FINAL=1e-6 \
+LR_WSD_DECAY_ITERS=1000 \
+LR_WSD_DECAY_STYLE=cosine \
 WARMUP_STEPS=10 \
 EPOCH_SAVE=1 \
 SAVE_EVERY_N_STEPS=0 \
@@ -508,7 +517,7 @@ bash run_13b_sft_zero3_offload.sh
 - `SFT_ONE_PASS`：设为 `1` 时，脚本仍会传入 `EPOCH_STEPS/EPOCH_COUNT` 作为整数占位值，但 `train.py` 会自动读取 `DATA_FILE.idx` 的 document 数并覆盖为 `ceil(num_documents / effective_bsz)` 和 `epoch_count=1`，适合只想完整跑一遍数据的场景。直接调用 `train.py` 时可以省略 `--epoch_steps/--epoch_count`；通过这个脚本调用时不用管它们的默认值。
 - `GRAD_CP`：激活检查点。`1` 表示对 block 开启 checkpointing，省显存但更慢；显存足够时可设 `0`。
 - `STRATEGY`：默认 `deepspeed_stage_3_offload`，更省显存；显存足够时可以用 `deepspeed_stage_3` 做纯 ZeRO-3。
-- `LR_INIT`、`LR_FINAL`、`WARMUP_STEPS`、`WEIGHT_DECAY`：SFT 学习率计划和正则参数。
+- `LR_INIT`、`LR_FINAL`、`WARMUP_STEPS`、`WEIGHT_DECAY`：SFT 学习率计划和正则参数。默认 `LR_WSD_DECAY_ITERS=0` 时，warmup 后保持 `LR_INIT`；设置 `LR_WSD_DECAY_ITERS=K` 后，最后 `K` 个 optimizer step 会按 `LR_WSD_DECAY_STYLE=cosine|linear` 衰减到 `LR_FINAL`。
 - `EPOCH_SAVE`、`SAVE_EVERY_N_STEPS`、`KEEP_LAST_N_CHECKPOINTS`：checkpoint 保存频率和保留数量。
 - `PROJ_DIR`：训练日志和 checkpoint 输出目录。
 - `WANDB_PROJECT`：空字符串表示不启用 wandb；非空则记录到对应项目。

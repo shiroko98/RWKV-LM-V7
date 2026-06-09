@@ -182,6 +182,8 @@ if __name__ == "__main__":  # pragma: no cover
 
     parser.add_argument("--lr_init", default=6e-4, type=float)  # 6e-4 for L12-D768, 4e-4 for L24-D1024, 3e-4 for L24-D2048
     parser.add_argument("--lr_final", default=1e-5, type=float)
+    parser.add_argument("--lr_wsd_decay_iters", default=0, type=int)  # SFT only: decay over the final N optimizer steps
+    parser.add_argument("--lr_wsd_decay_style", default="cosine", type=str)  # SFT only: none, linear, cosine
     parser.add_argument("--warmup_steps", default=-1, type=int)  # try 10 if you load a model
     parser.add_argument("--beta1", default=0.9, type=float)
     parser.add_argument("--beta2", default=0.99, type=float)

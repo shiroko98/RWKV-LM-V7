@@ -188,6 +188,7 @@ def test_resume_smoke_defaults_require_real_restore_and_progress_markers():
 def test_train_callback_initializes_logging_state_when_resuming_mid_run(tmp_path: Path):
     callback = trainer_mod.train_callback(
         SimpleNamespace(
+            data_type="binidx",
             strategy="deepspeed_stage_3_offload",
             proj_dir=str(tmp_path),
             wandb="",
@@ -201,6 +202,8 @@ def test_train_callback_initializes_logging_state_when_resuming_mid_run(tmp_path
             real_bsz=8,
             lr_init=1e-4,
             lr_final=1e-5,
+            lr_wsd_decay_iters=0,
+            lr_wsd_decay_style="cosine",
             weight_decay=0.01,
             magic_prime=0,
             save_every_n_steps=0,

@@ -484,6 +484,8 @@ Use `--data_type sft_binidx` when training on the SFT preprocessing output. `--d
 
 For SFT, `--epoch_steps` and `--epoch_count` are user-controlled. `epoch_steps` is the number of optimizer steps per epoch, and `epoch_count` is the number of epochs to run. This is different from pretraining `binidx`, where `train.py` keeps the historical magic-prime schedule.
 
+To run exactly one full pass over the SFT binidx dataset, set `--sft_one_pass 1`. The trainer reads only `DATA_FILE.idx` to count documents, computes `epoch_steps = ceil(num_documents / effective_bsz)`, and sets `epoch_count=1`; `effective_bsz = num_nodes * devices * micro_bsz * accumulate_grad_batches`. If the rounded-up final step needs extra samples, the dataset wraps deterministically from the beginning, and the startup log reports the repeated tail sample count.
+
 ```bash
 python train.py \
   --load_model model/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
@@ -493,6 +495,7 @@ python train.py \
   --ctx_len 4096 \
   --epoch_steps 1000 \
   --epoch_count 1 \
+  --sft_one_pass 0 \
   --micro_bsz 1 \
   --accumulate_grad_batches 1 \
   --vocab_size 65536 \
@@ -526,6 +529,7 @@ SFT masked-training implementation:
 
 1. Offline preprocessing writes two aligned binidx datasets. `PREFIX.bin/.idx` stores token ids, while `PREFIX.mask.bin/.idx` stores the same-length `0/1` loss mask.
 2. `train.py` enters SFT mode with `--data_type sft_binidx`. This mode does not use the pretraining magic-prime schedule. It preserves user-provided `--epoch_steps` and `--epoch_count`, and sets Lightning `max_epochs` to `epoch_count`. When `--accumulate_grad_batches G` is enabled, `epoch_steps` still means optimizer steps; the dataloader provides `epoch_steps * G` micro-batches per epoch.
+   When `--sft_one_pass 1` is enabled, this mode overrides manual `epoch_steps/epoch_count` with the automatically computed one-pass schedule and `epoch_count=1`.
 3. `src/dataset.py::MyDataset` loads the token prefix from `--data_file` and the mask prefix from `--data_file.mask` by default. `--sft_mask_file` can override the mask prefix. Initialization validates matching document counts and identical per-document sizes.
 4. Each SFT document may contain at most `ctx_len + 1` tokens. Short documents are padded in memory with `--sft_pad_token_id` and mask `0`; long documents raise an error instead of being silently truncated.
 5. The dataset returns `(x, y, loss_mask)`: `x = token_ids[:-1]`, `y = token_ids[1:]`, and `loss_mask = raw_mask[1:]`. The mask is shifted so it marks whether each next-token target contributes to loss.
@@ -612,6 +616,7 @@ MICRO_BSZ=1 \
 ACCUMULATE_GRAD_BATCHES=4 \
 EPOCH_STEPS=12500 \
 EPOCH_COUNT=1 \
+SFT_ONE_PASS=0 \
 STRATEGY=deepspeed_stage_3_offload \
 GRAD_CP=1 \
 LR_INIT=1e-5 \
@@ -633,6 +638,7 @@ Key parameters:
 - `ACCUMULATE_GRAD_BATCHES`: gradient accumulation steps. SFT commonly uses this to increase effective batch size when `MICRO_BSZ=1`; `effective_bsz = real_bsz * ACCUMULATE_GRAD_BATCHES`.
 - `EPOCH_STEPS`: optimizer steps per SFT epoch. For one full pass, use `ceil(num_sft_documents / effective_bsz)`.
 - `EPOCH_COUNT`: number of SFT passes. For `N` passes over the SFT data, keep `EPOCH_STEPS` from the one-pass formula and set `EPOCH_COUNT=N`.
+- `SFT_ONE_PASS`: set to `1` to let `train.py` read `DATA_FILE.idx` and override the schedule with `epoch_steps=ceil(num_documents / effective_bsz)` and `epoch_count=1`. This is the low-friction option when you want exactly one full pass.
 - `GRAD_CP`: activation checkpointing. `1` enables block-level checkpointing to save VRAM; `0` disables it and is faster if memory allows.
 - `STRATEGY`: defaults to `deepspeed_stage_3_offload` for lower VRAM. Use `deepspeed_stage_3` for pure ZeRO-3 if memory allows.
 - `LR_INIT`, `LR_FINAL`, `WARMUP_STEPS`, `WEIGHT_DECAY`: SFT learning-rate schedule and regularization.

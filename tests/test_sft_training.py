@@ -239,7 +239,7 @@ def test_masked_cross_entropy_handles_zero_mask_and_validates_shapes():
 
 
 def test_configure_epoch_schedule_preserves_sft_steps_and_keeps_pretrain_schedule():
-    sft_args = SimpleNamespace(data_type="sft_binidx", epoch_steps=7, epoch_count=3, real_bsz=8)
+    sft_args = SimpleNamespace(data_type="sft_binidx", epoch_steps=7, epoch_count=3, real_bsz=8, sft_one_pass=0)
     train.configure_epoch_schedule(sft_args)
     assert sft_args.epoch_steps == 7
     assert sft_args.epoch_count == 3
@@ -255,6 +255,70 @@ def test_configure_epoch_schedule_preserves_sft_steps_and_keeps_pretrain_schedul
         train.configure_epoch_schedule(SimpleNamespace(data_type="sft_binidx", epoch_steps=1, epoch_count=0))
     with pytest.raises(ValueError, match="Unsupported"):
         train.configure_epoch_schedule(SimpleNamespace(data_type="utf-8"))
+
+
+def test_sft_one_pass_overrides_steps_and_epoch_count(monkeypatch):
+    args = SimpleNamespace(
+        data_type="sft_binidx",
+        data_file="dummy",
+        sft_one_pass=1,
+        epoch_steps=0,
+        epoch_count=0,
+        real_bsz=8,
+        effective_bsz=32,
+        accumulate_grad_batches=4,
+    )
+
+    train.configure_epoch_schedule(args)
+    monkeypatch.setattr(train, "count_binidx_documents", lambda prefix: 65)
+    train.configure_sft_one_pass(args)
+    train.configure_samples_per_epoch(args)
+    train.configure_training_limits(args)
+
+    assert args.epoch_steps == 3
+    assert args.epoch_count == 1
+    assert args.max_epochs == 1
+    assert args.samples_per_epoch == 96
+    assert args.sft_one_pass_documents == 65
+
+
+def test_sft_one_pass_disabled_sets_default_metadata():
+    args = SimpleNamespace(data_type="sft_binidx", sft_one_pass=0, epoch_steps=7, epoch_count=3)
+    train.configure_sft_one_pass(args)
+    assert args.sft_one_pass == 0
+    assert args.sft_one_pass_documents == 0
+    assert args.epoch_steps == 7
+    assert args.epoch_count == 3
+
+
+def test_count_binidx_documents_reads_index_only(tmp_path):
+    prefix = str(tmp_path / "count_docs")
+    write_documents(
+        prefix,
+        [
+            EncodedDocument(input_ids=[1, 2], loss_mask=[0, 1]),
+            EncodedDocument(input_ids=[3, 4], loss_mask=[0, 1]),
+            EncodedDocument(input_ids=[5, 6], loss_mask=[0, 1]),
+        ],
+    )
+
+    assert train.count_binidx_documents(prefix) == 3
+
+
+def test_sft_one_pass_rejects_unsupported_or_empty_datasets(monkeypatch):
+    with pytest.raises(ValueError, match="sft_binidx"):
+        train.configure_sft_one_pass(SimpleNamespace(data_type="binidx", sft_one_pass=1, effective_bsz=8))
+
+    with pytest.raises(ValueError, match="effective_bsz"):
+        train.configure_sft_one_pass(
+            SimpleNamespace(data_type="sft_binidx", data_file="empty", sft_one_pass=1, effective_bsz=0)
+        )
+
+    monkeypatch.setattr(train, "count_binidx_documents", lambda prefix: 0)
+    with pytest.raises(ValueError, match="at least one document"):
+        train.configure_sft_one_pass(
+            SimpleNamespace(data_type="sft_binidx", data_file="empty", sft_one_pass=1, effective_bsz=8)
+        )
 
 
 def test_configure_training_limits_stops_sft_by_epoch_count_and_preserves_pretrain_default():
@@ -291,6 +355,11 @@ def test_batch_size_helpers_track_sft_gradient_accumulation():
     train.configure_samples_per_epoch(pretrain_args)
     assert pretrain_args.effective_bsz == 8
     assert pretrain_args.samples_per_epoch == 40
+
+    none_accum_args = SimpleNamespace(data_type="sft_binidx", real_bsz=2, accumulate_grad_batches=None)
+    train.configure_batch_sizes(none_accum_args)
+    assert none_accum_args.accumulate_grad_batches == 1
+    assert none_accum_args.effective_bsz == 2
 
     with pytest.raises(ValueError, match="accumulate_grad_batches"):
         train.normalize_accumulate_grad_batches(SimpleNamespace(accumulate_grad_batches=0))

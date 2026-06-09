@@ -380,6 +380,25 @@ Validation
 - `git diff --check` -> passed with line-ending normalization warnings only.
 - `git diff -- data\SFT\sample\chat_template.jinja` -> empty.
 
+2026-06-09 SFT one-pass schedule option
+
+Completed
+- Added `--sft_one_pass` for `data_type=sft_binidx`.
+- When enabled, `train.py` reads the token binidx index to count documents, computes `epoch_steps = ceil(num_documents / effective_bsz)`, and sets `epoch_count = 1`.
+- The option is SFT-only and leaves pretrain `binidx` magic-prime scheduling unchanged.
+- Startup logs now include the SFT one-pass document count, computed steps, and repeated tail sample count caused by ceil rounding.
+- `run_13b_sft_zero3_offload.sh` now exposes `SFT_ONE_PASS`.
+- README / README_CN document the option and the 13.3B launcher usage.
+
+Validation
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_training.py --tb=short` -> 17 passed.
+- `D:\anaconda\envs\model\python.exe -m py_compile train.py tests\test_sft_training.py tests\test_sft_cuda_smoke.py` -> passed.
+- `bash -n run_13b_sft_zero3_offload.sh` -> passed.
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_training.py tests\test_deepspeed_checkpointing.py tests\test_sft_cuda_smoke.py --cov=src.dataset --cov=src.sft_loss --cov=train --cov-report=term-missing --tb=short` -> 40 passed, 6 skipped, targeted training coverage 99%.
+- `D:\anaconda\envs\model\python.exe -m pytest -q --tb=short` -> 129 passed, 6 skipped.
+- `git diff --check` -> passed with line-ending normalization warnings only.
+- `git diff -- data\SFT\sample\chat_template.jinja` -> empty.
+
 2026-06-05 SFT sample-preserving packing
 
 Completed

@@ -66,6 +66,8 @@ def configure_epoch_schedule(args):
         assert args.epoch_steps * args.real_bsz == 40320
         return
     if args.data_type == "sft_binidx":
+        if int(getattr(args, "sft_one_pass", 0) or 0):
+            return
         if args.epoch_steps <= 0:
             raise ValueError("epoch_steps must be positive for sft_binidx training.")
         if args.epoch_count <= 0:
@@ -79,6 +81,13 @@ def configure_training_limits(args):
         args.max_epochs = args.epoch_count
     else:
         args.max_epochs = -1
+
+
+def count_binidx_documents(prefix_path: str) -> int:
+    from src.binidx import MMapIndexedDataset, index_file_path
+
+    index = MMapIndexedDataset.Index(index_file_path(prefix_path))
+    return len(index)
 
 
 def normalize_accumulate_grad_batches(args):
@@ -111,6 +120,26 @@ def configure_samples_per_epoch(args):
         args.samples_per_epoch = args.epoch_steps * args.real_bsz
 
 
+def configure_sft_one_pass(args):
+    enabled = int(getattr(args, "sft_one_pass", 0) or 0)
+    args.sft_one_pass = enabled
+    args.sft_one_pass_documents = 0
+    if not enabled:
+        return
+    if args.data_type != "sft_binidx":
+        raise ValueError("--sft_one_pass only supports data_type=sft_binidx.")
+    if args.effective_bsz <= 0:
+        raise ValueError("effective_bsz must be positive for --sft_one_pass.")
+
+    document_count = count_binidx_documents(args.data_file)
+    if document_count <= 0:
+        raise ValueError("SFT token dataset must contain at least one document for --sft_one_pass.")
+
+    args.sft_one_pass_documents = document_count
+    args.epoch_steps = (document_count + args.effective_bsz - 1) // args.effective_bsz
+    args.epoch_count = 1
+
+
 if __name__ == "__main__":  # pragma: no cover
     import os
     import subprocess
@@ -138,6 +167,7 @@ if __name__ == "__main__":  # pragma: no cover
     parser.add_argument("--ctx_len", default=1024, type=int)
     parser.add_argument("--epoch_steps", default=1000, type=int)  # a mini "epoch" has [epoch_steps] steps
     parser.add_argument("--epoch_count", default=500, type=int)  # train for this many "epochs". will continue afterwards with lr = lr_final
+    parser.add_argument("--sft_one_pass", default=0, type=int)  # SFT only: auto epoch_steps=ceil(num_docs/effective_bsz), epoch_count=1
     parser.add_argument("--epoch_begin", default=0, type=int)  # if you load a model trained for x "epochs", set epoch_begin = x
     parser.add_argument("--epoch_save", default=5, type=int)  # save the model every [epoch_save] "epochs"
     parser.add_argument("--save_every_n_steps", default=0, type=int)  # save every N real steps (0 to disable)
@@ -258,6 +288,7 @@ if __name__ == "__main__":  # pragma: no cover
         os.makedirs(args.proj_dir)
 
     configure_epoch_schedule(args)
+    configure_sft_one_pass(args)
     configure_training_limits(args)
     configure_samples_per_epoch(args)
 
@@ -307,6 +338,13 @@ if __name__ == "__main__":  # pragma: no cover
 
     samples_per_epoch = args.samples_per_epoch
     tokens_per_epoch = samples_per_epoch * args.ctx_len
+    sft_one_pass_line = ""
+    if getattr(args, "sft_one_pass", 0):
+        repeated_samples = samples_per_epoch - args.sft_one_pass_documents
+        sft_one_pass_line = (
+            f"# SFT one pass = {args.sft_one_pass_documents} documents, "
+            f"ceil -> {args.epoch_steps} steps, repeated tail samples {repeated_samples}\n#\n"
+        )
     try:
         deepspeed_version = deepspeed.__version__
     except:
@@ -324,6 +362,7 @@ if __name__ == "__main__":  # pragma: no cover
 #
 # Each "epoch" = {args.epoch_steps} steps, {samples_per_epoch} samples, {tokens_per_epoch} tokens
 #
+{sft_one_pass_line}\
 # Model = {args.n_layer} n_layer, {args.n_embd} n_embd, {args.ctx_len} ctx_len
 #
 # Adam = lr {args.lr_init} to {args.lr_final}, warmup {args.warmup_steps} steps, beta {args.betas}, eps {args.adam_eps}

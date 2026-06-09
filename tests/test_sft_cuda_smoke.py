@@ -162,6 +162,8 @@ def _train_py_command(
         str(epoch_steps),
         "--epoch_count",
         str(epoch_count),
+        "--sft_one_pass",
+        "0",
         "--micro_bsz",
         str(micro_bsz),
         "--accumulate_grad_batches",

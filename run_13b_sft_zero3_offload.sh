@@ -50,6 +50,7 @@ PROJ_DIR="${PROJ_DIR:-/mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zer
 
 EPOCH_STEPS="${EPOCH_STEPS:-1000}"
 EPOCH_COUNT="${EPOCH_COUNT:-1}"
+SFT_ONE_PASS="${SFT_ONE_PASS:-0}"
 EPOCH_SAVE="${EPOCH_SAVE:-1}"
 SAVE_EVERY_N_STEPS="${SAVE_EVERY_N_STEPS:-0}"
 KEEP_LAST_N_CHECKPOINTS="${KEEP_LAST_N_CHECKPOINTS:-3}"
@@ -102,6 +103,7 @@ fi
 
 python train.py --load_model "$LOAD_MODEL" --wandb "${WANDB_PROJECT:-}" --proj_dir "$PROJ_DIR" --my_testing "$MODEL_TYPE" \
  --ctx_len "$CTX_LEN" --train_stage 0 --epoch_steps "$EPOCH_STEPS" --epoch_count "$EPOCH_COUNT" --epoch_begin "${EPOCH_BEGIN:-0}" \
+ --sft_one_pass "$SFT_ONE_PASS" \
  --data_file "$DATA_FILE" --magic_prime 0 \
  --num_nodes "$N_NODE" --micro_bsz "$MICRO_BSZ" --accumulate_grad_batches "$ACCUMULATE_GRAD_BATCHES" --n_layer "$N_LAYER" --n_embd "$N_EMBD" --dim_ffn "$DIM_FFN" --kernel "$KERNEL" \
  --lr_init "$LR_INIT" --lr_final "$LR_FINAL" --warmup_steps "$WARMUP_STEPS" --beta1 0.9 --beta2 0.99 --adam_eps 1e-18 \

@@ -287,6 +287,8 @@ python data/make_sft_binidx.py /mnt/data/datasets/sft_jsonl \
 
 在 SFT 模式下，`--epoch_steps` 和 `--epoch_count` 由用户直接控制。`epoch_steps` 表示每个 epoch 多少个 optimizer step，`epoch_count` 表示总共训练多少个 epoch。这个语义不同于预训练 `binidx`，预训练仍保留原来的 magic-prime 调度。
 
+如果想完整跑一遍 SFT binidx 数据，可以设置 `--sft_one_pass 1`。训练脚本会只读取 `DATA_FILE.idx` 的 document 数，自动计算 `epoch_steps = ceil(num_documents / effective_bsz)`，并把 `epoch_count` 设为 `1`；其中 `effective_bsz = num_nodes * devices * micro_bsz * accumulate_grad_batches`。向上取整后如果样本数不足一个完整 step，dataset 会按原有确定性顺序从开头 wrap，启动日志会打印重复的尾部样本数。
+
 ```bash
 python train.py \
   --load_model model/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
@@ -296,6 +298,7 @@ python train.py \
   --ctx_len 4096 \
   --epoch_steps 1000 \
   --epoch_count 1 \
+  --sft_one_pass 0 \
   --micro_bsz 1 \
   --accumulate_grad_batches 1 \
   --vocab_size 65536 \
@@ -329,6 +332,7 @@ SFT mask 训练的实现框架：
 
 1. 离线数据处理阶段只负责生成两套完全对齐的 binidx：主数据 `PREFIX.bin/.idx` 存 token id，sidecar `PREFIX.mask.bin/.idx` 存同长度的 `0/1` loss mask。
 2. `train.py` 通过 `--data_type sft_binidx` 进入 SFT 分支。这个分支不使用预训练的 magic-prime 调度，而是保留用户传入的 `--epoch_steps` 和 `--epoch_count`，并把 Lightning `max_epochs` 设为 `epoch_count`，所以 SFT 会按指定 epoch 数正常结束。启用 `--accumulate_grad_batches G` 时，`epoch_steps` 仍然表示 optimizer step 数；dataloader 会为每个 epoch 提供 `epoch_steps * G` 个 micro-batch。
+   如果启用 `--sft_one_pass 1`，这个分支会覆盖手写的 `epoch_steps/epoch_count`，自动设置为“完整跑一遍数据”的步数和 `epoch_count=1`。
 3. `src/dataset.py` 的 `MyDataset` 会加载 `--data_file` 指向的 token binidx，同时默认加载 `--data_file.mask`。如果你传了 `--sft_mask_file`，就用显式 mask 前缀。初始化时会检查 token 和 mask 的 document 数量、每个 document 长度必须完全一致。
 4. 每个 SFT document 最长允许 `ctx_len + 1` 个 token。短 document 会在内存中用 `--sft_pad_token_id` padding 到 `ctx_len + 1`，padding mask 始终为 `0`；长 document 直接报错，避免静默截断破坏 mask。
 5. dataloader 返回三元组 `(x, y, loss_mask)`：`x = token_ids[:-1]`，`y = token_ids[1:]`，`loss_mask = raw_mask[1:]`。mask 右移是为了和 next-token label 对齐，也就是 mask 标记的是“这个 target token 是否参与 loss”。
@@ -415,6 +419,7 @@ MICRO_BSZ=1 \
 ACCUMULATE_GRAD_BATCHES=4 \
 EPOCH_STEPS=12500 \
 EPOCH_COUNT=1 \
+SFT_ONE_PASS=0 \
 STRATEGY=deepspeed_stage_3_offload \
 GRAD_CP=1 \
 LR_INIT=1e-5 \
@@ -436,6 +441,7 @@ bash run_13b_sft_zero3_offload.sh
 - `ACCUMULATE_GRAD_BATCHES`：梯度累计步数。SFT 常用它在 `MICRO_BSZ=1` 的情况下提高有效 batch；有效 batch 为 `effective_bsz = real_bsz * ACCUMULATE_GRAD_BATCHES`。
 - `EPOCH_STEPS`：每个 SFT epoch 的 optimizer step 数。完整跑一遍建议用 `ceil(num_sft_documents / effective_bsz)`。
 - `EPOCH_COUNT`：跑几遍 SFT 数据。想跑 `N` 遍时，`EPOCH_STEPS` 按一遍数据计算，`EPOCH_COUNT=N`。
+- `SFT_ONE_PASS`：设为 `1` 时，脚本仍会传入 `EPOCH_STEPS/EPOCH_COUNT`，但 `train.py` 会自动读取 `DATA_FILE.idx` 的 document 数并覆盖为 `ceil(num_documents / effective_bsz)` 和 `epoch_count=1`，适合只想完整跑一遍数据的场景。
 - `GRAD_CP`：激活检查点。`1` 表示对 block 开启 checkpointing，省显存但更慢；显存足够时可设 `0`。
 - `STRATEGY`：默认 `deepspeed_stage_3_offload`，更省显存；显存足够时可以用 `deepspeed_stage_3` 做纯 ZeRO-3。
 - `LR_INIT`、`LR_FINAL`、`WARMUP_STEPS`、`WEIGHT_DECAY`：SFT 学习率计划和正则参数。

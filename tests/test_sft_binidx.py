@@ -878,13 +878,17 @@ def test_build_binidx_dataset_best_fit_decreasing_packs_each_jsonl_shard_then_me
     second_path = tmp_path / "second.jsonl"
     first_path.write_text("large-a\nlarge-b\n", encoding="utf-8")
     second_path.write_text("small-a\nsmall-b\ntoo-long\n", encoding="utf-8")
+    fake_vocab_path = tmp_path / "fake-vocab.txt"
+    fake_template_path = tmp_path / "fake-template.jinja"
+    fake_vocab_path.write_text("fake vocab\n", encoding="utf-8")
+    fake_template_path.write_text("fake template\n", encoding="utf-8")
     output_prefix = str(tmp_path / "merged")
 
     stats = build_binidx_dataset(
         [str(first_path), str(second_path)],
         output_prefix=output_prefix,
-        vocab_path="fake-vocab.txt",
-        template_path="fake-template.jinja",
+        vocab_path=str(fake_vocab_path),
+        template_path=str(fake_template_path),
         n_epoch=1,
         seed=123,
         pack_length=9,
@@ -952,13 +956,17 @@ def test_build_binidx_dataset_best_fit_decreasing_can_group_jsonl_shards(
     second_path = tmp_path / "second.jsonl"
     first_path.write_text("large-a\nlarge-b\n", encoding="utf-8")
     second_path.write_text("small-a\nsmall-b\n", encoding="utf-8")
+    fake_vocab_path = tmp_path / "fake-vocab.txt"
+    fake_template_path = tmp_path / "fake-template.jinja"
+    fake_vocab_path.write_text("fake vocab\n", encoding="utf-8")
+    fake_template_path.write_text("fake template\n", encoding="utf-8")
     output_prefix = str(tmp_path / "grouped")
 
     stats = build_binidx_dataset(
         [str(first_path), str(second_path)],
         output_prefix=output_prefix,
-        vocab_path="fake-vocab.txt",
-        template_path="fake-template.jinja",
+        vocab_path=str(fake_vocab_path),
+        template_path=str(fake_template_path),
         n_epoch=1,
         seed=123,
         pack_length=9,
@@ -988,6 +996,78 @@ def test_build_binidx_dataset_best_fit_decreasing_can_group_jsonl_shards(
         [1, 1, 1, 1, 1, 0, 1, 1, 1],
         [1, 1, 1, 1, 1, 0, 1, 1, 1],
     ]
+
+
+def test_build_binidx_dataset_best_fit_cache_reuses_completed_groups(tmp_path, monkeypatch):
+    class FakeTokenizer:
+        def encode(self, text):
+            if text == EOD_TOKEN:
+                return [0]
+            if text == "\n":
+                return [99]
+            raise AssertionError(f"unexpected encode call: {text!r}")
+
+    fake_documents = {
+        "large-a": EncodedDocument(input_ids=[1] * 5, loss_mask=[1] * 5),
+        "small-a": EncodedDocument(input_ids=[2] * 3, loss_mask=[1] * 3),
+    }
+
+    def fake_build_documents_from_sources(sources, **_kwargs):
+        for source in sources:
+            yield fake_documents[source.text]
+
+    monkeypatch.setattr(sft_binidx, "TRIE_TOKENIZER", lambda *_args, **_kwargs: FakeTokenizer())
+    monkeypatch.setattr(sft_binidx, "load_chat_template", lambda _path: object())
+    monkeypatch.setattr(sft_binidx, "build_documents_from_sources", fake_build_documents_from_sources)
+
+    input_path = tmp_path / "first.jsonl"
+    input_path.write_text("large-a\nsmall-a\n", encoding="utf-8")
+    fake_vocab_path = tmp_path / "fake-vocab.txt"
+    fake_template_path = tmp_path / "fake-template.jinja"
+    fake_vocab_path.write_text("fake vocab\n", encoding="utf-8")
+    fake_template_path.write_text("fake template\n", encoding="utf-8")
+    cache_dir = tmp_path / "cache"
+    first_prefix = str(tmp_path / "first_out")
+
+    first_stats = build_binidx_dataset(
+        [str(input_path)],
+        output_prefix=first_prefix,
+        vocab_path=str(fake_vocab_path),
+        template_path=str(fake_template_path),
+        n_epoch=1,
+        seed=123,
+        pack_length=9,
+        shuffle=False,
+        pack_strategy="best-fit-decreasing",
+        pack_cache_dir=str(cache_dir),
+    )
+
+    cache_files = sorted(path.name for path in cache_dir.iterdir())
+    assert any(name.endswith(".meta.json") for name in cache_files)
+
+    def fail_build_documents_from_sources(_sources, **_kwargs):
+        raise AssertionError("cached group should skip render/tokenize")
+
+    monkeypatch.setattr(sft_binidx, "build_documents_from_sources", fail_build_documents_from_sources)
+    cached_prefix = str(tmp_path / "cached_out")
+    cached_stats = build_binidx_dataset(
+        [str(input_path)],
+        output_prefix=cached_prefix,
+        vocab_path=str(fake_vocab_path),
+        template_path=str(fake_template_path),
+        n_epoch=1,
+        seed=123,
+        pack_length=9,
+        shuffle=False,
+        pack_strategy="best-fit-decreasing",
+        pack_cache_dir=str(cache_dir),
+    )
+
+    assert cached_stats["source_lines"] == first_stats["source_lines"] == 2
+    assert cached_stats["source_documents"] == first_stats["source_documents"] == 2
+    assert cached_stats["filtered_documents"] == first_stats["filtered_documents"] == 0
+    assert Path(data_file_path(cached_prefix)).read_bytes() == Path(data_file_path(first_prefix)).read_bytes()
+    assert Path(mask_file_path(cached_prefix)).read_bytes() == Path(mask_file_path(first_prefix)).read_bytes()
 
 
 def test_collect_filtered_documents_drops_too_long_samples_after_tokenization():
@@ -1439,7 +1519,7 @@ def test_build_binidx_dataset_accepts_input_directory_and_custom_output_prefix(t
         template_path=str(TEMPLATE_PATH),
         n_epoch=1,
         seed=123,
-        num_workers=2,
+        num_workers=1,
         shuffle=False,
     )
 
@@ -1571,9 +1651,10 @@ def test_build_documents_from_sources_reports_json_errors(tokenizer: TRIE_TOKENI
         list(
             build_documents_from_sources(
                 sources,
-                tokenizer=tokenizer,
-                template=chat_template,
+                vocab_path=str(VOCAB_PATH),
+                template_path=str(TEMPLATE_PATH),
                 num_workers=2,
+                worker_chunksize=1,
             )
         )
 
@@ -1638,8 +1719,6 @@ def test_cli_main_builds_dataset_and_accepts_flags(tmp_path):
                 "--ctx-len",
                 "127",
                 "--pack",
-                "--num-workers",
-                "2",
                 "--no-shuffle",
                 "--no-progress",
                 "--add-generation-prompt",
@@ -1673,8 +1752,6 @@ def test_cli_main_accepts_legacy_explicit_pack_length(tmp_path):
                 str(TEMPLATE_PATH),
                 "--pack-length",
                 "128",
-                "--num-workers",
-                "2",
                 "--no-shuffle",
                 "--no-progress",
                 "--add-generation-prompt",
@@ -1713,8 +1790,6 @@ def test_cli_main_progress_bar_writes_single_stderr_line(tmp_path):
                 str(TEMPLATE_PATH),
                 "--pack-length",
                 "128",
-                "--num-workers",
-                "2",
                 "--no-shuffle",
                 "--progress-interval",
                 "0",
@@ -1810,11 +1885,13 @@ def test_arg_parser_defaults_and_overrides():
     assert args.n_epoch == 1
     assert args.seed == 1234
     assert args.num_workers == 1
+    assert args.worker_chunksize == 64
     assert args.shuffle is True
     assert args.ctx_len is None
     assert args.pack is False
     assert args.pad is False
     assert args.pack_length is None
+    assert args.pack_cache_dir is None
     assert args.pad_length is None
     assert args.progress is True
     assert args.progress_interval == 0.2
@@ -1836,6 +1913,8 @@ def test_arg_parser_defaults_and_overrides():
             "best-fit-decreasing",
             "--pack-shard-group-size",
             "4",
+            "--pack-cache-dir",
+            "cache",
             "--pack-length",
             "64",
             "--add-generation-prompt",
@@ -1846,6 +1925,8 @@ def test_arg_parser_defaults_and_overrides():
             "9",
             "--num-workers",
             "3",
+            "--worker-chunksize",
+            "7",
             "--no-shuffle",
             "--no-progress",
             "--progress-interval",
@@ -1861,6 +1942,7 @@ def test_arg_parser_defaults_and_overrides():
     assert overridden.pad is False
     assert overridden.pack_strategy == "best-fit-decreasing"
     assert overridden.pack_shard_group_size == 4
+    assert overridden.pack_cache_dir == "cache"
     assert overridden.pack_length == 64
     assert overridden.pad_length is None
     assert overridden.add_generation_prompt is True
@@ -1868,6 +1950,7 @@ def test_arg_parser_defaults_and_overrides():
     assert overridden.n_epoch == 2
     assert overridden.seed == 9
     assert overridden.num_workers == 3
+    assert overridden.worker_chunksize == 7
     assert overridden.shuffle is False
     assert overridden.progress is False
     assert overridden.progress_interval == 1.5
@@ -1898,6 +1981,10 @@ def test_cli_main_rejects_invalid_progress_and_length_flags(tmp_path):
         [str(input_path), "--pack-length", "0"],
         [str(input_path), "--pad-length", "0"],
         [str(input_path), "--progress-interval", "-1"],
+        [str(input_path), "--worker-chunksize", "0"],
+        [str(input_path), "--pack-cache-dir", "cache"],
+        [str(input_path), "--pack", "--ctx-len", "16", "--pack-strategy", "ordered", "--pack-cache-dir", "cache", "--no-shuffle"],
+        [str(input_path), "--pack", "--ctx-len", "16", "--pack-strategy", "best-fit-decreasing", "--pack-cache-dir", "cache"],
     ]
     for argv in invalid_argvs:
         with pytest.raises(SystemExit):

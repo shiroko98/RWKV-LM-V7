@@ -434,7 +434,7 @@ python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
 
 Use `--out-prefix` or its alias `--output-prefix` to choose the output binidx prefix. For example, `--out-prefix data/sft_train` writes `data/sft_train.bin`, `data/sft_train.idx`, `data/sft_train.mask.bin`, and `data/sft_train.mask.idx`. When passing more than one positional input path, the prefix is required because there is no single source name to infer it from. A single file defaults to that file name without `.jsonl`; a single directory defaults to the directory path as the prefix.
 
-`--num-workers` is used in two places. On the default path, each JSONL file is one read task, so multiple files can be read concurrently; one large file is not split across workers at the read stage. `--pack-strategy best-fit-decreasing` reads and packs JSONL shards in bounded groups. `--pack-shard-group-size` defaults to `1`, which preserves the previous one-shard-at-a-time memory profile; raising it lets each group read multiple JSONL shards concurrently and best-fit pack across that group. Groups themselves are processed serially: group 2 starts only after group 1 has been read, tokenized, packed, and appended to the output builders. Inside a group, JSONL read concurrency is `min(group_size, num_workers, files_in_group)`. For example, `--pack-shard-group-size 8 --num-workers 32` reads at most 8 JSONL files at the same time; `--pack-shard-group-size 64 --num-workers 32` reads at most 32 files at once and queues the remaining files. Template rendering and tokenization inside each group are still parallelized across source samples, up to `num_workers`. The progress bar is enabled by default and refreshes one stderr line with current file, processed/total samples, remaining samples, and samples/s; with multiple workers, only the main thread refreshes the bar and workers do not print directly. Output writes remain single-threaded append operations into one token binidx plus one mask sidecar. Output order remains deterministic, so the same inputs, `--seed`, shuffle setting, and group size produce reproducible datasets. Text files are read as UTF-8; JSONL also accepts a UTF-8 BOM. Chinese and other multi-byte text are mapped through UTF-8 byte spans, so mask projection does not lose non-ASCII content.
+`--num-workers` is used in two places, and these workers are now processes rather than Python threads. Jinja rendering, JSON parsing, and tokenization can therefore use multiple CPU cores. On the default path, each JSONL file is one read task, so multiple files can be read concurrently; one large file is not split across workers at the read stage. `--pack-strategy best-fit-decreasing` reads and packs JSONL shards in bounded groups. `--pack-shard-group-size` defaults to `1`, which keeps memory low by processing one shard at a time, but the read stage can only read that one JSONL and best-fit can only optimize within that file. Raising it lets each group read multiple JSONL shards concurrently and best-fit pack across that group. Groups themselves are processed serially: group 2 starts only after group 1 has been read, tokenized, packed, and appended to the output builders. Inside a group, JSONL read concurrency is `min(group_size, num_workers, files_in_group)`. For example, `--pack-shard-group-size 8 --num-workers 32` reads at most 8 JSONL files at the same time, while rendering and tokenization still use up to 32 worker processes; `--pack-shard-group-size 64 --num-workers 32` reads at most 32 files at once and queues the remaining files. `--worker-chunksize` controls how many samples each render/tokenize worker task handles; the default is `64`, which usually reduces inter-process scheduling overhead. The progress bar is enabled by default and refreshes one stderr line with stage name, current file, processed/total count, remaining count, and speed; with multiple workers, only the main process refreshes the bar and workers do not print directly. Output writes remain single-process append operations into one token binidx plus one mask sidecar. Output order remains deterministic, so the same inputs, `--seed`, shuffle setting, and group size produce reproducible datasets. Text files are read as UTF-8; JSONL also accepts a UTF-8 BOM. Chinese and other multi-byte text are mapped through UTF-8 byte spans, so mask projection does not lose non-ASCII content.
 
 Example best-fit commands:
 
@@ -462,6 +462,24 @@ python data/make_sft_binidx.py /mnt/data/datasets/sft_jsonl \
   --shuffle
 ```
 
+For long jobs, enable best-fit group caching. The cache is only supported with `--pack --pack-strategy best-fit-decreasing --no-shuffle`. Each completed group writes a small token binidx, mask binidx, and meta file under `--pack-cache-dir`; after an interruption, rerun the same command and completed groups will be skipped before the final output is merged:
+
+```bash
+python data/make_sft_binidx.py /mnt/data/Datas/SFT_RWKV7_13B/sharded_cleaned \
+  --out-prefix /mnt/data/Datasets/SFT_RWKV7_13B \
+  --ctx-len 86016 \
+  --pack \
+  --pack-strategy best-fit-decreasing \
+  --pack-shard-group-size 8 \
+  --num-workers 32 \
+  --worker-chunksize 64 \
+  --no-shuffle \
+  --pack-cache-dir /mnt/data/Datasets/SFT_RWKV7_13B.cache \
+  --progress
+```
+
+If memory allows, try `--pack-shard-group-size 16`, `32`, or `64`. Larger groups give best-fit more samples to combine and allow more concurrent JSONL reads, but tokenized samples inside a group are held in memory. Your earlier `--pack-shard-group-size 1 --num-workers 32` uses 32 processes only during render/tokenize; the read stage still handles one JSONL at a time, and best-fit can only optimize within that single file. It is the lowest-memory setting, but usually not the fastest.
+
 The high-level flow is:
 
 1. Read one or more UTF-8 JSONL files, skip empty lines, and keep source path plus line number for error reporting.
@@ -483,13 +501,15 @@ Main parameters:
 - `--n-epoch`: offline data repetition count. The default is `1`; values greater than `1` duplicate samples in the produced dataset.
 - `--seed`: random seed for shuffling; it does not affect order when shuffle is disabled.
 - `--shuffle` / `--no-shuffle`: whether to shuffle samples inside each epoch. Default is enabled.
-- `--num-workers`: worker count for concurrent reading, rendering, and tokenization. Default is `1`.
+- `--num-workers`: process worker count for concurrent reading, rendering, and tokenization. Default is `1`.
+- `--worker-chunksize`: number of samples per render/tokenize worker task. Default is `64`; increase it for many short samples to reduce scheduling overhead, or lower it for very long samples and finer progress.
 - `--progress` / `--no-progress`: whether to show the single-line progress bar. Default is enabled; progress is written to stderr while the final summary stays on stdout.
 - `--progress-interval`: minimum progress-bar refresh interval in seconds. Default is `0.2`; set `0` to refresh after every sample.
 - `--ctx-len`: training context length in tokens. With `--pack` or `--pad`, preprocessing uses `ctx_len + 1`.
 - `--pack`: enable ordered sample-preserving packing at `ctx_len + 1`. Disabled by default.
 - `--pack-strategy`: packing strategy. Defaults to `ordered`; `best-fit-decreasing` reorders by length inside each JSONL shard group, uses a best-fit approximation to reduce padding, and appends all groups into one output dataset.
 - `--pack-shard-group-size`: number of JSONL shards per best-fit group. Defaults to `1`; larger values enable concurrent multi-JSONL reads and cross-file packing inside each bounded group.
+- `--pack-cache-dir`: best-fit group cache directory. Use only with `--pack --pack-strategy best-fit-decreasing --no-shuffle`; rerunning the same command reuses complete cached groups.
 - `--pad`: enable per-sample padding at `ctx_len + 1`. Disabled by default and mutually exclusive with `--pack`.
 - `--pack-length`: legacy explicit fixed-length packing target in tokens.
 - `--pad-length`: legacy explicit fixed-length per-sample padding target in tokens. Mutually exclusive with `--pack-length`.

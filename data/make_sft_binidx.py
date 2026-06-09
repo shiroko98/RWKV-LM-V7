@@ -36,6 +36,8 @@ class ProgressBar:
         elapsed = max(now - self.start_time, 1e-9)
         speed = done / elapsed
         remaining = max(total_int - done, 0) if total_int > 0 else 0
+        stage = str(event.get("stage", "progress"))
+        unit = str(event.get("unit", "samples"))
         path = str(event.get("source_path", ""))
         line_number = event.get("line_number")
         source = f"{path}:{line_number}" if line_number else path
@@ -58,8 +60,8 @@ class ProgressBar:
             group_text = f" group={group_index}/{group_count}"
 
         line = (
-            f"### SFT progress [{bar}] {count_text} "
-            f"left={remaining} speed={speed:.1f} samples/s{group_text} file={source}"
+            f"### SFT progress {stage} [{bar}] {count_text} "
+            f"left={remaining} speed={speed:.1f} {unit}/s{group_text} file={source}"
         )
         self.stream.write("\r" + line + self._clear_suffix(line))
         self.stream.flush()
@@ -101,9 +103,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pad", action="store_true", default=False)
     parser.add_argument("--pack-strategy", choices=["ordered", "best-fit-decreasing"], default="ordered")
     parser.add_argument("--pack-shard-group-size", type=int, default=1)
+    parser.add_argument("--pack-cache-dir", type=str, default=None)
     parser.add_argument("--pack-length", type=int, default=None)
     parser.add_argument("--pad-length", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=1)
+    parser.add_argument("--worker-chunksize", type=int, default=64)
     parser.add_argument("--shuffle", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--progress-interval", type=float, default=0.2)
@@ -138,6 +142,13 @@ def main(argv=None):
         parser.error("--pad-length must be a positive integer.")
     if args.progress_interval < 0:
         parser.error("--progress-interval must be non-negative.")
+    if args.worker_chunksize <= 0:
+        parser.error("--worker-chunksize must be a positive integer.")
+    if args.pack_cache_dir is not None:
+        if not args.pack or args.pack_strategy != "best-fit-decreasing":
+            parser.error("--pack-cache-dir requires --pack --pack-strategy best-fit-decreasing.")
+        if args.shuffle:
+            parser.error("--pack-cache-dir requires --no-shuffle for deterministic cache reuse.")
 
     pack_length = args.pack_length
     pad_length = args.pad_length
@@ -165,6 +176,8 @@ def main(argv=None):
             shuffle=args.shuffle,
             pack_strategy=args.pack_strategy,
             pack_shard_group_size=args.pack_shard_group_size,
+            worker_chunksize=args.worker_chunksize,
+            pack_cache_dir=args.pack_cache_dir,
             current_date=args.current_date,
             current_location=args.current_location,
             progress_callback=progress_bar,

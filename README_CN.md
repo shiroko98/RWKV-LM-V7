@@ -222,7 +222,7 @@ python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
 
 使用 `--out-prefix` 或别名 `--output-prefix` 可以指定输出 binidx 的命名前缀。例如 `--out-prefix data/sft_train` 会写出 `data/sft_train.bin`、`data/sft_train.idx`、`data/sft_train.mask.bin`、`data/sft_train.mask.idx`。传入多个位置参数时必须显式指定输出前缀，因为脚本无法从多个源路径自动推导唯一名字；单个文件默认使用去掉 `.jsonl` 后缀的文件名，单个文件夹默认使用文件夹路径作为前缀。
 
-`--num-workers` 会用在两个阶段。默认路径的读取阶段以“一个 JSONL 文件”为一个任务，所以多个 JSONL 可以并发读取；单个大 JSONL 在读取阶段不会被多个 worker 拆分读取。`--pack-strategy best-fit-decreasing` 会按有界 JSONL shard group 读取和 packing。`--pack-shard-group-size` 默认是 `1`，保持之前一次只处理一个 shard 的内存占用；调大后，每个 group 可以并发读取多个 JSONL，并在 group 内跨文件做 best-fit packing。group 之间仍然串行：group 1 完成读取、tokenize、packing 并追加写入后，才会开始 group 2。group 内 JSONL 读取并发数是 `min(group_size, num_workers, 当前 group 文件数)`。例如 `--pack-shard-group-size 8 --num-workers 32` 最多同时读取 8 个 JSONL；`--pack-shard-group-size 64 --num-workers 32` 最多同时读取 32 个 JSONL，剩余文件排队。每个 group 内的模板渲染和 tokenization 仍会按样本并发执行，最多使用 `num_workers` 个 worker。进度条默认启用，并在 stderr 上单行刷新当前文件、已处理/总数、剩余样本数和 samples/s；多 worker 时只有主线程统一刷新，worker 不直接输出。输出写入仍是单线程 append 到同一套 token binidx 和 mask sidecar。输出仍按确定的样本顺序或 shard group 顺序写入，所以相同输入、`--seed`、`--shuffle` 设置和 group size 会得到可复现结果。当前所有文本文件按 UTF-8 读取，JSONL 额外兼容 UTF-8 BOM，中文内容会按 UTF-8 字节映射到 token span，不会在 mask 推导中丢失。
+`--num-workers` 会用在两个阶段，现在这些 worker 是多进程 worker，不是 Python 线程；Jinja 渲染、JSON 解析和 tokenize 会真实并行吃多核。默认路径的读取阶段以“一个 JSONL 文件”为一个任务，所以多个 JSONL 可以并发读取；单个大 JSONL 在读取阶段不会被多个 worker 拆分读取。`--pack-strategy best-fit-decreasing` 会按有界 JSONL shard group 读取和 packing。`--pack-shard-group-size` 默认是 `1`，保持一次只处理一个 shard 的低内存占用，但读取阶段只能读这 1 个 JSONL，best-fit 也只能在这个文件内部优化。调大后，每个 group 可以并发读取多个 JSONL，并在 group 内跨文件做 best-fit packing。group 之间仍然串行：group 1 完成读取、tokenize、packing 并追加写入后，才会开始 group 2。group 内 JSONL 读取并发数是 `min(group_size, num_workers, 当前 group 文件数)`。例如 `--pack-shard-group-size 8 --num-workers 32` 最多同时读取 8 个 JSONL，但渲染和 tokenize 阶段仍最多 32 个进程并行处理样本；`--pack-shard-group-size 64 --num-workers 32` 最多同时读取 32 个 JSONL，剩余文件排队。`--worker-chunksize` 控制多进程渲染/tokenize 每个任务批量处理多少条样本，默认 `64`，通常可以减少进程间调度开销。进度条默认启用，并在 stderr 上单行刷新阶段名、当前文件、已处理/总数、剩余数量和速度；多 worker 时只有主进程统一刷新，worker 不直接输出。输出写入仍是单进程 append 到同一套 token binidx 和 mask sidecar。输出仍按确定的样本顺序或 shard group 顺序写入，所以相同输入、`--seed`、`--shuffle` 设置和 group size 会得到可复现结果。当前所有文本文件按 UTF-8 读取，JSONL 额外兼容 UTF-8 BOM，中文内容会按 UTF-8 字节映射到 token span，不会在 mask 推导中丢失。
 
 best-fit 命令示例：
 
@@ -250,6 +250,24 @@ python data/make_sft_binidx.py /mnt/data/datasets/sft_jsonl \
   --shuffle
 ```
 
+长任务建议打开 best-fit group 缓存。缓存只支持 `--pack --pack-strategy best-fit-decreasing --no-shuffle`，每个 group 完成后会在 `--pack-cache-dir` 下保存一组小 binidx + mask + meta；中途失败后原命令重跑，会跳过已经完整缓存的 group，再合并成最终输出：
+
+```bash
+python data/make_sft_binidx.py /mnt/data/Datas/SFT_RWKV7_13B/sharded_cleaned \
+  --out-prefix /mnt/data/Datasets/SFT_RWKV7_13B \
+  --ctx-len 86016 \
+  --pack \
+  --pack-strategy best-fit-decreasing \
+  --pack-shard-group-size 8 \
+  --num-workers 32 \
+  --worker-chunksize 64 \
+  --no-shuffle \
+  --pack-cache-dir /mnt/data/Datasets/SFT_RWKV7_13B.cache \
+  --progress
+```
+
+如果内存足够，可以把 `--pack-shard-group-size` 试到 `16`、`32` 或 `64`。更大的 group 会让 best-fit 有更多样本可组合，也能让读取阶段并发更多 JSONL，但 group 内 tokenized 样本会暂存在内存中，过大可能撑爆内存。你之前的 `--pack-shard-group-size 1 --num-workers 32` 只有渲染/tokenize 阶段能用 32 个进程，读取阶段每次只有 1 个 JSONL，packing 也只能在单文件内优化；它最省内存，但通常不是最快。
+
 整体流程可以抽象为：
 
 1. 读取一个或多个 UTF-8 JSONL，过滤空行，并记录每条样本来自哪个文件和行号，便于定位坏 JSON。
@@ -271,13 +289,15 @@ python data/make_sft_binidx.py /mnt/data/datasets/sft_jsonl \
 - `--n-epoch`：离线重复数据次数，默认 `1`；大于 `1` 会让样本在产物中重复出现。
 - `--seed`：打乱顺序用的随机种子；关闭 shuffle 时不影响样本顺序。
 - `--shuffle` / `--no-shuffle`：是否在每个 epoch 内打乱样本，默认开启。
-- `--num-workers`：并发读取、渲染和 tokenize 的 worker 数，默认 `1`。
+- `--num-workers`：并发读取、渲染和 tokenize 的多进程 worker 数，默认 `1`。
+- `--worker-chunksize`：多进程渲染/tokenize 每个任务批量处理的样本数，默认 `64`；样本很短时可以调大减少调度开销，样本很长或希望进度更细时可以调小。
 - `--progress` / `--no-progress`：是否显示单行刷新进度条，默认开启；进度条写到 stderr，最终统计仍写到 stdout。
 - `--progress-interval`：进度条最小刷新间隔秒数，默认 `0.2`；设为 `0` 会每条样本都刷新。
 - `--ctx-len`：训练上下文 token 数；配合 `--pack` 或 `--pad` 时，预处理长度自动使用 `ctx_len + 1`。
 - `--pack`：启用顺序样本不拆分 packing，长度为 `ctx_len + 1`；不设置时默认关闭。
 - `--pack-strategy`：packing 策略，默认 `ordered` 保持样本顺序；`best-fit-decreasing` 会在每个 JSONL shard group 内按长度重排做近似最优打包，减少 padding，并把所有 group 追加到同一组输出文件。
 - `--pack-shard-group-size`：每个 best-fit group 包含多少个 JSONL shard，默认 `1`；调大后可在有界 group 内并发读取多个 JSONL，并跨文件 packing。
+- `--pack-cache-dir`：best-fit group 缓存目录，只能配合 `--pack --pack-strategy best-fit-decreasing --no-shuffle` 使用；中断后重跑同一命令会复用已完整缓存的 group。
 - `--pad`：启用逐样本 padding，长度为 `ctx_len + 1`；不设置时默认关闭，不能和 `--pack` 同时使用。
 - `--pack-length`：兼容旧用法，显式指定固定长度 packing 目标 token 数。
 - `--pad-length`：兼容旧用法，显式指定逐样本 padding 目标 token 数；不能和 `--pack-length` 同时使用。

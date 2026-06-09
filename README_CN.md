@@ -418,9 +418,11 @@ WSD 衰减区间的计算方式：
   - `RWKV_RUN_TRAIN_PY_SFT_DP_ZERO_ACCUM_EQUIV_SMOKE=1` + `RWKV_SFT_SMOKE_DEVICES=8` + `deepspeed_stage_3_offload` -> `1 passed in 81.06s`。
   - `RWKV_RUN_TRAIN_PY_SFT_MERGE_SMOKE=1` + `RWKV_SFT_SMOKE_DEVICES=8` + `deepspeed_stage_3_offload` -> `1 passed in 284.01s`。
 
-13.3B SFT 启动脚本：
+## 13.3B SFT 启动脚本操作手册
 
-完整 13.3B 示例就是 [run_13b_sft_zero3_offload.sh](/D:/codes/RWKV-LM-V7-12B-train/run_13b_sft_zero3_offload.sh)。它按 `model/rwkv7-g1f-13.3b.txt` 推导了模型形状：`n_layer=61`、`n_embd=4096`、`dim_ffn=16384`、`vocab_size=65536`、`head_size=64`、LoRA 维度 `192/192/128/384`。默认适配 8 卡 H800、`deepspeed_stage_3_offload`、开启激活检查点，并使用 SFT binidx+mask 数据。
+完整 13.3B 示例是 [run_13b_sft_zero3_offload.sh](/D:/codes/RWKV-LM-V7-12B-train/run_13b_sft_zero3_offload.sh)。它按 `model/rwkv7-g1f-13.3b.txt` 推导了模型形状：`n_layer=61`、`n_embd=4096`、`dim_ffn=16384`、`vocab_size=65536`、`head_size=64`、LoRA 维度 `192/192/128/384`。默认适配 8 卡 H800、`deepspeed_stage_3_offload`、开启激活检查点，并使用 SFT binidx+mask 数据。脚本里的配置都可以通过同名环境变量覆盖，所以推荐把一次训练的输入、输出、batch、LR 和 checkpoint 策略都写在启动命令前面。
+
+### 1. 准备 SFT binidx 数据
 
 第一步：准备固定长度 SFT 数据。`--ctx-len 8192 --pack` 会写出每个 document `8193` 个 token，因为训练端使用 next-token label：
 
@@ -434,6 +436,8 @@ python data/make_sft_binidx.py /mnt/data/datasets/sft_jsonl \
   --num-workers 32 \
   --shuffle
 ```
+
+### 2. 计算手动 schedule
 
 第二步：计算完整跑一遍 SFT documents 需要多少 `EPOCH_STEPS`：
 
@@ -464,6 +468,8 @@ print(f"samples_per_epoch={epoch_steps * effective_bsz}")
 print(f"extra_repeated_per_epoch={epoch_steps * effective_bsz - docs}")
 PY
 ```
+
+### 3. 启动 13.3B SFT
 
 第三步：在 8 张 H800 上启动 13.3B SFT：
 
@@ -521,8 +527,11 @@ WANDB_PROJECT=RWKV-13B-SFT \
 bash run_13b_sft_zero3_offload.sh
 ```
 
+### 4. 脚本参数说明
+
 关键参数说明：
 
+- `MODEL_TYPE`、`N_LAYER`、`N_EMBD`、`DIM_FFN`、`VOCAB_SIZE`、`HEAD_SIZE`、`D_DECAY_LORA`、`D_AAA_LORA`、`D_MV_LORA`、`D_GATE_LORA`：模型结构参数，默认值对应 RWKV7 G1F 13.3B。换 checkpoint 时必须和对应架构文本一致。
 - `LOAD_MODEL`：初始 13.3B checkpoint；也可以指向保存出的 `rwkv-step-N.pth` / `rwkv-N.pth` 做断点续训。DeepSpeed checkpoint 目录需要配合 DeepSpeed strategy 恢复。
 - `DATA_FILE`：SFT binidx 前缀，不带 `.bin` 或 `.idx`。脚本会检查 `DATA_FILE.bin`、`DATA_FILE.idx`、`DATA_FILE.mask.bin`、`DATA_FILE.mask.idx`。
 - `CTX_LEN`：训练上下文长度，需要和预处理 `--ctx-len` 一致；预处理产物里的 document 应该是 `CTX_LEN + 1` 个 token。
@@ -538,6 +547,94 @@ bash run_13b_sft_zero3_offload.sh
 - `EPOCH_SAVE`、`SAVE_EVERY_N_STEPS`、`KEEP_LAST_N_CHECKPOINTS`：checkpoint 保存频率和保留数量。
 - `PROJ_DIR`：训练日志和 checkpoint 输出目录。
 - `WANDB_PROJECT`：空字符串表示不启用 wandb；非空则记录到对应项目。
+- `KERNEL`：RWKV7 CUDA kernel 选择，默认 `@rwkv3`。
+- `HEAD_CHUNK`：head 分块设置，默认 `0`，一般先保持默认。
+- `DS_BUCKET_MB`：DeepSpeed bucket 大小，默认 `64` MB；显存/通信行为异常时再调。
+- `MASTER_ADDR`、`MASTER_PORT`、`CUDA_VISIBLE_DEVICES`：单机多卡 torchrun / distributed 初始化相关参数。
+- `TORCH_EXTENSIONS_DIR`、`TORCH_CUDA_ARCH_LIST`、`MAX_JOBS`：CUDA 扩展编译缓存、架构和并行编译设置。H800 常用 `TORCH_CUDA_ARCH_LIST=9.0`。
+
+### 5. 断点续训命令
+
+保存出的 step checkpoint 在 `PROJ_DIR/rwkv-step-N.pth`；DeepSpeed strategy 下它是一个目录，里面包含 ZeRO 分片和 trainer state。续训时把 `LOAD_MODEL` 指向这个目录，其他训练形状、数据、batch、LR/WSD、DeepSpeed strategy 尽量保持和原 run 一致：
+
+```bash
+LOAD_MODEL=/mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.pth \
+DATA_FILE=/mnt/data/datasets/sft_train_ctx8192 \
+PROJ_DIR=/mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload \
+CTX_LEN=8192 \
+N_NODE=1 \
+GPU_PER_NODE=8 \
+MICRO_BSZ=1 \
+ACCUMULATE_GRAD_BATCHES=4 \
+EPOCH_STEPS=12500 \
+EPOCH_COUNT=1 \
+SFT_ONE_PASS=0 \
+STRATEGY=deepspeed_stage_3_offload \
+GRAD_CP=1 \
+LR_INIT=1e-5 \
+LR_FINAL=1e-6 \
+LR_WSD_DECAY_ITERS=1000 \
+LR_WSD_DECAY_STYLE=cosine \
+WARMUP_STEPS=10 \
+SAVE_EVERY_N_STEPS=1000 \
+KEEP_LAST_N_CHECKPOINTS=3 \
+WANDB_PROJECT=RWKV-13B-SFT \
+bash run_13b_sft_zero3_offload.sh
+```
+
+如果原训练使用 `SFT_ONE_PASS=1`，续训时也可以继续设 `SFT_ONE_PASS=1`，但仍要保证 `DATA_FILE`、`effective_bsz` 和 LR/WSD 设置没有无意变化。`train.py` 会识别 DeepSpeed checkpoint 目录，并把它作为 Lightning `ckpt_path` 恢复；此时 `epoch_begin` 会被置为 `0`，真正的进度来自 checkpoint 里的 `global_step`。
+
+### 6. 合并 DeepSpeed 分片 checkpoint
+
+训练完成或需要做推理测试时，可以把 DeepSpeed/ZeRO 分片 checkpoint 合并成普通单文件 `.pth`。`--checkpoint-dir` 指向训练保存出的目录，`--output-file` 是合并后的文件；`--summary-file` 会写出参数名、shape、dtype 和总参数量，便于归档：
+
+```bash
+python scripts/convert_deepspeed_checkpoint_to_pth.py \
+  --checkpoint-dir /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.pth \
+  --output-file /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.bf16.pth \
+  --dtype bf16 \
+  --summary-file /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.summary.txt
+```
+
+如果你手里有架构摘要文件，也可以加 `--verify-summary-file model/rwkv7-g1f-13.3b.txt` 做 shape / dtype / 参数总量校验。13.3B 文件很大，建议在服务器上执行合并，并确保输出目录有足够磁盘空间。
+
+### 7. 合并后等价验证
+
+合并后可以用下面的脚本对比“从原 ZeRO checkpoint 重构出的 state_dict”和“合并后的单文件 `.pth`”。`--strict-forward` 会额外跑一次真实 forward；如果只是先检查 tensor 完全一致，可以去掉它：
+
+```bash
+python scripts/test_converted_checkpoint_equivalence.py \
+  --checkpoint-dir /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.pth \
+  --converted-file /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.bf16.pth \
+  --dtype bf16 \
+  --strict-forward \
+  --prompt "User: 你好\nAssistant:" \
+  --device cuda \
+  --demo-vocab-path rwkv_vocab_v20260603.txt \
+  --summary-file /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.equiv.json
+```
+
+### 8. 合并后推理测试命令
+
+`scripts/run_converted_rwkv_demo.py` 是轻量 next-token / generation demo，会从 `.pth` 自动推断层数、hidden size、LoRA 维度和 head size，不需要手动写 13.3B 结构参数。SFT 数据处理默认使用 `rwkv_vocab_v20260603.txt`，所以推理测试也建议显式传同一个 vocab：
+
+```bash
+python scripts/run_converted_rwkv_demo.py \
+  --model-path /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.bf16.pth \
+  --vocab-path rwkv_vocab_v20260603.txt \
+  --prompt "User: 你好，请用一句话介绍 RWKV。\nAssistant:" \
+  --device cuda \
+  --dtype auto \
+  --topk 10 \
+  --max-new-tokens 64 \
+  --temperature 1.0 \
+  --top-p 0.8 \
+  --sample
+```
+
+这个 demo 只是验证合并后的 checkpoint 能加载、能 forward、能生成；它不会自动套用 `data/SFT/sample/chat_template.jinja`。如果要做严格 chat 评测，输入 prompt 应该由同一个 chat template 渲染后再传给推理程序。
+
+### 9. 服务器 smoke 测试命令
 
 服务器上可以打开可选 CUDA smoke 测试：
 

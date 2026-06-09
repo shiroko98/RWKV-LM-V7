@@ -615,9 +615,11 @@ Current validation results:
   - `RWKV_RUN_TRAIN_PY_SFT_DP_ZERO_ACCUM_EQUIV_SMOKE=1` + `RWKV_SFT_SMOKE_DEVICES=8` + `deepspeed_stage_3_offload` -> `1 passed in 81.06s`.
   - `RWKV_RUN_TRAIN_PY_SFT_MERGE_SMOKE=1` + `RWKV_SFT_SMOKE_DEVICES=8` + `deepspeed_stage_3_offload` -> `1 passed in 284.01s`.
 
-13.3B SFT launcher:
+## 13.3B SFT Launcher Operations
 
-The complete 13.3B example is [run_13b_sft_zero3_offload.sh](/D:/codes/RWKV-LM-V7-12B-train/run_13b_sft_zero3_offload.sh). It is derived from `model/rwkv7-g1f-13.3b.txt`: `n_layer=61`, `n_embd=4096`, `dim_ffn=16384`, `vocab_size=65536`, `head_size=64`, and LoRA dimensions `192/192/128/384`. It defaults to 8xH800, `deepspeed_stage_3_offload`, activation checkpointing enabled, and SFT binidx+mask data.
+The complete 13.3B example is [run_13b_sft_zero3_offload.sh](/D:/codes/RWKV-LM-V7-12B-train/run_13b_sft_zero3_offload.sh). It is derived from `model/rwkv7-g1f-13.3b.txt`: `n_layer=61`, `n_embd=4096`, `dim_ffn=16384`, `vocab_size=65536`, `head_size=64`, and LoRA dimensions `192/192/128/384`. It defaults to 8xH800, `deepspeed_stage_3_offload`, activation checkpointing enabled, and SFT binidx+mask data. Every script setting can be overridden by an environment variable with the same name, so the recommended pattern is to put model, data, batch, LR, and checkpoint settings directly before the launcher command.
+
+### 1. Prepare SFT binidx data
 
 Step 1: prepare fixed-length SFT data. `--ctx-len 8192 --pack` writes `8193` tokens per document, because training uses next-token labels:
 
@@ -631,6 +633,8 @@ python data/make_sft_binidx.py /mnt/data/datasets/sft_jsonl \
   --num-workers 32 \
   --shuffle
 ```
+
+### 2. Calculate a manual schedule
 
 Step 2: calculate `EPOCH_STEPS` for one full pass over the produced SFT documents:
 
@@ -661,6 +665,8 @@ print(f"samples_per_epoch={epoch_steps * effective_bsz}")
 print(f"extra_repeated_per_epoch={epoch_steps * effective_bsz - docs}")
 PY
 ```
+
+### 3. Launch 13.3B SFT
 
 Step 3: launch 13.3B SFT on 8 H800 GPUs:
 
@@ -718,8 +724,11 @@ WANDB_PROJECT=RWKV-13B-SFT \
 bash run_13b_sft_zero3_offload.sh
 ```
 
+### 4. Launcher parameters
+
 Key parameters:
 
+- `MODEL_TYPE`, `N_LAYER`, `N_EMBD`, `DIM_FFN`, `VOCAB_SIZE`, `HEAD_SIZE`, `D_DECAY_LORA`, `D_AAA_LORA`, `D_MV_LORA`, `D_GATE_LORA`: model-shape parameters. Defaults match RWKV7 G1F 13.3B. Keep them aligned with the architecture text when changing checkpoints.
 - `LOAD_MODEL`: initial 13.3B checkpoint, or a saved `rwkv-step-N.pth` / `rwkv-N.pth` checkpoint for resume. DeepSpeed checkpoint directories are supported when the strategy is DeepSpeed.
 - `DATA_FILE`: SFT binidx prefix, without `.bin` or `.idx`. The script expects `DATA_FILE.bin`, `DATA_FILE.idx`, `DATA_FILE.mask.bin`, and `DATA_FILE.mask.idx`.
 - `CTX_LEN`: training context length. It must match the preprocessing `--ctx-len`; the binidx documents should contain `CTX_LEN + 1` tokens.
@@ -735,6 +744,94 @@ Key parameters:
 - `EPOCH_SAVE`, `SAVE_EVERY_N_STEPS`, `KEEP_LAST_N_CHECKPOINTS`: checkpoint cadence and retention.
 - `PROJ_DIR`: output directory for logs and checkpoints.
 - `WANDB_PROJECT`: empty disables wandb; a non-empty value enables logging under that project.
+- `KERNEL`: RWKV7 CUDA kernel selector. The default is `@rwkv3`.
+- `HEAD_CHUNK`: head chunking setting. The default is `0`; keep it unchanged unless you are intentionally testing memory/perf behavior.
+- `DS_BUCKET_MB`: DeepSpeed bucket size in MB. The script defaults to `64`.
+- `MASTER_ADDR`, `MASTER_PORT`, `CUDA_VISIBLE_DEVICES`: single-node torchrun / distributed initialization settings.
+- `TORCH_EXTENSIONS_DIR`, `TORCH_CUDA_ARCH_LIST`, `MAX_JOBS`: CUDA extension cache, target architecture, and parallel build settings. H800 commonly uses `TORCH_CUDA_ARCH_LIST=9.0`.
+
+### 5. Resume from a checkpoint
+
+Step checkpoints are saved as `PROJ_DIR/rwkv-step-N.pth`. With a DeepSpeed strategy this path is a directory containing ZeRO shards and trainer state. Resume by pointing `LOAD_MODEL` at that directory, while keeping model shape, data, batch, LR/WSD, and DeepSpeed strategy aligned with the original run:
+
+```bash
+LOAD_MODEL=/mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.pth \
+DATA_FILE=/mnt/data/datasets/sft_train_ctx8192 \
+PROJ_DIR=/mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload \
+CTX_LEN=8192 \
+N_NODE=1 \
+GPU_PER_NODE=8 \
+MICRO_BSZ=1 \
+ACCUMULATE_GRAD_BATCHES=4 \
+EPOCH_STEPS=12500 \
+EPOCH_COUNT=1 \
+SFT_ONE_PASS=0 \
+STRATEGY=deepspeed_stage_3_offload \
+GRAD_CP=1 \
+LR_INIT=1e-5 \
+LR_FINAL=1e-6 \
+LR_WSD_DECAY_ITERS=1000 \
+LR_WSD_DECAY_STYLE=cosine \
+WARMUP_STEPS=10 \
+SAVE_EVERY_N_STEPS=1000 \
+KEEP_LAST_N_CHECKPOINTS=3 \
+WANDB_PROJECT=RWKV-13B-SFT \
+bash run_13b_sft_zero3_offload.sh
+```
+
+If the original run used `SFT_ONE_PASS=1`, resume may keep `SFT_ONE_PASS=1`, but make sure `DATA_FILE`, `effective_bsz`, and LR/WSD settings did not change unintentionally. `train.py` detects DeepSpeed checkpoint directories and passes them to Lightning as `ckpt_path`; in this path `epoch_begin` is reset to `0`, and real progress comes from the restored `global_step`.
+
+### 6. Merge a DeepSpeed sharded checkpoint
+
+After training, or before inference validation, convert the DeepSpeed/ZeRO checkpoint directory into a plain single-file `.pth`. `--checkpoint-dir` points at the saved checkpoint directory, `--output-file` is the merged checkpoint, and `--summary-file` writes parameter names, shapes, dtypes, and total parameter count:
+
+```bash
+python scripts/convert_deepspeed_checkpoint_to_pth.py \
+  --checkpoint-dir /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.pth \
+  --output-file /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.bf16.pth \
+  --dtype bf16 \
+  --summary-file /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.summary.txt
+```
+
+If you have the architecture summary file, add `--verify-summary-file model/rwkv7-g1f-13.3b.txt` to validate shape, dtype, and total parameter count. The 13.3B file is large, so run this on the server and make sure the output filesystem has enough free space.
+
+### 7. Verify merged-checkpoint equivalence
+
+Use this script to compare the state dict reconstructed from the original ZeRO checkpoint with the converted single-file `.pth`. `--strict-forward` also runs a real forward pass; remove it if you only want tensor equality first:
+
+```bash
+python scripts/test_converted_checkpoint_equivalence.py \
+  --checkpoint-dir /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.pth \
+  --converted-file /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.bf16.pth \
+  --dtype bf16 \
+  --strict-forward \
+  --prompt "User: 你好\nAssistant:" \
+  --device cuda \
+  --demo-vocab-path rwkv_vocab_v20260603.txt \
+  --summary-file /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.equiv.json
+```
+
+### 8. Run an inference smoke test
+
+`scripts/run_converted_rwkv_demo.py` is a lightweight next-token / generation demo. It infers layer count, hidden size, LoRA dimensions, and head size from the `.pth`, so you do not need to pass 13.3B shape parameters manually. SFT preprocessing defaults to `rwkv_vocab_v20260603.txt`, so pass the same vocab explicitly for inference checks:
+
+```bash
+python scripts/run_converted_rwkv_demo.py \
+  --model-path /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.bf16.pth \
+  --vocab-path rwkv_vocab_v20260603.txt \
+  --prompt "User: 你好，请用一句话介绍 RWKV。\nAssistant:" \
+  --device cuda \
+  --dtype auto \
+  --topk 10 \
+  --max-new-tokens 64 \
+  --temperature 1.0 \
+  --top-p 0.8 \
+  --sample
+```
+
+This demo only validates that the converted checkpoint loads, runs forward, and can generate. It does not automatically apply `data/SFT/sample/chat_template.jinja`; for strict chat evaluation, render the prompt with the same chat template first, then pass the rendered text to the inference program.
+
+### 9. Server smoke-test commands
 
 Optional CUDA smoke tests are available for server validation:
 

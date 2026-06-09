@@ -1,5 +1,29 @@
 2026-06-03 new_sft branch bootstrap
 
+2026-06-09 13.3B SFT launcher operation docs
+
+Completed
+- Added a standalone `run_13b_sft_zero3_offload.sh` operation section to README / README_CN.
+- Documented 13.3B script parameter groups:
+- model shape and LoRA dimensions;
+- SFT data prefix and ctx length contract;
+- batch size, gradient accumulation, manual schedule, and `SFT_ONE_PASS`;
+- LR/WSD, warmup, weight decay, activation checkpointing, DeepSpeed strategy, checkpoint retention, wandb, and distributed/runtime env vars.
+- Added directly runnable commands for:
+- preparing SFT binidx data;
+- computing manual `EPOCH_STEPS`;
+- launching manual multi-pass 13.3B SFT;
+- launching automatic one-pass 13.3B SFT;
+- resuming from `rwkv-step-N.pth`;
+- converting DeepSpeed/ZeRO shards to a single `.pth`;
+- verifying converted checkpoint equivalence;
+- running a converted-checkpoint inference smoke test.
+
+Validation completed
+- `bash -n run_13b_sft_zero3_offload.sh` passed.
+- `git diff --check` passed with only repository line-ending warnings.
+- `git diff -- data/SFT/sample/chat_template.jinja` was empty.
+
 2026-06-09 SFT README command refresh
 
 Completed

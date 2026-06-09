@@ -620,13 +620,15 @@ def test_train_py_sft_deepspeed_resume_keeps_wsd_lr_position(tmp_path):
     proj_dir = tmp_path / "wsd_resume_out"
     lr_init = os.environ.get("RWKV_SFT_WSD_RESUME_LR_INIT", "1e-4")
     lr_final = os.environ.get("RWKV_SFT_WSD_RESUME_LR_FINAL", "1e-5")
-    epoch_steps = int(os.environ.get("RWKV_SFT_WSD_RESUME_EPOCH_STEPS", "32"))
-    decay_iters = int(os.environ.get("RWKV_SFT_WSD_RESUME_DECAY_ITERS", "8"))
+    epoch_steps = int(os.environ.get("RWKV_SFT_WSD_RESUME_EPOCH_STEPS", "33"))
+    decay_iters = int(os.environ.get("RWKV_SFT_WSD_RESUME_DECAY_ITERS", "9"))
     warmup_steps = int(os.environ.get("RWKV_SFT_WSD_RESUME_WARMUP_STEPS", "4"))
-    save_step = int(os.environ.get("RWKV_SFT_WSD_RESUME_SAVE_STEP", str(epoch_steps - decay_iters)))
+    decay_start = epoch_steps - decay_iters
+    save_step = int(os.environ.get("RWKV_SFT_WSD_RESUME_SAVE_STEP", str(decay_start + (decay_iters - 1) // 2)))
     assert epoch_steps > decay_iters > 0
     assert 0 <= warmup_steps < save_step < epoch_steps
-    assert save_step == epoch_steps - decay_iters, "save_step should be the WSD decay start for this smoke"
+    assert decay_iters % 2 == 1, "this smoke uses an odd decay_iters value so the midpoint is exact"
+    assert 2 * (save_step - decay_start) == decay_iters - 1, "save_step should be the WSD half-decay point"
 
     common_extra_args = [
         "--lr_init",
@@ -701,9 +703,11 @@ def test_train_py_sft_deepspeed_resume_keeps_wsd_lr_position(tmp_path):
         "epoch_steps": epoch_steps,
         "warmup_steps": warmup_steps,
         "lr_wsd_decay_iters": decay_iters,
+        "decay_start": decay_start,
         "save_step": save_step,
         "lr_init": float(lr_init),
         "lr_final": float(lr_final),
+        "expected_lr_at_save_step": float(lr_init) + (float(lr_final) - float(lr_init)) * 0.5,
         "resumed_lr": resumed_lr,
         "proj_dir": str(proj_dir),
     }

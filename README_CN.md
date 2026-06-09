@@ -570,9 +570,9 @@ RWKV_SFT_SMOKE_MODEL=model/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
 RWKV_RUN_TRAIN_PY_SFT_WSD_RESUME_SMOKE=1 \
 RWKV_SFT_SMOKE_DEVICES=8 \
 RWKV_SFT_SMOKE_STRATEGY=deepspeed_stage_3_offload \
-RWKV_SFT_WSD_RESUME_EPOCH_STEPS=32 \
+RWKV_SFT_WSD_RESUME_EPOCH_STEPS=33 \
 RWKV_SFT_WSD_RESUME_WARMUP_STEPS=4 \
-RWKV_SFT_WSD_RESUME_DECAY_ITERS=8 \
+RWKV_SFT_WSD_RESUME_DECAY_ITERS=9 \
 RWKV_SFT_WSD_RESUME_SUMMARY_FILE=/tmp/rwkv_sft_wsd_resume.json \
 pytest -q tests/test_sft_cuda_smoke.py::test_train_py_sft_deepspeed_resume_keeps_wsd_lr_position
 
@@ -583,7 +583,7 @@ RWKV_SFT_SMOKE_STRATEGY=deepspeed_stage_3_offload \
 pytest -q tests/test_sft_cuda_smoke.py::test_train_py_sft_deepspeed_checkpoint_converts_to_pth
 ```
 
-第一条命令在进程内跑 CUDA forward/backward，验证 SFT masked loss。第二条命令对比同一批合成 SFT 样本在“大 batch 一次 forward”和“拆成多个 micro-batch 后按梯度累计口径聚合”时的 masked loss 精度，默认对比 `micro_bsz=2, accumulate=1` 与 `micro_bsz=1, accumulate=2` 的 loss，容差为 `RWKV_SFT_ACCUM_EQUIV_ATOL=1e-2`、`RWKV_SFT_ACCUM_EQUIV_RTOL=1e-3`，并可把差值写到 `RWKV_SFT_ACCUM_EQUIV_SUMMARY_FILE`。第三条命令真实启动 `train.py` + DeepSpeed/ZeRO 多卡训练两次，对比 DP/ZeRO 下 `micro_bsz=2, accumulate=1` 和 `micro_bsz=1, accumulate=2` 的首个 epoch loss，容差为 `RWKV_SFT_DP_ZERO_ACCUM_EQUIV_ATOL=1e-2`、`RWKV_SFT_DP_ZERO_ACCUM_EQUIV_RTOL=1e-3`，并可写出 `RWKV_SFT_DP_ZERO_ACCUM_EQUIV_SUMMARY_FILE`。第四条命令启动 `train.py` 跑 1 个 SFT step，额外覆盖 Lightning、DeepSpeed 和 optimizer 链路。第五条命令会先保存 `rwkv-step-1.pth`，再从这个 step checkpoint 恢复，覆盖 SFT 断点续训；使用 DeepSpeed strategy 时，也会覆盖 DeepSpeed 分片 checkpoint 的加载。第六条命令专门验证 WSD LR 断点续训：默认 `epoch_steps=32`、`warmup_steps=4`、`lr_wsd_decay_iters=8`，也就是 step 0-3 warmup、step 4-23 保持 `lr_init`、step 24 进入 WSD decay 并保存 checkpoint，resume 后继续到 step 31，检查最后记录的 LR 到 `lr_final`；这避免了“还在 warmup”或“一开始就在 decay”的假阳性。第七条命令会先产出一个 tiny SFT DeepSpeed checkpoint，然后调用合并脚本把分片 checkpoint 目录转成单文件 `.pth`，再加载并和原 ZeRO checkpoint 重构结果做等价性比较。多卡服务器可以加 `RWKV_SFT_SMOKE_DEVICES=8`，`train.py` 会自动用 torchrun 重启多卡 DeepSpeed；也可以设置 `RWKV_SFT_SMOKE_STRATEGY=deepspeed_stage_3` 或 `deepspeed_stage_3_offload` 来验证不同分片模式。
+第一条命令在进程内跑 CUDA forward/backward，验证 SFT masked loss。第二条命令对比同一批合成 SFT 样本在“大 batch 一次 forward”和“拆成多个 micro-batch 后按梯度累计口径聚合”时的 masked loss 精度，默认对比 `micro_bsz=2, accumulate=1` 与 `micro_bsz=1, accumulate=2` 的 loss，容差为 `RWKV_SFT_ACCUM_EQUIV_ATOL=1e-2`、`RWKV_SFT_ACCUM_EQUIV_RTOL=1e-3`，并可把差值写到 `RWKV_SFT_ACCUM_EQUIV_SUMMARY_FILE`。第三条命令真实启动 `train.py` + DeepSpeed/ZeRO 多卡训练两次，对比 DP/ZeRO 下 `micro_bsz=2, accumulate=1` 和 `micro_bsz=1, accumulate=2` 的首个 epoch loss，容差为 `RWKV_SFT_DP_ZERO_ACCUM_EQUIV_ATOL=1e-2`、`RWKV_SFT_DP_ZERO_ACCUM_EQUIV_RTOL=1e-3`，并可写出 `RWKV_SFT_DP_ZERO_ACCUM_EQUIV_SUMMARY_FILE`。第四条命令启动 `train.py` 跑 1 个 SFT step，额外覆盖 Lightning、DeepSpeed 和 optimizer 链路。第五条命令会先保存 `rwkv-step-1.pth`，再从这个 step checkpoint 恢复，覆盖 SFT 断点续训；使用 DeepSpeed strategy 时，也会覆盖 DeepSpeed 分片 checkpoint 的加载。第六条命令专门验证 WSD LR 断点续训：默认 `epoch_steps=33`、`warmup_steps=4`、`lr_wsd_decay_iters=9`，也就是 step 0-3 warmup、step 4-23 保持 `lr_init`、step 24 进入 WSD decay，step 28 衰减到一半并保存 checkpoint，resume 后继续到 step 32，检查最后记录的 LR 到 `lr_final`；这避免了“还在 warmup”或“一开始就在 decay”的假阳性，也覆盖了衰减中途断点。第七条命令会先产出一个 tiny SFT DeepSpeed checkpoint，然后调用合并脚本把分片 checkpoint 目录转成单文件 `.pth`，再加载并和原 ZeRO checkpoint 重构结果做等价性比较。多卡服务器可以加 `RWKV_SFT_SMOKE_DEVICES=8`，`train.py` 会自动用 torchrun 重启多卡 DeepSpeed；也可以设置 `RWKV_SFT_SMOKE_STRATEGY=deepspeed_stage_3` 或 `deepspeed_stage_3_offload` 来验证不同分片模式。
 
 如果要直接测试已有 checkpoint 目录的 pth 合并，而不是先训练 tiny checkpoint：
 

@@ -43,8 +43,8 @@ Completed
 - DeepSpeed/Lightning resume restores `trainer.global_step`, so WSD LR continues on the same curve when the schedule knobs are unchanged.
 - Added CPU callback coverage for resumed `global_step` keeping the correct WSD decay position.
 - Added optional server smoke `test_train_py_sft_deepspeed_resume_keeps_wsd_lr_position`.
-- The WSD resume smoke now uses a larger default shape: `epoch_steps=32`, `warmup_steps=4`, `lr_wsd_decay_iters=8`, and `save_at_step=24`.
-- This means step 0-3 warm up, step 4-23 hold `lr_init`, step 24 enters WSD decay and saves the checkpoint, and resume continues to step 31 where LR reaches `lr_final`.
+- The WSD resume smoke now uses a larger default shape: `epoch_steps=33`, `warmup_steps=4`, `lr_wsd_decay_iters=9`, and `save_at_step=28`.
+- This means step 0-3 warm up, step 4-23 hold `lr_init`, step 24 enters WSD decay, step 28 reaches the half-decay point and saves the checkpoint, and resume continues to step 32 where LR reaches `lr_final`.
 
 Validation completed
 - `conda run -n model python -m pytest -q tests/test_sft_training.py tests/test_deepspeed_checkpointing.py --cov=src.lr_schedule --cov=train --cov=src.dataset --cov=src.sft_loss --cov-report=term-missing` -> 42 passed, total 99%, `src.lr_schedule.py` 100%.

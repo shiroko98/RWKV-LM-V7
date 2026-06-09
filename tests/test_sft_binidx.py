@@ -599,6 +599,26 @@ def test_tokenize_with_char_spans_and_mask_projection(tokenizer: TRIE_TOKENIZER)
     assert sum(projected) >= 1
 
 
+def test_tokenize_with_char_spans_masks_all_byte_tokens_for_split_utf8_char(tokenizer: TRIE_TOKENIZER):
+    text = "A⋃_{i=1} B"
+    trainable_char = text.index("⋃")
+    char_mask = [1 if index == trainable_char else 0 for index, _ in enumerate(text)]
+
+    token_ids, char_spans = _tokenize_with_char_spans(tokenizer, text)
+    projected = _loss_mask_from_char_mask(char_mask, char_spans)
+    split_char_token_indexes = [
+        index
+        for index, span in enumerate(char_spans)
+        if span[0] <= trainable_char < span[1]
+    ]
+
+    assert tokenizer.decode(token_ids) == text
+    assert len(split_char_token_indexes) > 1
+    assert all(projected[index] == 1 for index in split_char_token_indexes)
+    assert projected[split_char_token_indexes[0] - 1] == 0
+    assert projected[split_char_token_indexes[-1] + 1] == 0
+
+
 def test_encode_segments_appends_eod_and_can_skip_it(tokenizer: TRIE_TOKENIZER):
     encoded = encode_segments(tokenizer, [Segment("abc", True), Segment("def", False)])
     assert tokenizer.decode(encoded.input_ids[:-1]) == "abcdef"

@@ -466,17 +466,15 @@ def _tokenize_with_char_spans(tokenizer: TRIE_TOKENIZER, text: str) -> tuple[lis
         tokens.append(token_id)
         byte_spans.append((prev_idx, idx))
 
-    text_len = len(text)
-    byte_to_char = [0] * (len(encoded) + 1)
+    byte_to_char = [0] * len(encoded)
     byte_index = 0
     for char_index, char in enumerate(text):
         char_bytes = char.encode("utf-8")
         for _ in range(len(char_bytes)):
             byte_to_char[byte_index] = char_index
             byte_index += 1
-    byte_to_char[len(encoded)] = text_len
 
-    char_spans = [(byte_to_char[start], byte_to_char[end]) for start, end in byte_spans]
+    char_spans = [(byte_to_char[start], byte_to_char[end - 1] + 1) for start, end in byte_spans]
     return tokens, char_spans
 
 

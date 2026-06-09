@@ -34,6 +34,21 @@ Validation completed
 - Full preprocessing regression and coverage passed locally:
   `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_binidx.py --cov=src.sft_binidx --cov=data.make_sft_binidx --cov=data.tokenizer.rwkv_tokenizer --cov-report=term-missing --tb=short` -> 84 passed, total 96%; `src.sft_binidx.py` 95%, `data.make_sft_binidx.py` 98%.
 
+2026-06-09 SFT UTF-8 split-token mask regression
+
+Completed
+- Fixed character-span projection for UTF-8 characters that tokenizer splits into multiple byte tokens.
+- Added a regression with rare math symbol `⋃` in `A⋃_{i=1} B`; the test masks only that character and verifies all byte-split tokens for the symbol are trainable while adjacent tokens stay masked.
+- Kept the existing Chinese mask projection test.
+- Kept `data/SFT/sample/chat_template.jinja` untouched.
+
+Validation completed
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_binidx.py::test_tokenize_with_char_spans_and_mask_projection tests\test_sft_binidx.py::test_tokenize_with_char_spans_masks_all_byte_tokens_for_split_utf8_char --tb=short` -> 2 passed.
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_binidx.py --cov=src.sft_binidx --cov=data.make_sft_binidx --cov=data.tokenizer.rwkv_tokenizer --cov-report=term-missing --tb=short` -> 85 passed, total 95%; `src.sft_binidx.py` 95%, `data.make_sft_binidx.py` 98%.
+- `D:\anaconda\envs\model\python.exe -m compileall -q src data tests` passed.
+- `git diff --check` passed.
+- `git diff -- data/SFT/sample/chat_template.jinja` was empty.
+
 2026-06-09 Chat-template rendered converted-checkpoint demo
 
 Completed

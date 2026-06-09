@@ -226,6 +226,17 @@ def _read_train_log_epoch_loss(proj_dir: Path) -> float:
     return float(parts[1])
 
 
+def _read_train_log_last_lr(proj_dir: Path) -> float:
+    log_path = proj_dir / "train_log.txt"
+    assert log_path.is_file(), f"missing train log: {log_path}"
+    lines = [line.strip() for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    epoch_lines = [line for line in lines if line[0].isdigit()]
+    assert epoch_lines, f"missing epoch lines in train log: {log_path}"
+    parts = epoch_lines[-1].split()
+    assert len(parts) >= 4, f"unexpected train log line: {epoch_lines[-1]}"
+    return float(parts[3])
+
+
 def _run_train_py(command: list[str], label: str) -> str:
     result = subprocess.run(
         command,
@@ -584,6 +595,123 @@ def test_train_py_sft_cuda_resume_from_step_checkpoint(tmp_path):
 
     assert "Preloading resume position" in resume_output
     assert "Resuming trainer state" in resume_output
+
+
+@pytest.mark.cuda
+@pytest.mark.slow
+def test_train_py_sft_deepspeed_resume_keeps_wsd_lr_position(tmp_path):
+    model_path = _require_cuda_smoke("RWKV_RUN_TRAIN_PY_SFT_WSD_RESUME_SMOKE")
+    pad_length = int(os.environ.get("RWKV_SFT_SMOKE_PAD_LENGTH", "257"))
+    ctx_len = pad_length - 1
+    assert ctx_len > 0 and ctx_len % 16 == 0, "ctx_len must be positive and divisible by the RWKV7 chunk length 16"
+
+    devices = int(os.environ.get("RWKV_SFT_SMOKE_DEVICES", "2"))
+    strategy = os.environ.get("RWKV_SFT_SMOKE_STRATEGY", "deepspeed_stage_3_offload")
+    if devices < 2:
+        pytest.skip("WSD resume smoke requires RWKV_SFT_SMOKE_DEVICES >= 2")
+    if torch.cuda.device_count() < devices:
+        pytest.skip(f"only {torch.cuda.device_count()} CUDA device(s) visible, need {devices}")
+    if "deepspeed" not in strategy:
+        pytest.skip("WSD resume smoke requires a DeepSpeed strategy")
+
+    prefix = _build_tiny_sft_binidx(tmp_path, pad_length)
+    state = _load_state_dict(model_path)
+    dims = _infer_rwkv7_dims(state)
+    proj_dir = tmp_path / "wsd_resume_out"
+    lr_init = os.environ.get("RWKV_SFT_WSD_RESUME_LR_INIT", "1e-4")
+    lr_final = os.environ.get("RWKV_SFT_WSD_RESUME_LR_FINAL", "1e-5")
+    epoch_steps = int(os.environ.get("RWKV_SFT_WSD_RESUME_EPOCH_STEPS", "32"))
+    decay_iters = int(os.environ.get("RWKV_SFT_WSD_RESUME_DECAY_ITERS", "8"))
+    warmup_steps = int(os.environ.get("RWKV_SFT_WSD_RESUME_WARMUP_STEPS", "4"))
+    save_step = int(os.environ.get("RWKV_SFT_WSD_RESUME_SAVE_STEP", str(epoch_steps - decay_iters)))
+    assert epoch_steps > decay_iters > 0
+    assert 0 <= warmup_steps < save_step < epoch_steps
+    assert save_step == epoch_steps - decay_iters, "save_step should be the WSD decay start for this smoke"
+
+    common_extra_args = [
+        "--lr_init",
+        lr_init,
+        "--lr_final",
+        lr_final,
+        "--lr_wsd_decay_iters",
+        str(decay_iters),
+        "--lr_wsd_decay_style",
+        "linear",
+        "--warmup_steps",
+        str(warmup_steps),
+        "--save_at_step",
+        str(save_step),
+        "--epoch_save",
+        "0",
+        "--keep_last_n_checkpoints",
+        "0",
+    ]
+    first_command = _train_py_command(
+        load_model=model_path,
+        prefix=prefix,
+        proj_dir=proj_dir,
+        dims=dims,
+        ctx_len=ctx_len,
+        epoch_steps=epoch_steps,
+        epoch_count=1,
+        devices=devices,
+        strategy=strategy,
+        extra_args=common_extra_args,
+    )
+    _run_train_py(first_command, "train.py SFT DeepSpeed WSD initial run")
+
+    step_checkpoint = proj_dir / f"rwkv-step-{save_step}.pth"
+    assert step_checkpoint.is_dir(), f"expected DeepSpeed checkpoint directory: {step_checkpoint}"
+
+    resume_command = _train_py_command(
+        load_model=step_checkpoint,
+        prefix=prefix,
+        proj_dir=proj_dir,
+        dims=dims,
+        ctx_len=ctx_len,
+        epoch_steps=epoch_steps,
+        epoch_count=1,
+        devices=devices,
+        strategy=strategy,
+        extra_args=[
+            "--lr_init",
+            lr_init,
+            "--lr_final",
+            lr_final,
+            "--lr_wsd_decay_iters",
+            str(decay_iters),
+            "--lr_wsd_decay_style",
+            "linear",
+            "--warmup_steps",
+            str(warmup_steps),
+            "--epoch_save",
+            "0",
+            "--keep_last_n_checkpoints",
+            "0",
+        ],
+    )
+    resume_output = _run_train_py(resume_command, "train.py SFT DeepSpeed WSD resume run")
+    assert "Preloading resume position" in resume_output
+    assert "Resuming trainer state" in resume_output
+
+    resumed_lr = _read_train_log_last_lr(proj_dir)
+    summary = {
+        "devices": devices,
+        "strategy": strategy,
+        "epoch_steps": epoch_steps,
+        "warmup_steps": warmup_steps,
+        "lr_wsd_decay_iters": decay_iters,
+        "save_step": save_step,
+        "lr_init": float(lr_init),
+        "lr_final": float(lr_final),
+        "resumed_lr": resumed_lr,
+        "proj_dir": str(proj_dir),
+    }
+    summary_file = os.environ.get("RWKV_SFT_WSD_RESUME_SUMMARY_FILE", "")
+    if summary_file:
+        Path(summary_file).expanduser().write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    assert resumed_lr == pytest.approx(float(lr_final), abs=5e-8), json.dumps(summary, indent=2)
 
 
 @pytest.mark.cuda

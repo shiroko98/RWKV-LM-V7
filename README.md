@@ -576,19 +576,35 @@ SFT masked-training implementation:
 7. `masked_cross_entropy` computes per-token CE, averages only positions with `loss_mask=1`, and returns a differentiable zero loss if the mask is empty.
 8. Gradient accumulation is executed by Lightning through `--accumulate_grad_batches`; the SFT dataset uses the same value for epoch length, full-pass step calculation, and step-checkpoint mid-epoch resume offsets. Resuming from `rwkv-step-N.pth` skips `N * accumulate_grad_batches` micro-batches, not just `N` micro-batches.
 9. SFT LR defaults to warmup-only scheduling and then stays at `lr_init`. When `--lr_wsd_decay_iters K` is enabled, the scheduler uses `total_steps = epoch_steps * epoch_count`, finds the final `K` optimizer steps, and decays from `lr_init` to `lr_final` using `--lr_wsd_decay_style linear|cosine`. This SFT WSD schedule is independent from `my_exit_tokens` and does not trigger the pretraining token-limit exit path.
+   WSD uses the `global_step` restored by Lightning, so resume from a DeepSpeed/Lightning checkpoint keeps LR on the same curve. Keep `epoch_steps`, `epoch_count`, `lr_wsd_decay_iters`, `lr_wsd_decay_style`, `lr_init`, and `lr_final` unchanged when resuming; changing them intentionally means continuing from the current step on a newly interpreted LR curve.
+
+WSD decay interval:
+
+- `epoch_steps` is optimizer steps per SFT epoch.
+- `epoch_count` is the number of SFT epochs in this run.
+- `total_steps = epoch_steps * epoch_count`.
+- `K = min(lr_wsd_decay_iters, total_steps)`.
+- decay starts at optimizer step `total_steps - K`, using 0-based step counting.
+- the matching epoch/step is:
+  - `decay_start_epoch = (total_steps - K) // epoch_steps`
+  - `decay_start_step_in_epoch = (total_steps - K) % epoch_steps`
+- `lr_wsd_decay_iters=0` or `lr_wsd_decay_style=none` disables decay, so LR stays at `lr_init` after warmup.
+
+Example: with `epoch_steps=12500`, `epoch_count=1`, and `lr_wsd_decay_iters=1000`, `total_steps=12500`; decay starts at global optimizer step `11500`, i.e. epoch 0 step 11500, and the final step reaches `lr_final`. With `epoch_count=3`, `total_steps=37500`, so the same `K=1000` starts decay at global step `36500`, i.e. epoch 2 step 11500.
 
 Validation coverage:
 
-- Default unit tests in `tests/test_sft_training.py` cover sidecar loading, mask shifting, padding, invalid masks, too-long documents, SFT epoch scheduling, dataset length/resume offsets under gradient accumulation, and masked CE math.
+- Default unit tests in `tests/test_sft_training.py` cover sidecar loading, mask shifting, padding, invalid masks, too-long documents, SFT epoch scheduling, dataset length/resume offsets under gradient accumulation, WSD LR scheduling, WSD resume step position, and masked CE math.
 - `tests/test_sft_binidx.py` covers authoritative Jinja rendering, think/no-think rules, Chinese UTF-8 spans, tool calls, packing, padding, recursive directory input, concurrent JSONL loading, and CLI parsing.
 - `RWKV_RUN_CUDA_SFT_SMOKE=1` loads a real RWKV7 checkpoint, builds a tiny SFT binidx dataset, and runs CUDA forward/backward with masked SFT loss.
 - `RWKV_RUN_TRAIN_PY_SFT_SMOKE=1` launches `train.py` for one SFT step and covers Lightning, DeepSpeed, optimizer, and multi-card torchrun. Set `RWKV_SFT_SMOKE_ACCUMULATE_GRAD_BATCHES=2` or a similar value to cover the gradient-accumulation path.
 - `RWKV_RUN_TRAIN_PY_SFT_RESUME_SMOKE=1` saves `rwkv-step-1.pth` and resumes from it, covering SFT checkpoint resume and DeepSpeed sharded checkpoint loading.
+- `RWKV_RUN_TRAIN_PY_SFT_WSD_RESUME_SMOKE=1` uses DeepSpeed to save a step checkpoint, resumes from it, and checks that `train_log.txt` records the LR at the expected WSD decay position.
 
 Current validation results:
 
-- Local default regression: `129 passed, 6 skipped`.
-- SFT training targeted: `40 passed, 6 skipped`; `src.dataset`, `src.sft_loss`, and the testable `train.py` helper surface total `99%`, with the `train.py` helper surface at `100%`.
+- Local default regression: `133 passed, 7 skipped`.
+- SFT training targeted: `42 passed`; `src.dataset`, `src.sft_loss`, `src.lr_schedule`, and the testable `train.py` helper surface total `99%`, with `src.lr_schedule.py` and the `train.py` helper surface at `100%`.
 - SFT preprocessing coverage: `src.sft_binidx`, `data.make_sft_binidx`, and `data.tokenizer.rwkv_tokenizer` total `99%`.
 - 13.3B launcher syntax check: `bash -n run_13b_sft_zero3_offload.sh` passed.
 - Server 8xH800:
@@ -715,6 +731,7 @@ Key parameters:
 - `GRAD_CP`: activation checkpointing. `1` enables block-level checkpointing to save VRAM; `0` disables it and is faster if memory allows.
 - `STRATEGY`: defaults to `deepspeed_stage_3_offload` for lower VRAM. Use `deepspeed_stage_3` for pure ZeRO-3 if memory allows.
 - `LR_INIT`, `LR_FINAL`, `WARMUP_STEPS`, `WEIGHT_DECAY`: SFT learning-rate schedule and regularization. With the default `LR_WSD_DECAY_ITERS=0`, LR stays at `LR_INIT` after warmup. Set `LR_WSD_DECAY_ITERS=K` to decay over the final `K` optimizer steps to `LR_FINAL` with `LR_WSD_DECAY_STYLE=cosine|linear`.
+- Resume LR: when resuming from a DeepSpeed/Lightning checkpoint, `trainer.global_step` is restored and WSD continues from that step. Do not casually change `EPOCH_STEPS/EPOCH_COUNT/LR_WSD_DECAY_ITERS/LR_WSD_DECAY_STYLE/LR_INIT/LR_FINAL` on resume, or the later LR curve will be reinterpreted from the current step.
 - `EPOCH_SAVE`, `SAVE_EVERY_N_STEPS`, `KEEP_LAST_N_CHECKPOINTS`: checkpoint cadence and retention.
 - `PROJ_DIR`: output directory for logs and checkpoints.
 - `WANDB_PROJECT`: empty disables wandb; a non-empty value enables logging under that project.
@@ -747,13 +764,23 @@ RWKV_RUN_TRAIN_PY_SFT_RESUME_SMOKE=1 \
 pytest -q tests/test_sft_cuda_smoke.py
 
 RWKV_SFT_SMOKE_MODEL=model/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
+RWKV_RUN_TRAIN_PY_SFT_WSD_RESUME_SMOKE=1 \
+RWKV_SFT_SMOKE_DEVICES=8 \
+RWKV_SFT_SMOKE_STRATEGY=deepspeed_stage_3_offload \
+RWKV_SFT_WSD_RESUME_EPOCH_STEPS=32 \
+RWKV_SFT_WSD_RESUME_WARMUP_STEPS=4 \
+RWKV_SFT_WSD_RESUME_DECAY_ITERS=8 \
+RWKV_SFT_WSD_RESUME_SUMMARY_FILE=/tmp/rwkv_sft_wsd_resume.json \
+pytest -q tests/test_sft_cuda_smoke.py::test_train_py_sft_deepspeed_resume_keeps_wsd_lr_position
+
+RWKV_SFT_SMOKE_MODEL=model/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
 RWKV_RUN_TRAIN_PY_SFT_MERGE_SMOKE=1 \
 RWKV_SFT_SMOKE_DEVICES=8 \
 RWKV_SFT_SMOKE_STRATEGY=deepspeed_stage_3_offload \
 pytest -q tests/test_sft_cuda_smoke.py::test_train_py_sft_deepspeed_checkpoint_converts_to_pth
 ```
 
-The first command runs an in-process CUDA forward/backward on SFT masked loss. The second command compares masked loss precision for the same synthetic SFT batch computed as one large batch versus split micro-batches under the gradient-accumulation math; by default it compares `micro_bsz=2, accumulate=1` with `micro_bsz=1, accumulate=2`, uses `RWKV_SFT_ACCUM_EQUIV_ATOL=1e-2` and `RWKV_SFT_ACCUM_EQUIV_RTOL=1e-3`, and can write the measured diff to `RWKV_SFT_ACCUM_EQUIV_SUMMARY_FILE`. The third command launches `train.py` + multi-card DeepSpeed/ZeRO twice and compares the first epoch loss for `micro_bsz=2, accumulate=1` against `micro_bsz=1, accumulate=2` under DP/ZeRO, using `RWKV_SFT_DP_ZERO_ACCUM_EQUIV_ATOL=1e-2` and `RWKV_SFT_DP_ZERO_ACCUM_EQUIV_RTOL=1e-3`; it can write the measured diff to `RWKV_SFT_DP_ZERO_ACCUM_EQUIV_SUMMARY_FILE`. The fourth command launches `train.py` for one SFT step and also validates the Lightning/DeepSpeed/optimizer path. The fifth command saves `rwkv-step-1.pth` and resumes from it, covering SFT checkpoint resume and DeepSpeed sharded checkpoint loading when a DeepSpeed strategy is used. The sixth command creates a tiny SFT DeepSpeed checkpoint, converts the sharded checkpoint directory to a single `.pth`, reloads it, and compares it against the reconstructed ZeRO checkpoint. On multi-GPU servers, add `RWKV_SFT_SMOKE_DEVICES=8`; `train.py` will relaunch with torchrun for multi-card DeepSpeed. You can also set `RWKV_SFT_SMOKE_STRATEGY=deepspeed_stage_3` or `deepspeed_stage_3_offload` to validate a different sharding mode.
+The first command runs an in-process CUDA forward/backward on SFT masked loss. The second command compares masked loss precision for the same synthetic SFT batch computed as one large batch versus split micro-batches under the gradient-accumulation math; by default it compares `micro_bsz=2, accumulate=1` with `micro_bsz=1, accumulate=2`, uses `RWKV_SFT_ACCUM_EQUIV_ATOL=1e-2` and `RWKV_SFT_ACCUM_EQUIV_RTOL=1e-3`, and can write the measured diff to `RWKV_SFT_ACCUM_EQUIV_SUMMARY_FILE`. The third command launches `train.py` + multi-card DeepSpeed/ZeRO twice and compares the first epoch loss for `micro_bsz=2, accumulate=1` against `micro_bsz=1, accumulate=2` under DP/ZeRO, using `RWKV_SFT_DP_ZERO_ACCUM_EQUIV_ATOL=1e-2` and `RWKV_SFT_DP_ZERO_ACCUM_EQUIV_RTOL=1e-3`; it can write the measured diff to `RWKV_SFT_DP_ZERO_ACCUM_EQUIV_SUMMARY_FILE`. The fourth command launches `train.py` for one SFT step and also validates the Lightning/DeepSpeed/optimizer path. The fifth command saves `rwkv-step-1.pth` and resumes from it, covering SFT checkpoint resume and DeepSpeed sharded checkpoint loading when a DeepSpeed strategy is used. The sixth command specifically validates WSD LR resume: by default `epoch_steps=32`, `warmup_steps=4`, and `lr_wsd_decay_iters=8`, so steps 0-3 warm up, steps 4-23 hold `lr_init`, step 24 enters WSD decay and saves a checkpoint, and resume continues through step 31 where the logged LR reaches `lr_final`. This avoids false positives from still being in warmup or decaying from the start. The seventh command creates a tiny SFT DeepSpeed checkpoint, converts the sharded checkpoint directory to a single `.pth`, reloads it, and compares it against the reconstructed ZeRO checkpoint. On multi-GPU servers, add `RWKV_SFT_SMOKE_DEVICES=8`; `train.py` will relaunch with torchrun for multi-card DeepSpeed. You can also set `RWKV_SFT_SMOKE_STRATEGY=deepspeed_stage_3` or `deepspeed_stage_3_offload` to validate a different sharding mode.
 
 To test pth merge for an existing checkpoint directory instead of training a tiny one first:
 

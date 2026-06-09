@@ -432,7 +432,7 @@ def test_sft_wsd_lr_schedule_supports_cosine_linear_and_default():
     assert lr_schedule.compute_sft_wsd_lr(args, 9) == pytest.approx(1e-5)
 
     args.epoch_begin = 3
-    assert lr_schedule.compute_sft_wsd_lr(args, 9) == pytest.approx(1e-5)
+    assert lr_schedule.compute_sft_wsd_lr(args, 39) == pytest.approx(1e-5)
     args.epoch_begin = 0
 
     args.lr_wsd_decay_style = "linear"
@@ -518,4 +518,43 @@ def test_train_callback_applies_sft_wsd_lr_with_group_scale_and_warmup(tmp_path)
     assert trainer.optimizers[0].param_groups[0]["lr"] == pytest.approx(expected_lr)
     assert trainer.optimizers[0].param_groups[1]["lr"] == pytest.approx(expected_lr * 2)
     assert trainer.optimizers[0].param_groups[0]["weight_decay"] == pytest.approx(0.01)
+    trainer.my_log.close()
+
+
+def test_train_callback_resume_global_step_keeps_sft_wsd_decay_position(tmp_path):
+    callback = trainer_mod.train_callback(
+        SimpleNamespace(
+            data_type="sft_binidx",
+            strategy="deepspeed_stage_3_offload",
+            proj_dir=str(tmp_path),
+            wandb="",
+            my_timestamp="2026-06-09-12-30-00",
+            run_name="sft-wsd-resume-test",
+            epoch_begin=0,
+            epoch_steps=10,
+            epoch_count=2,
+            warmup_steps=0,
+            my_exit_tokens=0,
+            ctx_len=16,
+            real_bsz=1,
+            lr_init=1e-4,
+            lr_final=1e-5,
+            lr_wsd_decay_iters=10,
+            lr_wsd_decay_style="linear",
+            weight_decay=0.0,
+        )
+    )
+
+    trainer = SimpleNamespace(
+        global_step=15,
+        is_global_zero=True,
+        strategy=SimpleNamespace(config={"zero_optimization": {"stage": 3}}),
+        optimizers=[SimpleNamespace(param_groups=[{"weight_decay": 0.0, "my_lr_scale": 1.0}])],
+    )
+
+    callback.on_train_batch_start(trainer, object(), None, 0)
+
+    expected_lr = 1e-4 + (1e-5 - 1e-4) * (5 / 9)
+    assert trainer.my_lr == pytest.approx(expected_lr)
+    assert trainer.optimizers[0].param_groups[0]["lr"] == pytest.approx(expected_lr)
     trainer.my_log.close()

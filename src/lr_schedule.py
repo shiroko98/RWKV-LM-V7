@@ -25,14 +25,16 @@ def compute_sft_wsd_lr(args, optimizer_step: int) -> float:
     if total_steps <= 0:
         raise ValueError("SFT WSD LR schedule requires positive epoch_steps and epoch_count.")
 
+    schedule_step = optimizer_step - int(getattr(args, "epoch_begin", 0) * args.epoch_steps)
+    schedule_step = max(0, schedule_step)
     decay_steps = min(decay_iters, total_steps)
     decay_start = total_steps - decay_steps
-    if optimizer_step < decay_start:
+    if schedule_step < decay_start:
         return float(args.lr_init)
-    if decay_steps <= 1 or optimizer_step >= total_steps - 1:
+    if decay_steps <= 1 or schedule_step >= total_steps - 1:
         return float(args.lr_final)
 
-    progress = (optimizer_step - decay_start) / (decay_steps - 1)
+    progress = (schedule_step - decay_start) / (decay_steps - 1)
     progress = max(0.0, min(1.0, progress))
     if style == "linear":
         return float(args.lr_init + (args.lr_final - args.lr_init) * progress)

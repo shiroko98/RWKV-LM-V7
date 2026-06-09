@@ -33,6 +33,27 @@ Validation completed
 - `git diff --check` passed with only repository line-ending warnings.
 - `git diff -- data/SFT/sample/chat_template.jinja` was empty.
 
+2026-06-09 SFT WSD LR resume follow-up
+
+Completed
+- Clarified WSD LR decay interval in README / README_CN:
+- `total_steps = epoch_steps * epoch_count`;
+- decay starts at 0-based optimizer step `total_steps - min(lr_wsd_decay_iters, total_steps)`;
+- epoch/step position is derived by integer division and modulo with `epoch_steps`;
+- DeepSpeed/Lightning resume restores `trainer.global_step`, so WSD LR continues on the same curve when the schedule knobs are unchanged.
+- Added CPU callback coverage for resumed `global_step` keeping the correct WSD decay position.
+- Added optional server smoke `test_train_py_sft_deepspeed_resume_keeps_wsd_lr_position`.
+- The WSD resume smoke now uses a larger default shape: `epoch_steps=32`, `warmup_steps=4`, `lr_wsd_decay_iters=8`, and `save_at_step=24`.
+- This means step 0-3 warm up, step 4-23 hold `lr_init`, step 24 enters WSD decay and saves the checkpoint, and resume continues to step 31 where LR reaches `lr_final`.
+
+Validation completed
+- `conda run -n model python -m pytest -q tests/test_sft_training.py tests/test_deepspeed_checkpointing.py --cov=src.lr_schedule --cov=train --cov=src.dataset --cov=src.sft_loss --cov-report=term-missing` -> 42 passed, total 99%, `src.lr_schedule.py` 100%.
+- `conda run -n model python -m pytest -q tests/test_sft_cuda_smoke.py::test_train_py_sft_deepspeed_resume_keeps_wsd_lr_position` -> 1 skipped locally as expected without `RWKV_RUN_TRAIN_PY_SFT_WSD_RESUME_SMOKE=1`.
+- `conda run -n model python -m pytest -q` -> 133 passed, 7 skipped.
+- `bash -n run_13b_sft_zero3_offload.sh` passed.
+- `git diff --check` passed with only repository line-ending warnings.
+- `git diff -- data/SFT/sample/chat_template.jinja` was empty.
+
 2026-06-08 SFT best-fit packing shard groups
 
 Completed

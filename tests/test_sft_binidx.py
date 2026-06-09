@@ -3,7 +3,7 @@ import copy
 import json
 import random
 import warnings
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 import sys
 
@@ -15,7 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import src.sft_binidx as sft_binidx
-from data.make_sft_binidx import build_arg_parser, main as make_sft_binidx_main
+from data.make_sft_binidx import ProgressBar, build_arg_parser, main as make_sft_binidx_main
 from data.tokenizer.rwkv_tokenizer import TRIE, TRIE_TOKENIZER, parse_vocab_line
 from src.binidx import MMapIndexedDataset
 from src.sft_binidx import (
@@ -1641,6 +1641,7 @@ def test_cli_main_builds_dataset_and_accepts_flags(tmp_path):
                 "--num-workers",
                 "2",
                 "--no-shuffle",
+                "--no-progress",
                 "--add-generation-prompt",
                 "--enable-thinking",
             ]
@@ -1675,6 +1676,7 @@ def test_cli_main_accepts_legacy_explicit_pack_length(tmp_path):
                 "--num-workers",
                 "2",
                 "--no-shuffle",
+                "--no-progress",
                 "--add-generation-prompt",
                 "--enable-thinking",
             ]
@@ -1686,6 +1688,117 @@ def test_cli_main_accepts_legacy_explicit_pack_length(tmp_path):
     assert (tmp_path / "cli_legacy_out.idx").exists()
     assert Path(mask_file_path(str(output_prefix))).exists()
     assert (tmp_path / "cli_legacy_out.mask.idx").exists()
+
+
+def test_cli_main_progress_bar_writes_single_stderr_line(tmp_path):
+    input_path = tmp_path / "cli_progress.jsonl"
+    sample_line = THINK_SAMPLE_PATH.read_text(encoding="utf-8").splitlines()[0]
+    input_path.write_text(
+        sample_line + "\n" + sample_line + "\n",
+        encoding="utf-8",
+    )
+    output_prefix = tmp_path / "cli_progress_out"
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        make_sft_binidx_main(
+            [
+                str(input_path),
+                "--out-prefix",
+                str(output_prefix),
+                "--vocab",
+                str(VOCAB_PATH),
+                "--chat-template",
+                str(TEMPLATE_PATH),
+                "--pack-length",
+                "128",
+                "--num-workers",
+                "2",
+                "--no-shuffle",
+                "--progress-interval",
+                "0",
+            ]
+        )
+
+    progress_output = stderr.getvalue()
+    assert "### SFT progress" in progress_output
+    assert "2/2" in progress_output
+    assert "left=0" in progress_output
+    assert "speed=" in progress_output
+    assert "file=" in progress_output
+    assert input_path.name in progress_output
+    assert ":2" in progress_output
+    assert "Built SFT binidx dataset" in stdout.getvalue()
+
+
+def test_cli_main_can_disable_progress_bar(tmp_path):
+    input_path = tmp_path / "cli_no_progress.jsonl"
+    input_path.write_text(THINK_SAMPLE_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    output_prefix = tmp_path / "cli_no_progress_out"
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        make_sft_binidx_main(
+            [
+                str(input_path),
+                "--out-prefix",
+                str(output_prefix),
+                "--vocab",
+                str(VOCAB_PATH),
+                "--chat-template",
+                str(TEMPLATE_PATH),
+                "--pack-length",
+                "128",
+                "--no-progress",
+            ]
+        )
+
+    assert "Built SFT binidx dataset" in stdout.getvalue()
+    assert stderr.getvalue() == ""
+
+
+def test_progress_bar_formats_unknown_total_group_and_shortened_paths():
+    stream = io.StringIO()
+    progress = ProgressBar(interval=0, stream=stream)
+
+    progress(
+        {
+            "done": 3,
+            "source_path": "a" * 120 + ".jsonl",
+            "line_number": 9,
+            "group_index": 2,
+            "group_count": 5,
+        }
+    )
+    progress.finish()
+    progress.finish()
+
+    output = stream.getvalue()
+    assert "### SFT progress" in output
+    assert "3 left=0" in output
+    assert "group=2/5" in output
+    assert "file=..." in output
+    assert output.endswith("\n")
+    assert output.count("\n") == 1
+
+
+def test_progress_bar_can_skip_throttled_updates_and_disabled_output():
+    stream = io.StringIO()
+    progress = ProgressBar(interval=999, stream=stream)
+    progress({"done": 1, "total": 3, "source_path": "short.jsonl", "line_number": 1})
+    first_output = stream.getvalue()
+    progress({"done": 2, "total": 3, "source_path": "short.jsonl", "line_number": 2})
+    assert stream.getvalue() == first_output
+    progress({"done": 3, "total": 3, "source_path": "short.jsonl", "line_number": 3})
+    assert "3/3" in stream.getvalue()
+
+    disabled_stream = io.StringIO()
+    disabled = ProgressBar(enabled=False, stream=disabled_stream)
+    disabled({"done": 1, "total": 1, "source_path": "short.jsonl"})
+    disabled.finish()
+    assert disabled_stream.getvalue() == ""
 
 
 def test_arg_parser_defaults_and_overrides():
@@ -1703,6 +1816,8 @@ def test_arg_parser_defaults_and_overrides():
     assert args.pad is False
     assert args.pack_length is None
     assert args.pad_length is None
+    assert args.progress is True
+    assert args.progress_interval == 0.2
 
     overridden = parser.parse_args(
         [
@@ -1732,6 +1847,9 @@ def test_arg_parser_defaults_and_overrides():
             "--num-workers",
             "3",
             "--no-shuffle",
+            "--no-progress",
+            "--progress-interval",
+            "1.5",
         ]
     )
     assert overridden.input_jsonl == ["sample.jsonl", "sample2.jsonl"]
@@ -1751,6 +1869,8 @@ def test_arg_parser_defaults_and_overrides():
     assert overridden.seed == 9
     assert overridden.num_workers == 3
     assert overridden.shuffle is False
+    assert overridden.progress is False
+    assert overridden.progress_interval == 1.5
 
 
 def test_cli_main_rejects_ambiguous_pack_and_pad_flags(tmp_path):
@@ -1763,6 +1883,25 @@ def test_cli_main_rejects_ambiguous_pack_and_pad_flags(tmp_path):
         make_sft_binidx_main([str(input_path), "--pack"])
     with pytest.raises(SystemExit):
         make_sft_binidx_main([str(input_path), "--pack", "--ctx-len", "16", "--pad-length", "17"])
+
+
+def test_cli_main_rejects_invalid_progress_and_length_flags(tmp_path):
+    input_path = tmp_path / "cli_error_more.jsonl"
+    input_path.write_text(THINK_SAMPLE_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+
+    invalid_argvs = [
+        [str(input_path), "--pack-length", "128", "--pad-length", "128"],
+        [str(input_path), "--pack", "--ctx-len", "16", "--pack-length", "17"],
+        [str(input_path), "--pad", "--ctx-len", "16", "--pad-length", "17"],
+        [str(input_path), "--ctx-len", "0"],
+        [str(input_path), "--pack-shard-group-size", "0"],
+        [str(input_path), "--pack-length", "0"],
+        [str(input_path), "--pad-length", "0"],
+        [str(input_path), "--progress-interval", "-1"],
+    ]
+    for argv in invalid_argvs:
+        with pytest.raises(SystemExit):
+            make_sft_binidx_main(argv)
 
 
 def test_tools_jsonl_smoke_still_only_trains_last_assistant_if_available(

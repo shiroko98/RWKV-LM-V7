@@ -222,7 +222,7 @@ python data/make_sft_binidx.py data/sft_part_000.jsonl data/sft_part_001.jsonl \
 
 使用 `--out-prefix` 或别名 `--output-prefix` 可以指定输出 binidx 的命名前缀。例如 `--out-prefix data/sft_train` 会写出 `data/sft_train.bin`、`data/sft_train.idx`、`data/sft_train.mask.bin`、`data/sft_train.mask.idx`。传入多个位置参数时必须显式指定输出前缀，因为脚本无法从多个源路径自动推导唯一名字；单个文件默认使用去掉 `.jsonl` 后缀的文件名，单个文件夹默认使用文件夹路径作为前缀。
 
-`--num-workers` 会用在两个阶段。默认路径的读取阶段以“一个 JSONL 文件”为一个任务，所以多个 JSONL 可以并发读取；单个大 JSONL 在读取阶段不会被多个 worker 拆分读取。`--pack-strategy best-fit-decreasing` 会按有界 JSONL shard group 读取和 packing。`--pack-shard-group-size` 默认是 `1`，保持之前一次只处理一个 shard 的内存占用；调大后，每个 group 可以并发读取多个 JSONL，并在 group 内跨文件做 best-fit packing。group 之间仍然串行：group 1 完成读取、tokenize、packing 并追加写入后，才会开始 group 2。group 内 JSONL 读取并发数是 `min(group_size, num_workers, 当前 group 文件数)`。例如 `--pack-shard-group-size 8 --num-workers 32` 最多同时读取 8 个 JSONL；`--pack-shard-group-size 64 --num-workers 32` 最多同时读取 32 个 JSONL，剩余文件排队。每个 group 内的模板渲染和 tokenization 仍会按样本并发执行，最多使用 `num_workers` 个 worker。输出写入仍是单线程 append 到同一套 token binidx 和 mask sidecar。输出仍按确定的样本顺序或 shard group 顺序写入，所以相同输入、`--seed`、`--shuffle` 设置和 group size 会得到可复现结果。当前所有文本文件按 UTF-8 读取，JSONL 额外兼容 UTF-8 BOM，中文内容会按 UTF-8 字节映射到 token span，不会在 mask 推导中丢失。
+`--num-workers` 会用在两个阶段。默认路径的读取阶段以“一个 JSONL 文件”为一个任务，所以多个 JSONL 可以并发读取；单个大 JSONL 在读取阶段不会被多个 worker 拆分读取。`--pack-strategy best-fit-decreasing` 会按有界 JSONL shard group 读取和 packing。`--pack-shard-group-size` 默认是 `1`，保持之前一次只处理一个 shard 的内存占用；调大后，每个 group 可以并发读取多个 JSONL，并在 group 内跨文件做 best-fit packing。group 之间仍然串行：group 1 完成读取、tokenize、packing 并追加写入后，才会开始 group 2。group 内 JSONL 读取并发数是 `min(group_size, num_workers, 当前 group 文件数)`。例如 `--pack-shard-group-size 8 --num-workers 32` 最多同时读取 8 个 JSONL；`--pack-shard-group-size 64 --num-workers 32` 最多同时读取 32 个 JSONL，剩余文件排队。每个 group 内的模板渲染和 tokenization 仍会按样本并发执行，最多使用 `num_workers` 个 worker。进度条默认启用，并在 stderr 上单行刷新当前文件、已处理/总数、剩余样本数和 samples/s；多 worker 时只有主线程统一刷新，worker 不直接输出。输出写入仍是单线程 append 到同一套 token binidx 和 mask sidecar。输出仍按确定的样本顺序或 shard group 顺序写入，所以相同输入、`--seed`、`--shuffle` 设置和 group size 会得到可复现结果。当前所有文本文件按 UTF-8 读取，JSONL 额外兼容 UTF-8 BOM，中文内容会按 UTF-8 字节映射到 token span，不会在 mask 推导中丢失。
 
 best-fit 命令示例：
 
@@ -272,6 +272,8 @@ python data/make_sft_binidx.py /mnt/data/datasets/sft_jsonl \
 - `--seed`：打乱顺序用的随机种子；关闭 shuffle 时不影响样本顺序。
 - `--shuffle` / `--no-shuffle`：是否在每个 epoch 内打乱样本，默认开启。
 - `--num-workers`：并发读取、渲染和 tokenize 的 worker 数，默认 `1`。
+- `--progress` / `--no-progress`：是否显示单行刷新进度条，默认开启；进度条写到 stderr，最终统计仍写到 stdout。
+- `--progress-interval`：进度条最小刷新间隔秒数，默认 `0.2`；设为 `0` 会每条样本都刷新。
 - `--ctx-len`：训练上下文 token 数；配合 `--pack` 或 `--pad` 时，预处理长度自动使用 `ctx_len + 1`。
 - `--pack`：启用顺序样本不拆分 packing，长度为 `ctx_len + 1`；不设置时默认关闭。
 - `--pack-strategy`：packing 策略，默认 `ordered` 保持样本顺序；`best-fit-decreasing` 会在每个 JSONL shard group 内按长度重排做近似最优打包，减少 padding，并把所有 group 追加到同一组输出文件。

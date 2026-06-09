@@ -6,7 +6,7 @@ import random
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 import numpy as np
 from jinja2 import Environment
@@ -844,6 +844,35 @@ def _build_document_from_source_line(
     )
 
 
+ProgressCallback = Callable[[dict[str, object]], None]
+
+
+def _emit_document_progress(
+    progress_callback: ProgressCallback | None,
+    *,
+    done: int,
+    total: int | None,
+    source: JsonlSourceLine,
+    group_index: int | None = None,
+    group_count: int | None = None,
+) -> None:
+    if progress_callback is None:
+        return
+    event: dict[str, object] = {
+        "stage": "render-tokenize",
+        "done": done,
+        "source_path": source.source_path,
+        "line_number": source.line_number,
+    }
+    if total is not None:
+        event["total"] = total
+    if group_index is not None:
+        event["group_index"] = group_index
+    if group_count is not None:
+        event["group_count"] = group_count
+    progress_callback(event)
+
+
 def build_documents_from_sources(
     sources: Sequence[JsonlSourceLine],
     *,
@@ -852,16 +881,31 @@ def build_documents_from_sources(
     current_date: str | None = None,
     current_location: str | None = None,
     num_workers: int = 1,
+    progress_callback: ProgressCallback | None = None,
+    progress_total: int | None = None,
+    progress_group_index: int | None = None,
+    progress_group_count: int | None = None,
 ) -> Iterable[EncodedDocument]:
     if num_workers <= 1:
+        done = 0
         for source in sources:
-            yield _build_document_from_source_line(
+            document = _build_document_from_source_line(
                 source,
                 tokenizer=tokenizer,
                 template=template,
                 current_date=current_date,
                 current_location=current_location,
             )
+            done += 1
+            _emit_document_progress(
+                progress_callback,
+                done=done,
+                total=progress_total,
+                source=source,
+                group_index=progress_group_index,
+                group_count=progress_group_count,
+            )
+            yield document
         return
 
     def build(source: JsonlSourceLine) -> EncodedDocument:
@@ -874,7 +918,18 @@ def build_documents_from_sources(
         )
 
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        yield from executor.map(build, sources)
+        done = 0
+        for source, document in zip(sources, executor.map(build, sources)):
+            done += 1
+            _emit_document_progress(
+                progress_callback,
+                done=done,
+                total=progress_total,
+                source=source,
+                group_index=progress_group_index,
+                group_count=progress_group_count,
+            )
+            yield document
 
 
 def append_documents_to_builders(
@@ -966,6 +1021,7 @@ def write_best_fit_decreasing_sharded_documents(
     pack_shard_group_size: int = 1,
     token_dtype=np.uint16,
     mask_dtype=np.uint8,
+    progress_callback: ProgressCallback | None = None,
 ):
     if pack_shard_group_size <= 0:
         raise ValueError("pack_shard_group_size must be a positive integer.")
@@ -986,7 +1042,8 @@ def write_best_fit_decreasing_sharded_documents(
         "filtered_documents": 0,
     }
 
-    for start in range(0, len(input_paths), pack_shard_group_size):
+    group_count = (len(input_paths) + pack_shard_group_size - 1) // pack_shard_group_size
+    for group_index, start in enumerate(range(0, len(input_paths), pack_shard_group_size), start=1):
         input_group = input_paths[start:start + pack_shard_group_size]
         sources = load_jsonl_sources(input_group, num_workers=num_workers)
         shuffled_sources = shuffled_epoch_sources(sources, n_epoch, rng, shuffle=shuffle)
@@ -997,6 +1054,10 @@ def write_best_fit_decreasing_sharded_documents(
             current_date=current_date,
             current_location=current_location,
             num_workers=num_workers,
+            progress_callback=progress_callback,
+            progress_total=len(shuffled_sources),
+            progress_group_index=group_index,
+            progress_group_count=group_count,
         )
         documents, filtered_documents = collect_filtered_documents(
             documents,
@@ -1058,6 +1119,7 @@ def build_binidx_dataset(
     shuffle: bool = True,
     pack_strategy: str = "ordered",
     pack_shard_group_size: int = 1,
+    progress_callback: ProgressCallback | None = None,
 ):
     if num_workers <= 0:
         raise ValueError("num_workers must be a positive integer.")
@@ -1087,6 +1149,7 @@ def build_binidx_dataset(
             num_workers=num_workers,
             shuffle=shuffle,
             pack_shard_group_size=pack_shard_group_size,
+            progress_callback=progress_callback,
         )
     else:
         sources = load_jsonl_sources(input_paths, num_workers=num_workers)
@@ -1099,6 +1162,8 @@ def build_binidx_dataset(
             current_date=current_date,
             current_location=current_location,
             num_workers=num_workers,
+            progress_callback=progress_callback,
+            progress_total=len(shuffled_sources),
         )
 
         max_source_length = pack_length if pack_length is not None else pad_length

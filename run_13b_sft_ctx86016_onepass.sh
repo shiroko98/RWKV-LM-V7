@@ -32,6 +32,7 @@ export EPOCH_COUNT="${EPOCH_COUNT:-1}"
 export STRATEGY="${STRATEGY:-deepspeed_stage_3_offload}"
 export GRAD_CP="${GRAD_CP:-1}"
 export DS_BUCKET_MB="${DS_BUCKET_MB:-64}"
+export SFT_MASKED_CE_CHUNK="${SFT_MASKED_CE_CHUNK:-512}"
 
 export LR_INIT="${LR_INIT:-5e-6}"
 export LR_FINAL="${LR_FINAL:-5e-7}"

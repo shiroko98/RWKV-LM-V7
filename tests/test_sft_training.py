@@ -15,7 +15,7 @@ from src import dataset as dataset_mod
 from src import lr_schedule
 from src import trainer as trainer_mod
 from src.sft_binidx import EncodedDocument, write_documents
-from src.sft_loss import masked_cross_entropy
+from src.sft_loss import masked_cross_entropy, masked_head_cross_entropy
 
 
 def make_sft_args(prefix: str, **overrides):
@@ -237,6 +237,73 @@ def test_masked_cross_entropy_handles_zero_mask_and_validates_shapes():
         masked_cross_entropy(logits, targets[:, :1], zero_mask)
     with pytest.raises(ValueError, match="loss_mask"):
         masked_cross_entropy(logits, targets, zero_mask[:, :1])
+
+
+def test_masked_head_cross_entropy_matches_full_logits_and_masks_gradients():
+    torch.manual_seed(123)
+    hidden = torch.randn(1, 4, 3, requires_grad=True)
+    weight = torch.randn(5, 3, requires_grad=True)
+    targets = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
+    loss_mask = torch.tensor([[0, 1, 0, 1]], dtype=torch.float32)
+
+    full_hidden = hidden.detach().clone().requires_grad_()
+    full_weight = weight.detach().clone().requires_grad_()
+    expected = masked_cross_entropy(F.linear(full_hidden, full_weight), targets, loss_mask)
+    actual = masked_head_cross_entropy(hidden, weight, targets, loss_mask, chunk_size=1)
+
+    assert actual.item() == pytest.approx(expected.item())
+    actual.backward()
+    expected.backward()
+
+    assert torch.allclose(hidden.grad, full_hidden.grad, atol=1e-6)
+    assert torch.allclose(weight.grad, full_weight.grad, atol=1e-6)
+    assert hidden.grad[0, 0].abs().sum().item() == pytest.approx(0)
+    assert hidden.grad[0, 2].abs().sum().item() == pytest.approx(0)
+
+
+def test_masked_head_cross_entropy_accepts_linear_head_module():
+    torch.manual_seed(321)
+    hidden = torch.randn(2, 3, 4, requires_grad=True)
+    head = torch.nn.Linear(4, 6, bias=False)
+    targets = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.long)
+    loss_mask = torch.tensor([[1, 0, 1], [0, 1, 0]], dtype=torch.float32)
+
+    full_hidden = hidden.detach().clone().requires_grad_()
+    full_head = torch.nn.Linear(4, 6, bias=False)
+    full_head.load_state_dict(head.state_dict())
+
+    expected = masked_cross_entropy(full_head(full_hidden), targets, loss_mask)
+    actual = masked_head_cross_entropy(hidden, head, targets, loss_mask, chunk_size=2)
+
+    assert actual.item() == pytest.approx(expected.item())
+    actual.backward()
+    expected.backward()
+    assert torch.allclose(hidden.grad, full_hidden.grad, atol=1e-6)
+    assert torch.allclose(head.weight.grad, full_head.weight.grad, atol=1e-6)
+
+
+def test_masked_head_cross_entropy_zero_mask_and_validation():
+    hidden = torch.randn(1, 2, 3, requires_grad=True)
+    weight = torch.randn(4, 3, requires_grad=True)
+    targets = torch.tensor([[1, 2]], dtype=torch.long)
+    zero_mask = torch.zeros(1, 2)
+
+    loss = masked_head_cross_entropy(hidden, weight, targets, zero_mask, chunk_size=2)
+    assert loss.item() == pytest.approx(0)
+    loss.backward()
+    assert hidden.grad.abs().sum().item() == pytest.approx(0)
+    assert weight.grad.abs().sum().item() == pytest.approx(0)
+
+    with pytest.raises(ValueError, match="hidden"):
+        masked_head_cross_entropy(hidden.squeeze(0), weight, targets, zero_mask)
+    with pytest.raises(ValueError, match="weight"):
+        masked_head_cross_entropy(hidden, weight[:, :2], targets, zero_mask)
+    with pytest.raises(ValueError, match="targets"):
+        masked_head_cross_entropy(hidden, weight, targets[:, :1], zero_mask)
+    with pytest.raises(ValueError, match="loss_mask"):
+        masked_head_cross_entropy(hidden, weight, targets, zero_mask[:, :1])
+    with pytest.raises(ValueError, match="chunk_size"):
+        masked_head_cross_entropy(hidden, weight, targets, zero_mask, chunk_size=0)
 
 
 def test_configure_epoch_schedule_preserves_sft_steps_and_keeps_pretrain_schedule():

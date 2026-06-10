@@ -5,6 +5,7 @@ Current status
 - SFT training core path is implemented: `data_type=sft_binidx`, automatic mask sidecar loading, shifted next-token loss mask, masked CE, explicit SFT epoch schedule, `--sft_one_pass`, gradient accumulation, WSD final LR decay, DeepSpeed resume, ZeRO checkpoint conversion, and chat-template-rendered converted-checkpoint demo.
 - README / README_CN document that SFT preprocessing worker processes run concurrently while progress is reported in input-order result-consumption order.
 - Added a ctx86016 one-pass 13.3B SFT launcher wrapper with conservative long-run defaults; SFT does not need `MAGIC_PRIME`.
+- Added switchable SFT chunked masked-head CE: `sft_masked_ce_chunk=0` keeps the old full-logits path, while positive values reduce head/loss logits peak memory for long-context SFT.
 - The historical entries below are kept as an append-only implementation log. Some older `Next` or `TODO` items are already completed by later dated entries.
 
 Open tasks
@@ -21,9 +22,10 @@ Open tasks
 
 Validation notes
 - Latest recorded local preprocessing coverage: `tests/test_sft_binidx.py` passed with total modified-surface coverage at or above 95%.
-- Latest recorded SFT training targeted coverage: `tests/test_sft_training.py` and related helpers passed with targeted coverage at or above 95%.
+- Latest recorded SFT training targeted coverage: `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_training.py tests\test_deepspeed_checkpointing.py --cov=train --cov=src.dataset --cov=src.sft_loss --cov=src.lr_schedule --cov-report=term-missing --tb=short` -> 45 passed, total 99%; `src.sft_loss.py` 96%.
+- Latest recorded syntax checks: `D:\anaconda\envs\model\python.exe -m compileall -q train.py src tests`, `bash -n run_13b_sft_zero3_offload.sh`, and `bash -n run_13b_sft_ctx86016_onepass.sh` passed.
 - Latest recorded server smoke results include CUDA SFT forward/backward, train.py SFT, resume, DP/ZeRO gradient accumulation equivalence, WSD LR resume, and DeepSpeed checkpoint conversion.
-- This top section is a documentation/status cleanup only. No code path changes are expected from this edit.
+- `git diff -- data/SFT/sample/chat_template.jinja` is empty for the current SFT masked-head CE change.
 
 2026-06-10 SFT trailing tool trim info log
 

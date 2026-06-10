@@ -9,7 +9,7 @@ from torch.nn import functional as F
 import pytorch_lightning as pl
 from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
 from pytorch_lightning.strategies import DeepSpeedStrategy
-from .sft_loss import masked_cross_entropy
+from .sft_loss import masked_cross_entropy, masked_head_cross_entropy
 if importlib.util.find_spec('deepspeed'):
     import deepspeed
     from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
@@ -904,8 +904,16 @@ class RWKV(pl.LightningModule):
             if len(batch) == 3:
                 idx, targets, loss_mask = batch
                 hidden = self(idx)
-                logits = self.head(hidden)
-                return masked_cross_entropy(logits, targets, loss_mask)
+                sft_masked_ce_chunk = getattr(self.args, "sft_masked_ce_chunk", 0)
+                if sft_masked_ce_chunk <= 0:
+                    return masked_cross_entropy(self.head(hidden), targets, loss_mask)
+                return masked_head_cross_entropy(
+                    hidden,
+                    self.head,
+                    targets,
+                    loss_mask,
+                    chunk_size=sft_masked_ce_chunk,
+                )
             idx, targets = batch
             hidden = self(idx)
             return head_l2wrap_cross_entropy(hidden, self.head.weight, targets)
@@ -920,8 +928,17 @@ class RWKV(pl.LightningModule):
         def training_step(self, batch, batch_idx):
             if len(batch) == 3:
                 idx, targets, loss_mask = batch
-                logits = self(idx)
-                return masked_cross_entropy(logits, targets, loss_mask)
+                sft_masked_ce_chunk = getattr(self.args, "sft_masked_ce_chunk", 0)
+                if sft_masked_ce_chunk <= 0:
+                    return masked_cross_entropy(self(idx), targets, loss_mask)
+                hidden = self._forward_features(idx)
+                return masked_head_cross_entropy(
+                    hidden,
+                    self.head,
+                    targets,
+                    loss_mask,
+                    chunk_size=sft_masked_ce_chunk,
+                )
             idx, targets = batch
             logits = self(idx)
 

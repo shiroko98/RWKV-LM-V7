@@ -168,6 +168,7 @@ if __name__ == "__main__":  # pragma: no cover
     parser.add_argument("--epoch_steps", default=1000, type=int)  # a mini "epoch" has [epoch_steps] steps
     parser.add_argument("--epoch_count", default=500, type=int)  # train for this many "epochs". will continue afterwards with lr = lr_final
     parser.add_argument("--sft_one_pass", default=0, type=int)  # SFT only: auto epoch_steps=ceil(num_docs/effective_bsz), epoch_count=1
+    parser.add_argument("--sft_masked_ce_chunk", default=0, type=int)  # SFT only: 0 disables, >0 chunks trainable-token head CE
     parser.add_argument("--epoch_begin", default=0, type=int)  # if you load a model trained for x "epochs", set epoch_begin = x
     parser.add_argument("--epoch_save", default=5, type=int)  # save the model every [epoch_save] "epochs"
     parser.add_argument("--save_every_n_steps", default=0, type=int)  # save every N real steps (0 to disable)
@@ -272,6 +273,8 @@ if __name__ == "__main__":  # pragma: no cover
     args.log_every_n_steps = int(1e20)
     args.max_epochs = -1  # pretrain continues forever unless my_exit_tokens stops it
     args.betas = (args.beta1, args.beta2)
+    if args.sft_masked_ce_chunk < 0:
+        raise ValueError("sft_masked_ce_chunk must be a non-negative integer.")
     args.real_bsz = int(args.num_nodes) * int(args.devices) * args.micro_bsz
     configure_batch_sizes(args)
     os.environ["DEEPSPEED_TIMEOUT"] = str(args.dist_timeout_sec)

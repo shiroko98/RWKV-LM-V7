@@ -115,6 +115,7 @@ def _base_sft_args(prefix: Path, dims: dict[str, int], ctx_len: int, **overrides
         resume_step_offset=0,
         micro_bsz=1,
         accumulate_grad_batches=1,
+        sft_masked_ce_chunk=0,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -335,6 +336,7 @@ def test_cuda_sft_checkpoint_forward_backward(tmp_path, monkeypatch):
         my_testing=os.environ["RWKV_MY_TESTING"],
         grad_cp=0,
         ctx_len=ctx_len,
+        sft_masked_ce_chunk=int(os.environ.get("RWKV_SFT_SMOKE_MASKED_CE_CHUNK", "0")),
     )
     model = RWKV(model_args).to(device="cuda", dtype=torch.bfloat16)
     model.load_state_dict(state, strict=True)
@@ -381,6 +383,7 @@ def test_cuda_sft_gradient_accumulation_loss_matches_large_batch(tmp_path, monke
         my_testing=os.environ["RWKV_MY_TESTING"],
         grad_cp=0,
         ctx_len=ctx_len,
+        sft_masked_ce_chunk=int(os.environ.get("RWKV_SFT_SMOKE_MASKED_CE_CHUNK", "0")),
     )
     model = RWKV(model_args).to(device="cuda", dtype=torch.bfloat16)
     model.load_state_dict(state, strict=True)

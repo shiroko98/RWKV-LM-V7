@@ -711,6 +711,19 @@ PY
 
 Step 3: launch 13.3B SFT on 8 H800 GPUs:
 
+For `ctx_len=86016`, 160G-scale SFT data, and one full pass, use this wrapper directly. It defaults to `SFT_ONE_PASS=1`, so `MAGIC_PRIME` is not needed and you do not need to hand-write `EPOCH_STEPS/EPOCH_COUNT`; `train.py` reads `DATA_FILE.idx` and computes the one-pass optimizer step count. The defaults are conservative: `micro_bsz=1`, 8 GPUs, no gradient accumulation, ZeRO-3-offload, block activation checkpointing, `lr=5e-6`, `weight_decay=0.01`, and 200 warmup steps. Half-day checkpointing still uses the existing `SAVE_EVERY_N_STEPS`; fill it in after measuring how many steps correspond to half a day:
+
+```bash
+LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b.pth \
+DATA_FILE=/mnt/data/Datasets/SFT_RWKV7_13B/results/SFT_RWKV7_13B \
+PROJ_DIR=/mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-ctx86016-onepass \
+SAVE_EVERY_N_STEPS=0 \
+LR_WSD_DECAY_ITERS=0 \
+bash run_13b_sft_ctx86016_onepass.sh
+```
+
+After you know the one-pass step count, a practical starting point is to set `LR_WSD_DECAY_ITERS` to the final 5%-10% of optimizer steps. If the target wall time is about 20 days and you want a checkpoint every half day, set `SAVE_EVERY_N_STEPS` to roughly total optimizer steps divided by `40`, or derive it from the measured first few hours of throughput.
+
 Use this form when you want manual control over one or more passes. Compute `EPOCH_STEPS` for one pass, then set `EPOCH_COUNT=N` for `N` passes:
 
 ```bash

@@ -499,6 +499,19 @@ PY
 
 第三步：在 8 张 H800 上启动 13.3B SFT：
 
+针对 `ctx_len=86016`、160G 级 SFT 数据、完整跑一遍数据的长训，可以直接用这个 wrapper。它默认 `SFT_ONE_PASS=1`，所以不需要 `MAGIC_PRIME`，也不需要手写 `EPOCH_STEPS/EPOCH_COUNT`；`train.py` 会从 `DATA_FILE.idx` 读取 document 数并自动计算一遍数据需要的 optimizer step。默认超参偏保守：`micro_bsz=1`、8 卡、无梯度累计、ZeRO-3-offload、开启 block 级激活检查点、`lr=5e-6`、`weight_decay=0.01`、warmup 200 step。半天保存一次仍用现有 `SAVE_EVERY_N_STEPS`，等你按真实吞吐找出半天对应多少 step 后填进去即可：
+
+```bash
+LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b.pth \
+DATA_FILE=/mnt/data/Datasets/SFT_RWKV7_13B/results/SFT_RWKV7_13B \
+PROJ_DIR=/mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-ctx86016-onepass \
+SAVE_EVERY_N_STEPS=0 \
+LR_WSD_DECAY_ITERS=0 \
+bash run_13b_sft_ctx86016_onepass.sh
+```
+
+如果后面根据一遍数据的总 step 数决定开启末段衰减，建议把 `LR_WSD_DECAY_ITERS` 设为总 optimizer step 的最后 5%-10%；如果目标约 20 天、希望每半天保存一次，`SAVE_EVERY_N_STEPS` 可以设为总 optimizer step 除以约 `40`，或者用实际前几小时吞吐换算。
+
 如果你要手动控制一遍或多遍数据，用下面这种写法。`EPOCH_STEPS` 按“一遍数据”算，想跑 `N` 遍就把 `EPOCH_COUNT=N`：
 
 ```bash

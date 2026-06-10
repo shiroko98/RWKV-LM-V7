@@ -1,3 +1,27 @@
+2026-06-10 Current SFT open tasks
+
+Current status
+- SFT preprocessing core path is implemented: UTF-8 JSONL input, recursive directory input, multiprocessing render/tokenize, progress display, best-fit-decreasing packing, bounded shard groups, group cache/resume, error log, trailing tool-result trimming, and aligned token/mask binidx output.
+- SFT training core path is implemented: `data_type=sft_binidx`, automatic mask sidecar loading, shifted next-token loss mask, masked CE, explicit SFT epoch schedule, `--sft_one_pass`, gradient accumulation, WSD final LR decay, DeepSpeed resume, ZeRO checkpoint conversion, and chat-template-rendered converted-checkpoint demo.
+- The historical entries below are kept as an append-only implementation log. Some older `Next` or `TODO` items are already completed by later dated entries.
+
+Open tasks
+- Run the full production SFT preprocessing job on the server with the chosen `--pack-shard-group-size`, `--num-workers`, `--worker-chunksize`, `--pack-cache-dir`, `--error-log`, and `--progress` settings.
+- After preprocessing completes, inspect the error/info log: real errors should be fixed or filtered intentionally; `label=trim_trailing_tool_messages` entries should be counted and spot-checked.
+- Validate the final production binidx pair: token and mask document counts match, document lengths match the training `ctx_len + 1`, mask values are only `0/1`, packing/padding behavior is expected, and mask density looks reasonable.
+- Decide final production preprocessing parameters, especially `CTX_LEN`, `--pack-shard-group-size`, shuffle policy, and cache location.
+- Run a short 13.3B SFT smoke on a small real-data shard to confirm real-data loss, throughput, memory usage, checkpoint writing, and log output.
+- Run a longer 13.3B dry run on 8xH800 with the intended DeepSpeed strategy to validate ZeRO/offload stability, activation checkpointing, checkpoint retention, resume, and WSD LR behavior under realistic settings.
+- After the first real 13.3B checkpoint, run DeepSpeed/ZeRO shard conversion to single `.pth`, converted-checkpoint equivalence, and chat-template inference smoke.
+- Finalize training hyperparameters: `MICRO_BSZ`, `ACCUMULATE_GRAD_BATCHES`, `LR_INIT`, `LR_FINAL`, `LR_WSD_DECAY_ITERS`, `LR_WSD_DECAY_STYLE`, `WEIGHT_DECAY`, checkpoint interval, checkpoint retention, and whether to use `SFT_ONE_PASS=1` or manual `EPOCH_STEPS/EPOCH_COUNT`.
+- Optionally push branch `new_sft` after the current local commits and this todolist cleanup are confirmed.
+
+Validation notes
+- Latest recorded local preprocessing coverage: `tests/test_sft_binidx.py` passed with total modified-surface coverage at or above 95%.
+- Latest recorded SFT training targeted coverage: `tests/test_sft_training.py` and related helpers passed with targeted coverage at or above 95%.
+- Latest recorded server smoke results include CUDA SFT forward/backward, train.py SFT, resume, DP/ZeRO gradient accumulation equivalence, WSD LR resume, and DeepSpeed checkpoint conversion.
+- This top section is a documentation/status cleanup only. No code path changes are expected from this edit.
+
 2026-06-10 SFT trailing tool trim info log
 
 Completed

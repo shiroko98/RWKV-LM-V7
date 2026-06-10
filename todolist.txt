@@ -7,6 +7,7 @@ Current status
 - Added a self-contained ctx86016 one-pass 13.3B SFT launcher with conservative long-run defaults; SFT does not need `MAGIC_PRIME`.
 - Added switchable SFT chunked masked-head CE for experiments, but server feedback shows positive chunks still timeout under 13B ZeRO-3 long-context SFT; production launchers currently keep `sft_masked_ce_chunk=0`.
 - Added an optional server CUDA equivalence/perf smoke for chunked masked-head CE vs full-logits CE: `RWKV_RUN_CUDA_SFT_MASKED_CE_CHUNK_EQUIV_SMOKE=1`; keep it as a small-model / single-GPU comparison, not as the production 13B ZeRO-3 path.
+- Added `run_13b_sft_profile.sh` for short 13.3B SFT profiling runs. It records train logs, GPU/CPU sampling, optional NCCL logs, and optional Nsight Systems traces for diagnosing CUDA kernel time versus ZeRO/offload/communication waits.
 - The historical entries below are kept as an append-only implementation log. Some older `Next` or `TODO` items are already completed by later dated entries.
 
 Open tasks
@@ -15,10 +16,7 @@ Open tasks
 - Validate the final production binidx pair: token and mask document counts match, document lengths match the training `ctx_len + 1`, mask values are only `0/1`, packing/padding behavior is expected, and mask density looks reasonable.
 - Decide final production preprocessing parameters, especially `CTX_LEN`, `--pack-shard-group-size`, shuffle policy, and cache location.
 - Run a short 13.3B SFT smoke on a small real-data shard to confirm real-data loss, throughput, memory usage, checkpoint writing, and log output.
-- Run the new SFT masked fused CE CUDA smokes on the server:
-  `RWKV_SFT_SMOKE_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1d-0.4b-20260210-ctx8192.pth RWKV_RUN_CUDA_SFT_MASKED_FUSED_CE_SMOKE=1 RWKV_SFT_FUSED_CE_PAD_LENGTH=4097 RWKV_SFT_FUSED_CE_STEPS=8 RWKV_SFT_FUSED_CE_CHUNK=512 RWKV_SFT_FUSED_CE_SUMMARY_FILE=/tmp/rwkv_sft_fused_ce.json python -m pytest -q tests/test_sft_cuda_smoke.py::test_cuda_sft_masked_fused_ce_training_matches_full_logits`
-- Run the new train.py + ZeRO fused CE smoke on the server:
-  `RWKV_SFT_SMOKE_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1d-0.4b-20260210-ctx8192.pth RWKV_RUN_TRAIN_PY_SFT_FUSED_CE_SMOKE=1 RWKV_SFT_SMOKE_DEVICES=8 RWKV_SFT_SMOKE_STRATEGY=deepspeed_stage_3_offload RWKV_SFT_FUSED_CE_TRAIN_PY_CHUNK=512 RWKV_SFT_FUSED_CE_TRAIN_PY_SUMMARY_FILE=/tmp/rwkv_sft_fused_ce_zero3.json python -m pytest -q tests/test_sft_cuda_smoke.py::test_train_py_sft_deepspeed_masked_fused_ce_smoke`
+- Run `run_13b_sft_profile.sh` on the server with the intended 13B config to collect step timing, GPU utilization, NCCL logs, and optional nsys trace before deciding the next CUDA/operator optimization.
 - Run a longer 13.3B dry run on 8xH800 with the intended DeepSpeed strategy to validate ZeRO/offload stability, activation checkpointing, checkpoint retention, resume, and WSD LR behavior under realistic settings.
 - Fill `SAVE_EVERY_N_STEPS` after measuring how many optimizer steps correspond to about half a day, and choose `LR_WSD_DECAY_ITERS` after confirming the one-pass step count.
 - After the first real 13.3B checkpoint, run DeepSpeed/ZeRO shard conversion to single `.pth`, converted-checkpoint equivalence, and chat-template inference smoke.
@@ -31,8 +29,16 @@ Validation notes
 - Latest recorded optional masked-head CE chunk equivalence smoke default behavior: `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_cuda_smoke.py::test_cuda_sft_masked_ce_chunk_training_matches_full_logits --tb=short` -> 1 skipped until the CUDA env flag is enabled.
 - Latest recorded syntax checks: `D:\anaconda\envs\model\python.exe -m compileall -q train.py src tests`, `bash -n run_13b_sft_zero3_offload.sh`, and `bash -n run_13b_sft_ctx86016_onepass.sh` passed.
 - Latest recorded server smoke results include CUDA SFT forward/backward, train.py SFT, resume, DP/ZeRO gradient accumulation equivalence, WSD LR resume, and DeepSpeed checkpoint conversion.
+- Latest recorded server fused masked CE smokes passed with the latest config: single-GPU full-logits-vs-fused equivalence and train.py + 8xH800 ZeRO-3-offload fused CE smoke.
 - Latest server feedback for positive `--sft_masked_ce_chunk`: `4096` and `8192` still timeout under 13B ZeRO-3 long-context SFT, so production scripts should keep it at `0` until the fused masked CUDA op exists.
 - `git diff -- data/SFT/sample/chat_template.jinja` is empty for the current SFT masked-head CE change.
+
+2026-06-10 SFT profiling launcher
+
+Completed
+- Added `run_13b_sft_profile.sh`, a short 13.3B ctx86016 SFT diagnostic launcher.
+- The script uses the production SFT mask/fused CE settings by default, runs only `PROFILE_STEPS`, disables wandb/checkpoint saves, and writes `train.log`, `gpu_monitor.csv`, optional `vmstat.log`, optional NCCL logs, and optional Nsight Systems trace/stats to `PROJ_DIR`.
+- Documented how to compare `deepspeed_stage_3_offload` and `deepspeed_stage_3`, and how to interpret low GPU utilization, high NCCL time, or model-kernel-heavy traces in README / README_CN.
 
 2026-06-10 Disable production SFT masked CE chunking
 

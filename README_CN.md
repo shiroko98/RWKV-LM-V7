@@ -708,7 +708,63 @@ python scripts/run_converted_rwkv_demo.py \
 
 这个 demo 只是验证合并后的 checkpoint 能加载、能 forward、能按 SFT chat template 生成。需要指定系统消息时可以加 `--system-prompt`、`--current-date`、`--current-location`；如果只是想做普通 next-token continuation，不经过 chat template，可以加 `--raw-prompt`。
 
-### 9. 服务器 smoke 测试命令
+### 9. 13.3B SFT profiling / ZeRO 诊断
+
+[run_13b_sft_profile.sh](/D:/codes/RWKV-LM-V7-12B-train/run_13b_sft_profile.sh) 是短跑诊断脚本，不用于正式长训。它复用 13.3B / ctx86016 / SFT mask 参数，默认只跑 `PROFILE_STEPS=8` 个 optimizer step，不保存 checkpoint、不上 wandb，并把诊断文件写到 `PROJ_DIR`：
+
+- `train.log`：完整训练日志和 step time。
+- `gpu_monitor.csv`：后台 `nvidia-smi` 采样，包含 GPU 利用率、显存、功耗。
+- `vmstat.log`：后台 CPU / IO 粗采样；服务器没有 `vmstat` 时自动跳过。
+- `nccl.*.log`：当 `NCCL_DEBUG=INFO` 时记录每个进程的 NCCL 初始化和 collective 日志。
+- `nsys_sft_profile.nsys-rep` / `nsys_stats.txt`：当 `PROFILE_MODE=nsys` 时生成 CUDA / cuBLAS / NCCL 时间线和摘要。
+
+先跑一个无 nsys 的短诊断，确认真实 step time 和 GPU 利用率：
+
+```bash
+LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b-20260415-ctx8192.pth \
+DATA_FILE=/mnt/data/Datasets/SFT_RWKV7_13B/results/SFT_RWKV7_13B \
+PROFILE_STEPS=20 \
+SFT_MASKED_FUSED_CE_CHUNK=4096 \
+STRATEGY=deepspeed_stage_3_offload \
+bash run_13b_sft_profile.sh
+```
+
+再跑一个 nsys 版本，看 CUDA kernel、cuBLAS、NCCL 在时间线上各占多少。nsys trace 会比较大，建议先用 4-8 step：
+
+```bash
+LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b-20260415-ctx8192.pth \
+DATA_FILE=/mnt/data/Datasets/SFT_RWKV7_13B/results/SFT_RWKV7_13B \
+PROFILE_STEPS=6 \
+PROFILE_MODE=nsys \
+NCCL_DEBUG=INFO \
+SFT_MASKED_FUSED_CE_CHUNK=4096 \
+STRATEGY=deepspeed_stage_3_offload \
+bash run_13b_sft_profile.sh
+```
+
+看结果时可以按下面判断：
+
+- 如果 `gpu_monitor.csv` 里大部分 GPU util 长时间很低，同时 `train.log` step time 很长，通常是 CPU offload、IO、进程同步或通信等待，不是 CUDA 算子本身算不过来。
+- 如果 nsys 时间线/`nsys_stats.txt` 里 `nccl*` kernel 或 NCCL 相关等待占比高，说明 ZeRO all-gather / reduce-scatter / 通信同步是主要瓶颈。
+- 如果 `cublas*gemm*`、`rwkv7_*`、`wkv7*` kernel 占大头且 GPU util 高，说明主要瓶颈在模型主干/矩阵乘/自定义 CUDA 算子。
+- 如果显存已经接近满，`SFT_MASKED_FUSED_CE_CHUNK` 不要继续加大；偶发 OOM 时先降到 `2048`。`SFT_MASKED_CE_CHUNK` 仍保持 `0`。
+- 对比 offload 影响时，只改 `STRATEGY`，其他参数保持一致：`deepspeed_stage_3_offload` 更省显存但可能慢，`deepspeed_stage_3` 更吃显存但能判断 CPU offload 是否是瓶颈。
+
+如果显存允许，可以用同一条命令对比纯 ZeRO-3：
+
+```bash
+LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b-20260415-ctx8192.pth \
+DATA_FILE=/mnt/data/Datasets/SFT_RWKV7_13B/results/SFT_RWKV7_13B \
+PROFILE_STEPS=10 \
+PROFILE_MODE=nsys \
+NCCL_DEBUG=INFO \
+SFT_MASKED_FUSED_CE_CHUNK=4096 \
+STRATEGY=deepspeed_stage_3 \
+RUN_TAG=zero3-no-offload \
+bash run_13b_sft_profile.sh
+```
+
+### 10. 服务器 smoke 测试命令
 
 服务器上可以打开可选 CUDA smoke 测试：
 

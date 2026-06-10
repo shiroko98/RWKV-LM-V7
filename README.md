@@ -920,7 +920,63 @@ python scripts/run_converted_rwkv_demo.py \
 
 This demo validates that the converted checkpoint loads, runs forward, and generates through the SFT chat template. Add `--system-prompt`, `--current-date`, or `--current-location` when you need those system fields. Add `--raw-prompt` only when you want plain next-token continuation without chat-template rendering.
 
-### 9. Server smoke-test commands
+### 9. 13.3B SFT Profiling / ZeRO Diagnosis
+
+[run_13b_sft_profile.sh](/D:/codes/RWKV-LM-V7-12B-train/run_13b_sft_profile.sh) is a short diagnostic launcher, not the production long-run script. It reuses the 13.3B / ctx86016 / SFT mask settings, defaults to `PROFILE_STEPS=8` optimizer steps, disables checkpoint saving and wandb, and writes artifacts under `PROJ_DIR`:
+
+- `train.log`: full train.py output and step timing.
+- `gpu_monitor.csv`: background `nvidia-smi` samples with GPU utilization, memory, and power.
+- `vmstat.log`: coarse CPU / IO samples; skipped automatically when `vmstat` is unavailable.
+- `nccl.*.log`: one NCCL log per process when `NCCL_DEBUG=INFO`.
+- `nsys_sft_profile.nsys-rep` / `nsys_stats.txt`: CUDA / cuBLAS / NCCL timeline and summary when `PROFILE_MODE=nsys`.
+
+First run without nsys to confirm real step time and GPU utilization:
+
+```bash
+LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b-20260415-ctx8192.pth \
+DATA_FILE=/mnt/data/Datasets/SFT_RWKV7_13B/results/SFT_RWKV7_13B \
+PROFILE_STEPS=20 \
+SFT_MASKED_FUSED_CE_CHUNK=4096 \
+STRATEGY=deepspeed_stage_3_offload \
+bash run_13b_sft_profile.sh
+```
+
+Then run a short nsys capture to see CUDA kernels, cuBLAS, and NCCL on the timeline. The trace can be large, so start with 4-8 steps:
+
+```bash
+LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b-20260415-ctx8192.pth \
+DATA_FILE=/mnt/data/Datasets/SFT_RWKV7_13B/results/SFT_RWKV7_13B \
+PROFILE_STEPS=6 \
+PROFILE_MODE=nsys \
+NCCL_DEBUG=INFO \
+SFT_MASKED_FUSED_CE_CHUNK=4096 \
+STRATEGY=deepspeed_stage_3_offload \
+bash run_13b_sft_profile.sh
+```
+
+Read the artifacts with these rules of thumb:
+
+- If `gpu_monitor.csv` shows low GPU utilization for long stretches while `train.log` step time is high, the run is likely waiting on CPU offload, IO, synchronization, or communication rather than raw CUDA math.
+- If the nsys timeline or `nsys_stats.txt` is dominated by `nccl*` kernels or NCCL waits, ZeRO all-gather / reduce-scatter / communication synchronization is the bottleneck.
+- If `cublas*gemm*`, `rwkv7_*`, or `wkv7*` kernels dominate and GPU utilization is high, the bottleneck is in the model trunk, matrix multiplies, or custom CUDA kernels.
+- If VRAM is already close to full, do not increase `SFT_MASKED_FUSED_CE_CHUNK`; drop it to `2048` for stability if OOMs appear. Keep `SFT_MASKED_CE_CHUNK=0`.
+- To compare offload overhead, change only `STRATEGY`: `deepspeed_stage_3_offload` saves VRAM but can be slower, while `deepspeed_stage_3` uses more VRAM and helps confirm whether CPU offload is the bottleneck.
+
+If memory allows, compare pure ZeRO-3 with the same settings:
+
+```bash
+LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b-20260415-ctx8192.pth \
+DATA_FILE=/mnt/data/Datasets/SFT_RWKV7_13B/results/SFT_RWKV7_13B \
+PROFILE_STEPS=10 \
+PROFILE_MODE=nsys \
+NCCL_DEBUG=INFO \
+SFT_MASKED_FUSED_CE_CHUNK=4096 \
+STRATEGY=deepspeed_stage_3 \
+RUN_TAG=zero3-no-offload \
+bash run_13b_sft_profile.sh
+```
+
+### 10. Server smoke-test commands
 
 Optional CUDA smoke tests are available for server validation:
 

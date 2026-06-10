@@ -435,6 +435,19 @@ def test_batch_size_helpers_track_sft_gradient_accumulation():
         train.normalize_accumulate_grad_batches(SimpleNamespace(accumulate_grad_batches="bad"))
 
 
+def test_validate_sft_loss_settings_accepts_one_backend_and_rejects_invalid_values():
+    train.validate_sft_loss_settings(SimpleNamespace(sft_masked_ce_chunk=0, sft_masked_fused_ce_chunk=0))
+    train.validate_sft_loss_settings(SimpleNamespace(sft_masked_ce_chunk=128, sft_masked_fused_ce_chunk=0))
+    train.validate_sft_loss_settings(SimpleNamespace(sft_masked_ce_chunk=0, sft_masked_fused_ce_chunk=4096))
+
+    with pytest.raises(ValueError, match="sft_masked_ce_chunk"):
+        train.validate_sft_loss_settings(SimpleNamespace(sft_masked_ce_chunk=-1, sft_masked_fused_ce_chunk=0))
+    with pytest.raises(ValueError, match="sft_masked_fused_ce_chunk"):
+        train.validate_sft_loss_settings(SimpleNamespace(sft_masked_ce_chunk=0, sft_masked_fused_ce_chunk=-1))
+    with pytest.raises(ValueError, match="either"):
+        train.validate_sft_loss_settings(SimpleNamespace(sft_masked_ce_chunk=128, sft_masked_fused_ce_chunk=4096))
+
+
 def test_checkpoint_path_helpers_handle_empty_regular_and_unreadable_paths(tmp_path, monkeypatch):
     assert train.resolve_resume_checkpoint_path("", "deepspeed_stage_2") is None
     assert train.resolve_resume_checkpoint_path(str(tmp_path / "plain.pth"), "deepspeed_stage_2") is None

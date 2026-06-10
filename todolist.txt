@@ -15,9 +15,10 @@ Open tasks
 - Validate the final production binidx pair: token and mask document counts match, document lengths match the training `ctx_len + 1`, mask values are only `0/1`, packing/padding behavior is expected, and mask density looks reasonable.
 - Decide final production preprocessing parameters, especially `CTX_LEN`, `--pack-shard-group-size`, shuffle policy, and cache location.
 - Run a short 13.3B SFT smoke on a small real-data shard to confirm real-data loss, throughput, memory usage, checkpoint writing, and log output.
-- Design and implement a dedicated SFT masked head fused CE CUDA path. Prefer adding a sibling masked op or masked forward for `rwkv7_head_l2wrap_ce_bf16_v4`, rather than only adding `loss_mask` to the logits-based `rwkv7_l2wrap_ce_bf16_v2`, because the logits-based op still materializes full `[B,T,V]` logits and does not solve 13.3B ctx86016 SFT OOM.
-- The masked fused CE design should accept `loss_mask`, skip `mask=0` rows, normalize loss and gradients by `mask_sum`, preserve the all-zero-mask differentiable-zero behavior, avoid changing the existing pretrain CE path, and decide explicitly whether L2Wrap is disabled or optional for SFT so the loss remains comparable to current masked CE.
-- Add validation for the masked fused CE path: CUDA numeric equivalence against current PyTorch `masked_cross_entropy` / `masked_head_cross_entropy`, gradient checks for hidden and head weight, all-zero-mask behavior, bf16/fp32 coverage where practical, and a server ZeRO-3 long-context smoke/perf run to confirm it avoids repeated head-weight all-gather and full-logits OOM.
+- Run the new SFT masked fused CE CUDA smokes on the server:
+  `RWKV_SFT_SMOKE_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1d-0.4b-20260210-ctx8192.pth RWKV_RUN_CUDA_SFT_MASKED_FUSED_CE_SMOKE=1 RWKV_SFT_FUSED_CE_PAD_LENGTH=4097 RWKV_SFT_FUSED_CE_STEPS=8 RWKV_SFT_FUSED_CE_CHUNK=512 RWKV_SFT_FUSED_CE_SUMMARY_FILE=/tmp/rwkv_sft_fused_ce.json python -m pytest -q tests/test_sft_cuda_smoke.py::test_cuda_sft_masked_fused_ce_training_matches_full_logits`
+- Run the new train.py + ZeRO fused CE smoke on the server:
+  `RWKV_SFT_SMOKE_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1d-0.4b-20260210-ctx8192.pth RWKV_RUN_TRAIN_PY_SFT_FUSED_CE_SMOKE=1 RWKV_SFT_SMOKE_DEVICES=8 RWKV_SFT_SMOKE_STRATEGY=deepspeed_stage_3_offload RWKV_SFT_FUSED_CE_TRAIN_PY_CHUNK=512 RWKV_SFT_FUSED_CE_TRAIN_PY_SUMMARY_FILE=/tmp/rwkv_sft_fused_ce_zero3.json python -m pytest -q tests/test_sft_cuda_smoke.py::test_train_py_sft_deepspeed_masked_fused_ce_smoke`
 - Run a longer 13.3B dry run on 8xH800 with the intended DeepSpeed strategy to validate ZeRO/offload stability, activation checkpointing, checkpoint retention, resume, and WSD LR behavior under realistic settings.
 - Fill `SAVE_EVERY_N_STEPS` after measuring how many optimizer steps correspond to about half a day, and choose `LR_WSD_DECAY_ITERS` after confirming the one-pass step count.
 - After the first real 13.3B checkpoint, run DeepSpeed/ZeRO shard conversion to single `.pth`, converted-checkpoint equivalence, and chat-template inference smoke.
@@ -39,7 +40,18 @@ Completed
 - Updated 13B production launchers and README / README_CN to keep `SFT_MASKED_CE_CHUNK=0` for production runs.
 - Documented that `0` does not add chunking/recompute/all-gather overhead, but still uses the old full-logits masked CE path and can be memory-heavy.
 - Recorded server feedback that positive chunk values such as `4096` and `8192` still timeout under 13B ZeRO-3 long-context training.
-- Left training code unchanged for now; the experimental chunked path remains available for small-model / single-GPU comparison, while the real long-context fix is the pending masked head fused CE CUDA op.
+- This entry was superseded by the CUDA-only `--sft_masked_fused_ce_chunk` implementation below. The old Python chunked path remains available for small-model / single-GPU comparison, but production should keep `SFT_MASKED_CE_CHUNK=0`.
+
+2026-06-10 SFT masked fused CE CUDA implementation
+
+In progress
+- Added CUDA-only `rwkv7_head_l2wrap_ce_bf16_v4.forward_masked` for SFT masked head CE.
+- The fused CUDA path takes `hidden`, `head.weight`, `targets`, `loss_mask`, and an internal row chunk size. It computes temporary head logits inside the op, skips `mask=0` rows, normalizes loss/gradients by `loss_mask.sum()`, and returns `grad_hidden` plus `grad_weight`.
+- The SFT fused path does not apply L2Wrap, so it is intended to match current SFT masked CE rather than the pretraining loss.
+- Pretraining `(x, y)` fused CE is left unchanged.
+- HIP files are intentionally untouched for now; the new SFT fused path is CUDA/H800 focused.
+- Added `--sft_masked_fused_ce_chunk` and `SFT_MASKED_FUSED_CE_CHUNK`, separate from the old Python `--sft_masked_ce_chunk`.
+- Added CUDA smoke coverage for single-GPU full-logits vs fused masked CE equivalence and a train.py + DeepSpeed/ZeRO fused CE smoke for timeout/memory validation.
 
 2026-06-10 SFT masked fused CE investigation
 

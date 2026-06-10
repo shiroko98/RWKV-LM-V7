@@ -603,7 +603,9 @@ In this generic example, `--accelerator gpu` tells Lightning to train on CUDA GP
 
 Training samples use next-token labels, so the dataloader needs `ctx_len + 1` token ids per SFT document. A shorter document is padded in memory with `--sft_pad_token_id` and mask `0`; a longer document raises an error. For predictable fixed-length training, build data with `--ctx-len CTX_LEN --pack` or `--ctx-len CTX_LEN --pad`; preprocessing writes `CTX_LEN + 1` token documents, then train with `--ctx_len CTX_LEN`. For RWKV7 x070, keep `ctx_len` divisible by 16.
 
-Keep `--sft_masked_ce_chunk` at `0` for now. `0` disables the experimental Python chunked masked-head CE path, so SFT uses the previous full-logits masked CE path; this setting itself does not add chunking, checkpoint recomputation, or repeated ZeRO-3 all-gather overhead. It still materializes full `[batch, ctx_len, vocab]` logits, so long-context memory pressure remains high. Positive chunk values can lower the Python loss-side logits peak, but server feedback shows that `4096/8192` still timeout for 13B + ZeRO-3 long-context training. Do not enable positive chunks for production runs yet. The better follow-up is a dedicated masked head fused CE CUDA op.
+Keep `--sft_masked_ce_chunk` at `0` for now. `0` disables the experimental Python chunked masked-head CE path, so SFT uses the previous full-logits masked CE path; this setting itself does not add chunking, checkpoint recomputation, or repeated ZeRO-3 all-gather overhead. It still materializes full `[batch, ctx_len, vocab]` logits, so long-context memory pressure remains high. Positive Python chunk values can lower the Python loss-side logits peak, but server feedback shows that `4096/8192` still timeout for 13B + ZeRO-3 long-context training. Do not enable positive Python chunks for production runs.
+
+The new `--sft_masked_fused_ce_chunk N` is a separate CUDA fused masked head CE path, not the Python chunk path above. When positive, SFT calls one fused CUDA op that internally uses an `N`-row temporary logits buffer to compute `hidden @ head.weight.T`, masked CE, `grad_hidden`, and `grad_weight`. Loss and gradients are normalized by `loss_mask.sum()`, L2Wrap is not applied, and the existing pretraining `(x, y)` fused CE path is unchanged. This path is currently CUDA/H800-oriented and defaults to `0`; run the server smokes below first, then try `SFT_MASKED_FUSED_CE_CHUNK=4096` or `8192` in the 13B launcher.
 
 The 0.4B checkpoint listed in the example is `L24-D1024` with `dim_ffn=4096`, `vocab_size=65536`, `head_size=64`, and RWKV7 G1 LoRA dimensions `64/64/32/128`. If you use another checkpoint, read its architecture text and keep these shape parameters aligned with the checkpoint.
 
@@ -617,9 +619,10 @@ SFT masked-training implementation:
 5. The dataset returns `(x, y, loss_mask)`: `x = token_ids[:-1]`, `y = token_ids[1:]`, and `loss_mask = raw_mask[1:]`. The mask is shifted so it marks whether each next-token target contributes to loss.
 6. `src/model.py::training_step` dispatches by batch shape. Pretraining batches `(x, y)` keep the existing fused CE path. SFT batches `(x, y, loss_mask)` use `src/sft_loss.py::masked_cross_entropy` by default.
 7. `masked_cross_entropy` computes per-token CE, averages only positions with `loss_mask=1`, and returns a differentiable zero loss if the mask is empty.
-8. Keep `--sft_masked_ce_chunk` at `0` for now, which means SFT defaults to full-logits masked CE. A positive value switches to `src/sft_loss.py::masked_head_cross_entropy`: the model body returns hidden states without first materializing full logits; the loss selects mask=1 target tokens, runs `hidden @ head.weight.T` plus CE in chunks of `N` trainable tokens, and averages the weighted loss. This Python chunked path remains useful for small-model or single-GPU numerical comparison, but it repeatedly triggers head-weight all-gather under 13B ZeRO-3 long-context training and has timed out on the server, so it is not recommended for production.
-9. Gradient accumulation is executed by Lightning through `--accumulate_grad_batches`; the SFT dataset uses the same value for epoch length, full-pass step calculation, and step-checkpoint mid-epoch resume offsets. Resuming from `rwkv-step-N.pth` skips `N * accumulate_grad_batches` micro-batches, not just `N` micro-batches.
-10. SFT LR defaults to warmup-only scheduling and then stays at `lr_init`. When `--lr_wsd_decay_iters K` is enabled, the scheduler uses `total_steps = epoch_steps * epoch_count`, finds the final `K` optimizer steps, and decays from `lr_init` to `lr_final` using `--lr_wsd_decay_style linear|cosine`. This SFT WSD schedule is independent from `my_exit_tokens` and does not trigger the pretraining token-limit exit path.
+8. Keep `--sft_masked_ce_chunk` at `0` for now. A positive value switches to the Python chunked `src/sft_loss.py::masked_head_cross_entropy` path: the model body returns hidden states without first materializing full logits; the loss selects mask=1 target tokens and runs `hidden @ head.weight.T` plus CE in chunks of `N` trainable tokens. This remains useful for small-model or single-GPU numerical comparison, but it repeatedly triggers head-weight all-gather under 13B ZeRO-3 long-context training and has timed out on the server, so it is not recommended for production.
+9. `--sft_masked_fused_ce_chunk N` is the new CUDA fused masked head CE path. It calls `rwkv7_head_l2wrap_ce_bf16_v4.forward_masked`, computes head logits and masked CE inside the CUDA op with an internal `N`-row chunk, and directly returns `grad_hidden/grad_weight`. This path does not use L2Wrap; it is meant to match current SFT masked CE numerically while avoiding full-logits OOM and Python chunk repeated all-gather.
+10. Gradient accumulation is executed by Lightning through `--accumulate_grad_batches`; the SFT dataset uses the same value for epoch length, full-pass step calculation, and step-checkpoint mid-epoch resume offsets. Resuming from `rwkv-step-N.pth` skips `N * accumulate_grad_batches` micro-batches, not just `N` micro-batches.
+11. SFT LR defaults to warmup-only scheduling and then stays at `lr_init`. When `--lr_wsd_decay_iters K` is enabled, the scheduler uses `total_steps = epoch_steps * epoch_count`, finds the final `K` optimizer steps, and decays from `lr_init` to `lr_final` using `--lr_wsd_decay_style linear|cosine`. This SFT WSD schedule is independent from `my_exit_tokens` and does not trigger the pretraining token-limit exit path.
    WSD uses the `global_step` restored by Lightning, so resume from a DeepSpeed/Lightning checkpoint keeps LR on the same curve. Keep `epoch_steps`, `epoch_count`, `lr_wsd_decay_iters`, `lr_wsd_decay_style`, `lr_init`, and `lr_final` unchanged when resuming; changing them intentionally means continuing from the current step on a newly interpreted LR curve.
 
 WSD decay interval:
@@ -644,7 +647,9 @@ Validation coverage:
 - `RWKV_RUN_TRAIN_PY_SFT_SMOKE=1` launches `train.py` for one SFT step and covers Lightning, DeepSpeed, optimizer, and multi-card torchrun. Set `RWKV_SFT_SMOKE_ACCUMULATE_GRAD_BATCHES=2` or a similar value to cover the gradient-accumulation path.
 - `RWKV_RUN_TRAIN_PY_SFT_RESUME_SMOKE=1` saves `rwkv-step-1.pth` and resumes from it, covering SFT checkpoint resume and DeepSpeed sharded checkpoint loading.
 - `RWKV_RUN_TRAIN_PY_SFT_WSD_RESUME_SMOKE=1` uses DeepSpeed to save a step checkpoint, resumes from it, and checks that `train_log.txt` records the LR at the expected WSD decay position.
-- `RWKV_RUN_CUDA_SFT_MASKED_CE_CHUNK_EQUIV_SMOKE=1` runs a single-GPU comparison from the same checkpoint and synthetic SFT binidx, training once with full-logits CE and once with `--sft_masked_ce_chunk`. It compares loss sequence, gradient norms, sampled parameter differences, elapsed time, and CUDA peak memory. Keep this as an experimental numerical-comparison smoke only; do not enable positive chunks for 13B ZeRO-3 production runs yet.
+- `RWKV_RUN_CUDA_SFT_MASKED_CE_CHUNK_EQUIV_SMOKE=1` runs a single-GPU comparison between full-logits CE and the old `--sft_masked_ce_chunk` Python chunked CE. Keep this as an experimental numerical-comparison smoke only; do not enable positive Python chunks for 13B ZeRO-3 production runs.
+- `RWKV_RUN_CUDA_SFT_MASKED_FUSED_CE_SMOKE=1` runs a single-GPU comparison between full-logits CE and the new `--sft_masked_fused_ce_chunk` CUDA fused masked head CE, recording loss, gradient norms, sampled parameter differences, elapsed time, and CUDA peak memory.
+- `RWKV_RUN_TRAIN_PY_SFT_FUSED_CE_SMOKE=1` runs `train.py` with DeepSpeed/ZeRO and fused masked CE, checking that the multi-GPU strategy completes and writes a finite loss; this is closer to checking whether 13B still times out.
 
 Current validation results:
 
@@ -659,7 +664,31 @@ Current validation results:
   - `RWKV_RUN_CUDA_SFT_ACCUM_EQUIV_SMOKE=1` -> `1 passed in 14.74s`.
   - `RWKV_RUN_TRAIN_PY_SFT_DP_ZERO_ACCUM_EQUIV_SMOKE=1` + `RWKV_SFT_SMOKE_DEVICES=8` + `deepspeed_stage_3_offload` -> `1 passed in 81.06s`.
   - `RWKV_RUN_TRAIN_PY_SFT_MERGE_SMOKE=1` + `RWKV_SFT_SMOKE_DEVICES=8` + `deepspeed_stage_3_offload` -> `1 passed in 284.01s`.
-- Server feedback: `--sft_masked_ce_chunk 4096/8192` still timed out for 13B + ZeRO-3 long-context training. Production launchers keep `SFT_MASKED_CE_CHUNK=0` while the follow-up masked head fused CE CUDA op is pending.
+- Server feedback: the old Python `--sft_masked_ce_chunk 4096/8192` still timed out for 13B + ZeRO-3 long-context training. Production launchers keep `SFT_MASKED_CE_CHUNK=0`. The new CUDA fused path is enabled separately through `SFT_MASKED_FUSED_CE_CHUNK` and should be smoke-tested first.
+
+New fused masked CE server smoke commands:
+
+```bash
+RWKV_SFT_SMOKE_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
+RWKV_RUN_CUDA_SFT_MASKED_FUSED_CE_SMOKE=1 \
+RWKV_SFT_FUSED_CE_PAD_LENGTH=4097 \
+RWKV_SFT_FUSED_CE_STEPS=8 \
+RWKV_SFT_FUSED_CE_MICRO_BSZ=1 \
+RWKV_SFT_FUSED_CE_CHUNK=512 \
+RWKV_SFT_FUSED_CE_SUMMARY_FILE=/tmp/rwkv_sft_fused_ce.json \
+python -m pytest -q tests/test_sft_cuda_smoke.py::test_cuda_sft_masked_fused_ce_training_matches_full_logits
+```
+
+```bash
+RWKV_SFT_SMOKE_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
+RWKV_RUN_TRAIN_PY_SFT_FUSED_CE_SMOKE=1 \
+RWKV_SFT_SMOKE_DEVICES=8 \
+RWKV_SFT_SMOKE_STRATEGY=deepspeed_stage_3_offload \
+RWKV_SFT_FUSED_CE_TRAIN_PY_CHUNK=512 \
+RWKV_SFT_FUSED_CE_TRAIN_PY_STEPS=2 \
+RWKV_SFT_FUSED_CE_TRAIN_PY_SUMMARY_FILE=/tmp/rwkv_sft_fused_ce_zero3.json \
+python -m pytest -q tests/test_sft_cuda_smoke.py::test_train_py_sft_deepspeed_masked_fused_ce_smoke
+```
 
 ## 13.3B SFT Launcher Operations
 
@@ -795,6 +824,7 @@ Key parameters:
 - `SFT_ONE_PASS`: set to `1` to let `train.py` read `DATA_FILE.idx` and override the schedule with `epoch_steps=ceil(num_documents / effective_bsz)` and `epoch_count=1`. This is the low-friction option when you want exactly one full pass. Direct `train.py` usage may omit `--epoch_steps/--epoch_count`; this launcher still passes integer placeholders, but you do not need to care about their defaults in one-pass mode.
 - `GRAD_CP`: activation checkpointing. `1` enables block-level checkpointing to save VRAM; `0` disables it and is faster if memory allows.
 - `SFT_MASKED_CE_CHUNK`: experimental head/CE chunk size for SFT masked loss. Production defaults to `0`, which uses full-logits masked CE; `0` itself has no extra chunking overhead, but it materializes full logits. Positive values compute head and CE only for mask=1 target tokens in chunks, but currently timeout under 13B ZeRO-3 long-context training and are not recommended for production.
+- `SFT_MASKED_FUSED_CE_CHUNK`: internal row chunk size for the new CUDA fused masked head CE. Default `0` disables it; after server smokes pass, try `4096` or `8192`. Do not set it positive together with `SFT_MASKED_CE_CHUNK`.
 - `STRATEGY`: defaults to `deepspeed_stage_3_offload` for lower VRAM. Use `deepspeed_stage_3` for pure ZeRO-3 if memory allows.
 - `LR_INIT`, `LR_FINAL`, `WARMUP_STEPS`, `WEIGHT_DECAY`: SFT learning-rate schedule and regularization. With the default `LR_WSD_DECAY_ITERS=0`, LR stays at `LR_INIT` after warmup. Set `LR_WSD_DECAY_ITERS=K` to decay over the final `K` optimizer steps to `LR_FINAL` with `LR_WSD_DECAY_STYLE=cosine|linear`.
 - Resume LR: when resuming from a DeepSpeed/Lightning checkpoint, `trainer.global_step` is restored and WSD continues from that step. Do not casually change `EPOCH_STEPS/EPOCH_COUNT/LR_WSD_DECAY_ITERS/LR_WSD_DECAY_STYLE/LR_INIT/LR_FINAL` on resume, or the later LR curve will be reinterpreted from the current step.

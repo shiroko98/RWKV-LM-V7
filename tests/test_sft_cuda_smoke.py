@@ -117,6 +117,7 @@ def _base_sft_args(prefix: Path, dims: dict[str, int], ctx_len: int, **overrides
         micro_bsz=1,
         accumulate_grad_batches=1,
         sft_masked_ce_chunk=0,
+        sft_masked_fused_ce_chunk=0,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -133,6 +134,7 @@ def _train_py_command(
     epoch_steps: int,
     epoch_count: int,
     micro_bsz: int = 1,
+    sft_masked_fused_ce_chunk: int | None = None,
     accumulate_grad_batches: int | None = None,
     devices: int | str | None = None,
     strategy: str | None = None,
@@ -140,6 +142,8 @@ def _train_py_command(
 ) -> list[str]:
     if accumulate_grad_batches is None:
         accumulate_grad_batches = int(os.environ.get("RWKV_SFT_SMOKE_ACCUMULATE_GRAD_BATCHES", "1"))
+    if sft_masked_fused_ce_chunk is None:
+        sft_masked_fused_ce_chunk = int(os.environ.get("RWKV_SFT_SMOKE_MASKED_FUSED_CE_CHUNK", "0"))
     if devices is None:
         devices = os.environ.get("RWKV_SFT_SMOKE_DEVICES", "1")
     if strategy is None:
@@ -166,6 +170,8 @@ def _train_py_command(
         str(epoch_count),
         "--sft_one_pass",
         "0",
+        "--sft_masked_fused_ce_chunk",
+        str(sft_masked_fused_ce_chunk),
         "--micro_bsz",
         str(micro_bsz),
         "--accumulate_grad_batches",
@@ -326,6 +332,7 @@ def test_cuda_sft_checkpoint_forward_backward(tmp_path, monkeypatch):
     monkeypatch.setenv("RWKV_CTXLEN", str(ctx_len))
     monkeypatch.setenv("RWKV_HEAD_SIZE", str(dims["head_size"]))
     monkeypatch.setenv("RWKV_HEAD_L2WRAP_CE_CHUNK", "0")
+    monkeypatch.setenv("RWKV_SFT_MASKED_FUSED_CE_CHUNK", os.environ.get("RWKV_SFT_SMOKE_MASKED_FUSED_CE_CHUNK", "0"))
     monkeypatch.setenv("RWKV_FLOAT_MODE", "bf16")
 
     from src.dataset import MyDataset
@@ -338,6 +345,7 @@ def test_cuda_sft_checkpoint_forward_backward(tmp_path, monkeypatch):
         grad_cp=0,
         ctx_len=ctx_len,
         sft_masked_ce_chunk=int(os.environ.get("RWKV_SFT_SMOKE_MASKED_CE_CHUNK", "0")),
+        sft_masked_fused_ce_chunk=int(os.environ.get("RWKV_SFT_SMOKE_MASKED_FUSED_CE_CHUNK", "0")),
     )
     model = RWKV(model_args).to(device="cuda", dtype=torch.bfloat16)
     model.load_state_dict(state, strict=True)
@@ -373,6 +381,7 @@ def test_cuda_sft_gradient_accumulation_loss_matches_large_batch(tmp_path, monke
     monkeypatch.setenv("RWKV_CTXLEN", str(ctx_len))
     monkeypatch.setenv("RWKV_HEAD_SIZE", str(dims["head_size"]))
     monkeypatch.setenv("RWKV_HEAD_L2WRAP_CE_CHUNK", "0")
+    monkeypatch.setenv("RWKV_SFT_MASKED_FUSED_CE_CHUNK", os.environ.get("RWKV_SFT_SMOKE_MASKED_FUSED_CE_CHUNK", "0"))
     monkeypatch.setenv("RWKV_FLOAT_MODE", "bf16")
 
     from src.dataset import MyDataset
@@ -385,6 +394,7 @@ def test_cuda_sft_gradient_accumulation_loss_matches_large_batch(tmp_path, monke
         grad_cp=0,
         ctx_len=ctx_len,
         sft_masked_ce_chunk=int(os.environ.get("RWKV_SFT_SMOKE_MASKED_CE_CHUNK", "0")),
+        sft_masked_fused_ce_chunk=int(os.environ.get("RWKV_SFT_SMOKE_MASKED_FUSED_CE_CHUNK", "0")),
     )
     model = RWKV(model_args).to(device="cuda", dtype=torch.bfloat16)
     model.load_state_dict(state, strict=True)
@@ -470,6 +480,7 @@ def test_cuda_sft_masked_ce_chunk_training_matches_full_logits(tmp_path, monkeyp
     monkeypatch.setenv("RWKV_CTXLEN", str(ctx_len))
     monkeypatch.setenv("RWKV_HEAD_SIZE", str(dims["head_size"]))
     monkeypatch.setenv("RWKV_HEAD_L2WRAP_CE_CHUNK", "0")
+    monkeypatch.setenv("RWKV_SFT_MASKED_FUSED_CE_CHUNK", "0")
     monkeypatch.setenv("RWKV_FLOAT_MODE", "bf16")
 
     from src.dataset import MyDataset
@@ -499,6 +510,7 @@ def test_cuda_sft_masked_ce_chunk_training_matches_full_logits(tmp_path, monkeyp
             grad_cp=0,
             ctx_len=ctx_len,
             sft_masked_ce_chunk=sft_masked_ce_chunk,
+            sft_masked_fused_ce_chunk=0,
         )
         model = RWKV(model_args).to(device="cuda", dtype=torch.bfloat16)
         model.load_state_dict(state, strict=True)
@@ -618,6 +630,180 @@ def test_cuda_sft_masked_ce_chunk_training_matches_full_logits(tmp_path, monkeyp
 
 @pytest.mark.cuda
 @pytest.mark.slow
+def test_cuda_sft_masked_fused_ce_training_matches_full_logits(tmp_path, monkeypatch):
+    model_path = _require_cuda_smoke("RWKV_RUN_CUDA_SFT_MASKED_FUSED_CE_SMOKE")
+    pad_length = int(os.environ.get("RWKV_SFT_FUSED_CE_PAD_LENGTH", "1025"))
+    ctx_len = pad_length - 1
+    steps = int(os.environ.get("RWKV_SFT_FUSED_CE_STEPS", "4"))
+    micro_bsz = int(os.environ.get("RWKV_SFT_FUSED_CE_MICRO_BSZ", "1"))
+    fused_chunk = int(os.environ.get("RWKV_SFT_FUSED_CE_CHUNK", "512"))
+    lr = float(os.environ.get("RWKV_SFT_FUSED_CE_LR", "1e-5"))
+    assert steps >= 1
+    assert micro_bsz >= 1
+    assert fused_chunk > 0
+    assert ctx_len > 0 and ctx_len % 16 == 0, "ctx_len must be positive and divisible by the RWKV7 chunk length 16"
+
+    state = _load_state_dict(model_path)
+    dims = _infer_rwkv7_dims(state)
+    prefix = _build_accum_equiv_sft_binidx(tmp_path, pad_length, docs=steps * micro_bsz, vocab_size=dims["vocab_size"])
+
+    monkeypatch.setenv("RWKV_MY_TESTING", os.environ.get("RWKV_SFT_SMOKE_MY_TESTING", "x070"))
+    monkeypatch.setenv("RWKV_KERNEL", os.environ.get("RWKV_SFT_SMOKE_KERNEL", ""))
+    monkeypatch.setenv("RWKV_JIT_ON", "1")
+    monkeypatch.setenv("RWKV_CTXLEN", str(ctx_len))
+    monkeypatch.setenv("RWKV_HEAD_SIZE", str(dims["head_size"]))
+    monkeypatch.setenv("RWKV_HEAD_L2WRAP_CE_CHUNK", "0")
+    monkeypatch.setenv("RWKV_SFT_MASKED_FUSED_CE_CHUNK", str(fused_chunk))
+    monkeypatch.setenv("RWKV_FLOAT_MODE", "bf16")
+
+    sys.modules.pop("src.model", None)
+    from src.dataset import MyDataset
+    from src.model import RWKV
+
+    dataset = MyDataset(_base_sft_args(prefix, dims, ctx_len, epoch_steps=steps, micro_bsz=micro_bsz))
+    examples = [dataset[idx] for idx in range(steps * micro_bsz)]
+    selected_names = [
+        "emb.weight",
+        "head.weight",
+        "ln_out.weight",
+        "blocks.0.ffn.key.weight",
+        "blocks.0.att.receptance.weight",
+    ]
+
+    def tensor_snapshot(tensor: torch.Tensor) -> torch.Tensor:
+        slices = tuple(slice(0, min(256, dim)) for dim in tensor.shape)
+        return tensor.detach().float()[slices].cpu().clone()
+
+    def run_variant(sft_masked_fused_ce_chunk: int):
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        model_args = SimpleNamespace(
+            **dims,
+            dim_att=dims["n_embd"],
+            my_testing=os.environ["RWKV_MY_TESTING"],
+            grad_cp=0,
+            ctx_len=ctx_len,
+            sft_masked_ce_chunk=0,
+            sft_masked_fused_ce_chunk=sft_masked_fused_ce_chunk,
+        )
+        model = RWKV(model_args).to(device="cuda", dtype=torch.bfloat16)
+        model.load_state_dict(state, strict=True)
+        model.train()
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+        losses = []
+        grad_norms = []
+        started_at = time.perf_counter()
+
+        for step in range(steps):
+            batch_examples = examples[step * micro_bsz : (step + 1) * micro_bsz]
+            batch = tuple(
+                torch.stack([example[field] for example in batch_examples]).cuda(non_blocking=True)
+                for field in range(3)
+            )
+            optimizer.zero_grad(set_to_none=True)
+            loss = model.training_step(batch, step)
+            assert torch.isfinite(loss.detach()).item()
+            loss.backward()
+            grad_norm_sq = 0.0
+            for parameter in model.parameters():
+                if parameter.grad is not None:
+                    grad_norm_sq += float(parameter.grad.detach().float().norm().item() ** 2)
+            grad_norms.append(grad_norm_sq ** 0.5)
+            optimizer.step()
+            losses.append(float(loss.detach().float().cpu().item()))
+
+        torch.cuda.synchronize()
+        elapsed_sec = time.perf_counter() - started_at
+        peak_memory_bytes = int(torch.cuda.max_memory_allocated())
+        with torch.no_grad():
+            state_dict = model.state_dict()
+            snapshots = {
+                name: tensor_snapshot(state_dict[name])
+                for name in selected_names
+                if name in state_dict
+            }
+            checksum = 0.0
+            sq_norm = 0.0
+            max_abs = 0.0
+            for parameter in model.parameters():
+                value = parameter.detach().float()
+                checksum += float(value.sum().item())
+                sq_norm += float(value.square().sum().item())
+                max_abs = max(max_abs, float(value.abs().max().item()))
+        del model
+        del optimizer
+        torch.cuda.empty_cache()
+        return {
+            "losses": losses,
+            "grad_norms": grad_norms,
+            "elapsed_sec": elapsed_sec,
+            "tokens_per_sec": float(steps * micro_bsz * ctx_len / elapsed_sec),
+            "peak_memory_bytes": peak_memory_bytes,
+            "peak_memory_gib": float(peak_memory_bytes / (1024**3)),
+            "param_checksum": checksum,
+            "param_l2_norm": sq_norm ** 0.5,
+            "param_max_abs": max_abs,
+            "snapshots": snapshots,
+        }
+
+    full = run_variant(0)
+    fused = run_variant(fused_chunk)
+
+    loss_diffs = [abs(a - b) for a, b in zip(full["losses"], fused["losses"])]
+    grad_norm_diffs = [abs(a - b) for a, b in zip(full["grad_norms"], fused["grad_norms"])]
+    param_diffs = {
+        name: float((full["snapshots"][name] - fused["snapshots"][name]).abs().max().item())
+        for name in full["snapshots"].keys() & fused["snapshots"].keys()
+    }
+    max_loss_diff = max(loss_diffs) if loss_diffs else 0.0
+    max_grad_norm_diff = max(grad_norm_diffs) if grad_norm_diffs else 0.0
+    max_param_diff = max(param_diffs.values()) if param_diffs else 0.0
+    checksum_diff = abs(full["param_checksum"] - fused["param_checksum"])
+    l2_norm_diff = abs(full["param_l2_norm"] - fused["param_l2_norm"])
+    loss_atol = float(os.environ.get("RWKV_SFT_FUSED_CE_LOSS_ATOL", "2e-2"))
+    loss_rtol = float(os.environ.get("RWKV_SFT_FUSED_CE_LOSS_RTOL", "2e-3"))
+    param_atol = float(os.environ.get("RWKV_SFT_FUSED_CE_PARAM_ATOL", "2e-2"))
+    param_rtol = float(os.environ.get("RWKV_SFT_FUSED_CE_PARAM_RTOL", "1e-2"))
+    loss_allowed = max(
+        loss_atol + loss_rtol * max(abs(a), abs(b))
+        for a, b in zip(full["losses"], fused["losses"])
+    )
+    param_allowed = param_atol + param_rtol * max(full["param_max_abs"], fused["param_max_abs"])
+    summary = {
+        "pad_length": pad_length,
+        "ctx_len": ctx_len,
+        "steps": steps,
+        "micro_bsz": micro_bsz,
+        "fused_chunk": fused_chunk,
+        "lr": lr,
+        "full_logits": {key: value for key, value in full.items() if key != "snapshots"},
+        "fused_masked_head": {key: value for key, value in fused.items() if key != "snapshots"},
+        "loss_diffs": loss_diffs,
+        "max_loss_diff": max_loss_diff,
+        "loss_allowed": loss_allowed,
+        "grad_norm_diffs": grad_norm_diffs,
+        "max_grad_norm_diff": max_grad_norm_diff,
+        "param_snapshot_max_abs_diffs": param_diffs,
+        "max_param_snapshot_diff": max_param_diff,
+        "param_allowed": param_allowed,
+        "param_checksum_diff": checksum_diff,
+        "param_l2_norm_diff": l2_norm_diff,
+        "memory_delta_gib": full["peak_memory_gib"] - fused["peak_memory_gib"],
+        "fused_peak_memory_ratio": fused["peak_memory_bytes"] / max(full["peak_memory_bytes"], 1),
+        "fused_elapsed_ratio": fused["elapsed_sec"] / max(full["elapsed_sec"], 1e-9),
+    }
+    summary_file = os.environ.get("RWKV_SFT_FUSED_CE_SUMMARY_FILE", "")
+    if summary_file:
+        Path(summary_file).expanduser().write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    assert max_loss_diff <= loss_allowed, json.dumps(summary, indent=2)
+    assert max_param_diff <= param_allowed, json.dumps(summary, indent=2)
+    if os.environ.get("RWKV_SFT_FUSED_CE_REQUIRE_MEMORY_IMPROVEMENT", "") == "1":
+        assert fused["peak_memory_bytes"] < full["peak_memory_bytes"], json.dumps(summary, indent=2)
+
+
+@pytest.mark.cuda
+@pytest.mark.slow
 def test_train_py_sft_cuda_one_step(tmp_path):
     model_path = _require_cuda_smoke("RWKV_RUN_TRAIN_PY_SFT_SMOKE")
     pad_length = int(os.environ.get("RWKV_SFT_SMOKE_PAD_LENGTH", "257"))
@@ -727,6 +913,69 @@ def test_train_py_sft_deepspeed_accumulation_loss_matches_large_micro_batch(tmp_
         Path(summary_file).expanduser().write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     assert diff <= allowed, json.dumps(summary, indent=2)
+
+
+@pytest.mark.cuda
+@pytest.mark.slow
+def test_train_py_sft_deepspeed_masked_fused_ce_smoke(tmp_path):
+    model_path = _require_cuda_smoke("RWKV_RUN_TRAIN_PY_SFT_FUSED_CE_SMOKE")
+    pad_length = int(os.environ.get("RWKV_SFT_FUSED_CE_TRAIN_PY_PAD_LENGTH", os.environ.get("RWKV_SFT_SMOKE_PAD_LENGTH", "257")))
+    ctx_len = pad_length - 1
+    assert ctx_len > 0 and ctx_len % 16 == 0, "ctx_len must be positive and divisible by the RWKV7 chunk length 16"
+
+    devices = int(os.environ.get("RWKV_SFT_SMOKE_DEVICES", "2"))
+    strategy = os.environ.get("RWKV_SFT_SMOKE_STRATEGY", "deepspeed_stage_3_offload")
+    if devices < 2:
+        pytest.skip("DeepSpeed fused CE smoke requires RWKV_SFT_SMOKE_DEVICES >= 2")
+    if torch.cuda.device_count() < devices:
+        pytest.skip(f"only {torch.cuda.device_count()} CUDA device(s) visible, need {devices}")
+    if "deepspeed" not in strategy:
+        pytest.skip("DeepSpeed fused CE smoke requires a DeepSpeed strategy")
+
+    epoch_steps = int(os.environ.get("RWKV_SFT_FUSED_CE_TRAIN_PY_STEPS", "2"))
+    fused_chunk = int(os.environ.get("RWKV_SFT_FUSED_CE_TRAIN_PY_CHUNK", "512"))
+    assert epoch_steps >= 1
+    assert fused_chunk > 0
+
+    prefix = _build_tiny_sft_binidx(tmp_path, pad_length)
+    state = _load_state_dict(model_path)
+    dims = _infer_rwkv7_dims(state)
+    proj_dir = tmp_path / "fused_ce_train_py"
+
+    command = _train_py_command(
+        load_model=model_path,
+        prefix=prefix,
+        proj_dir=proj_dir,
+        dims=dims,
+        ctx_len=ctx_len,
+        epoch_steps=epoch_steps,
+        epoch_count=1,
+        devices=devices,
+        strategy=strategy,
+        sft_masked_fused_ce_chunk=fused_chunk,
+    )
+    started_at = time.perf_counter()
+    output = _run_train_py(command, "train.py SFT DeepSpeed masked fused CE")
+    elapsed_sec = time.perf_counter() - started_at
+    loss = _read_train_log_epoch_loss(proj_dir)
+
+    summary = {
+        "pad_length": pad_length,
+        "ctx_len": ctx_len,
+        "devices": devices,
+        "strategy": strategy,
+        "epoch_steps": epoch_steps,
+        "fused_chunk": fused_chunk,
+        "loss": loss,
+        "elapsed_sec": elapsed_sec,
+        "proj_dir": str(proj_dir),
+        "output_tail": output[-4000:],
+    }
+    summary_file = os.environ.get("RWKV_SFT_FUSED_CE_TRAIN_PY_SUMMARY_FILE", "")
+    if summary_file:
+        Path(summary_file).expanduser().write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    assert torch.isfinite(torch.tensor(loss)).item(), json.dumps(summary, indent=2)
 
 
 @pytest.mark.cuda

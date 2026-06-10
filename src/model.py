@@ -494,15 +494,19 @@ def l2wrap_cross_entropy(logits, targets):
 
 ########################################################################################################
 
-if int(os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"]) > 0:
-    HEAD_L2WRAP_CE_CHUNK = int(os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"])
+HEAD_L2WRAP_CE_CHUNK = int(os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"])
+SFT_MASKED_FUSED_CE_CHUNK = int(os.environ.get("RWKV_SFT_MASKED_FUSED_CE_CHUNK", "0"))
+if SFT_MASKED_FUSED_CE_CHUNK > 0 and ROCm_flag:
+    raise RuntimeError("SFT masked fused CE is currently implemented for CUDA only; keep sft_masked_fused_ce_chunk=0 on ROCm.")
+if HEAD_L2WRAP_CE_CHUNK > 0 or SFT_MASKED_FUSED_CE_CHUNK > 0:
+    HEAD_CE_COMPILE_CHUNK = HEAD_L2WRAP_CE_CHUNK if HEAD_L2WRAP_CE_CHUNK > 0 else SFT_MASKED_FUSED_CE_CHUNK
     if ROCm_flag:
-        HEAD_L2WRAP_CE_CUDA_V4 = load(name="rwkv7_head_l2wrap_ce_bf16_v4", sources=["hip/rwkv7_head_l2wrap_ce_bf16_v4_op.hip","hip/rwkv7_head_l2wrap_ce_bf16_v4.hip"], extra_cflags=["-O3", f"-DHEAD_CE_CHUNK={HEAD_L2WRAP_CE_CHUNK}"],
-            extra_cuda_cflags=["-xhip", "-fopenmp", "-ffast-math", "-O3", "-munsafe-fp-atomics","--save-temps", '-DAMD', f"-DHEAD_CE_CHUNK={HEAD_L2WRAP_CE_CHUNK}"],
+        HEAD_L2WRAP_CE_CUDA_V4 = load(name="rwkv7_head_l2wrap_ce_bf16_v4", sources=["hip/rwkv7_head_l2wrap_ce_bf16_v4_op.hip","hip/rwkv7_head_l2wrap_ce_bf16_v4.hip"], extra_cflags=["-O3", f"-DHEAD_CE_CHUNK={HEAD_CE_COMPILE_CHUNK}"],
+            extra_cuda_cflags=["-xhip", "-fopenmp", "-ffast-math", "-O3", "-munsafe-fp-atomics","--save-temps", '-DAMD', f"-DHEAD_CE_CHUNK={HEAD_CE_COMPILE_CHUNK}"],
             verbose=True)
     else:
-        HEAD_L2WRAP_CE_CUDA_V4 = load(name="rwkv7_head_l2wrap_ce_bf16_v4", sources=["cuda/rwkv7_head_l2wrap_ce_bf16_v4.cpp","cuda/rwkv7_head_l2wrap_ce_bf16_v4.cu"], extra_cflags=["-O3", f"-DHEAD_CE_CHUNK={HEAD_L2WRAP_CE_CHUNK}"],
-            extra_cuda_cflags=['-res-usage', "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization", f"-DHEAD_CE_CHUNK={HEAD_L2WRAP_CE_CHUNK}"],
+        HEAD_L2WRAP_CE_CUDA_V4 = load(name="rwkv7_head_l2wrap_ce_bf16_v4", sources=["cuda/rwkv7_head_l2wrap_ce_bf16_v4.cpp","cuda/rwkv7_head_l2wrap_ce_bf16_v4.cu"], extra_cflags=["-O3", f"-DHEAD_CE_CHUNK={HEAD_CE_COMPILE_CHUNK}"],
+            extra_cuda_cflags=['-res-usage', "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization", f"-DHEAD_CE_CHUNK={HEAD_CE_COMPILE_CHUNK}"],
             verbose=True)
 
     class HeadL2WrapCrossEntropyCUDAV4(torch.autograd.Function):
@@ -530,6 +534,34 @@ if int(os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"]) > 0:
 
     def head_l2wrap_cross_entropy(hidden, weight, targets):
         return HeadL2WrapCrossEntropyCUDAV4.apply(hidden, weight, targets)
+
+    class HeadMaskedCrossEntropyCUDAV4(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, hidden, weight, targets, loss_mask, chunk_rows):
+            hidden = hidden.contiguous()
+            weight = weight.contiguous()
+            targets = targets.contiguous()
+            loss_mask = loss_mask.contiguous().float()
+            loss, grad_hidden, grad_weight = HEAD_L2WRAP_CE_CUDA_V4.forward_masked(
+                hidden,
+                weight,
+                targets,
+                loss_mask,
+                int(chunk_rows),
+            )
+            ctx.save_for_backward(grad_hidden, grad_weight)
+            return loss
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            grad_hidden, grad_weight = ctx.saved_tensors
+            if grad_output.numel() == 1 and float(grad_output.detach()) == 1.0:
+                return grad_hidden, grad_weight, None, None, None
+            scale = grad_output.to(dtype=torch.float32)
+            return grad_hidden * scale.to(grad_hidden.dtype), grad_weight * scale.to(grad_weight.dtype), None, None, None
+
+    def head_masked_cross_entropy_cuda(hidden, weight, targets, loss_mask, chunk_rows):
+        return HeadMaskedCrossEntropyCUDAV4.apply(hidden, weight, targets, loss_mask, chunk_rows)
 
 ########################################################################################################
 
@@ -904,6 +936,15 @@ class RWKV(pl.LightningModule):
             if len(batch) == 3:
                 idx, targets, loss_mask = batch
                 hidden = self(idx)
+                sft_masked_fused_ce_chunk = getattr(self.args, "sft_masked_fused_ce_chunk", 0)
+                if sft_masked_fused_ce_chunk > 0:
+                    return head_masked_cross_entropy_cuda(
+                        hidden,
+                        self.head.weight,
+                        targets,
+                        loss_mask,
+                        sft_masked_fused_ce_chunk,
+                    )
                 sft_masked_ce_chunk = getattr(self.args, "sft_masked_ce_chunk", 0)
                 if sft_masked_ce_chunk <= 0:
                     return masked_cross_entropy(self.head(hidden), targets, loss_mask)
@@ -928,6 +969,16 @@ class RWKV(pl.LightningModule):
         def training_step(self, batch, batch_idx):
             if len(batch) == 3:
                 idx, targets, loss_mask = batch
+                sft_masked_fused_ce_chunk = getattr(self.args, "sft_masked_fused_ce_chunk", 0)
+                if sft_masked_fused_ce_chunk > 0:
+                    hidden = self._forward_features(idx)
+                    return head_masked_cross_entropy_cuda(
+                        hidden,
+                        self.head.weight,
+                        targets,
+                        loss_mask,
+                        sft_masked_fused_ce_chunk,
+                    )
                 sft_masked_ce_chunk = getattr(self.args, "sft_masked_ce_chunk", 0)
                 if sft_masked_ce_chunk <= 0:
                     return masked_cross_entropy(self(idx), targets, loss_mask)

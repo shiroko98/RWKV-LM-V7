@@ -185,6 +185,144 @@ __global__ void reduce_loss_kernel(
 }
 
 template <typename scalar_t, int BLOCK_SIZE>
+__global__ void masked_row_chunk_loss_and_grad_kernel(
+    scalar_t* __restrict__ logits,
+    const int64_t* __restrict__ targets,
+    const float* __restrict__ loss_mask,
+    const float* __restrict__ mask_sum,
+    float* __restrict__ loss_rows,
+    int64_t row_start,
+    int64_t chunk_rows) {
+    const int64_t row = static_cast<int64_t>(blockIdx.x);
+    if (row >= chunk_rows) {
+        return;
+    }
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    constexpr int kWarps = BLOCK_SIZE / 32;
+    const int64_t global_row = row_start + row;
+    const int64_t base = row * HEAD_L2WRAP_CE_VOCAB;
+    const float row_mask = loss_mask[global_row];
+    const float denom = mask_sum[0];
+
+    if (denom <= 0.0f || row_mask == 0.0f) {
+        if (tid == 0) {
+            loss_rows[global_row] = 0.0f;
+        }
+        for (int64_t col = tid; col < HEAD_L2WRAP_CE_VOCAB; col += BLOCK_SIZE) {
+            logits[base + col] = float_to_scalar<scalar_t>(0.0f);
+        }
+        return;
+    }
+
+    const int target = static_cast<int>(targets[global_row]);
+
+    float local_max = NEG_INF_F;
+    int local_idx = 0;
+    float local_target = 0.0f;
+    for (int64_t col = tid; col < HEAD_L2WRAP_CE_VOCAB; col += BLOCK_SIZE) {
+        const float v = scalar_to_float(logits[base + col]);
+        reduce_max_first(local_max, local_idx, v, static_cast<int>(col));
+        if (static_cast<int>(col) == target) {
+            local_target = v;
+        }
+    }
+
+    warp_reduce_max_first(local_max, local_idx);
+    local_target = warp_reduce_sum(local_target);
+
+    __shared__ float warp_val[16];
+    __shared__ int warp_idx[16];
+    __shared__ float warp_target[16];
+    __shared__ float shared_max;
+    __shared__ float shared_lse;
+    if (lane == 0) {
+        warp_val[warp] = local_max;
+        warp_idx[warp] = local_idx;
+        warp_target[warp] = local_target;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float block_max = lane < kWarps ? warp_val[lane] : NEG_INF_F;
+        int block_idx = lane < kWarps ? warp_idx[lane] : 0;
+        float target_val = lane < kWarps ? warp_target[lane] : 0.0f;
+        warp_reduce_max_first(block_max, block_idx);
+        target_val = warp_reduce_sum(target_val);
+        if (lane == 0) {
+            shared_max = block_max;
+            warp_target[0] = target_val;
+        }
+    }
+    __syncthreads();
+
+    const float block_max = shared_max;
+    float local_sum = 0.0f;
+    for (int64_t col = tid; col < HEAD_L2WRAP_CE_VOCAB; col += BLOCK_SIZE) {
+        local_sum += __expf(scalar_to_float(logits[base + col]) - block_max);
+    }
+    local_sum = warp_reduce_sum(local_sum);
+
+    if (lane == 0) {
+        warp_val[warp] = local_sum;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float block_sum = lane < kWarps ? warp_val[lane] : 0.0f;
+        block_sum = warp_reduce_sum(block_sum);
+        if (lane == 0) {
+            const float row_lse = logf(block_sum) + block_max;
+            shared_lse = row_lse;
+            loss_rows[global_row] = (row_lse - warp_target[0]) * row_mask;
+        }
+    }
+    __syncthreads();
+
+    const float row_lse = shared_lse;
+    const float scale = row_mask / denom;
+    for (int64_t col = tid; col < HEAD_L2WRAP_CE_VOCAB; col += BLOCK_SIZE) {
+        float g = __expf(scalar_to_float(logits[base + col]) - row_lse) * scale;
+        if (static_cast<int>(col) == target) {
+            g -= scale;
+        }
+        logits[base + col] = float_to_scalar<scalar_t>(g);
+    }
+}
+
+__global__ void masked_reduce_loss_kernel(
+    const float* __restrict__ loss_rows,
+    const float* __restrict__ mask_sum,
+    float* __restrict__ loss,
+    int64_t rows) {
+    constexpr int BLOCK_SIZE = 256;
+    const int tid = threadIdx.x;
+    float sum = 0.0f;
+    for (int64_t idx = tid; idx < rows; idx += BLOCK_SIZE) {
+        sum += loss_rows[idx];
+    }
+    sum = warp_reduce_sum(sum);
+
+    __shared__ float warp_sum[8];
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    if (lane == 0) {
+        warp_sum[warp] = sum;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float block_sum = lane < 8 ? warp_sum[lane] : 0.0f;
+        block_sum = warp_reduce_sum(block_sum);
+        if (lane == 0) {
+            const float denom = mask_sum[0];
+            loss[0] = denom > 0.0f ? block_sum / denom : 0.0f;
+        }
+    }
+}
+
+template <typename scalar_t, int BLOCK_SIZE>
 void launch_row_chunk_loss_and_grad(
     scalar_t* logits,
     const int64_t* targets,
@@ -201,6 +339,27 @@ void launch_row_chunk_loss_and_grad(
         row_start,
         chunk_rows,
         total_rows);
+}
+
+template <typename scalar_t, int BLOCK_SIZE>
+void launch_masked_row_chunk_loss_and_grad(
+    scalar_t* logits,
+    const int64_t* targets,
+    const float* loss_mask,
+    const float* mask_sum,
+    float* loss_rows,
+    int64_t row_start,
+    int64_t chunk_rows,
+    cudaStream_t stream) {
+    dim3 blocks(static_cast<unsigned int>(chunk_rows));
+    masked_row_chunk_loss_and_grad_kernel<scalar_t, BLOCK_SIZE><<<blocks, BLOCK_SIZE, 0, stream>>>(
+        logits,
+        targets,
+        loss_mask,
+        mask_sum,
+        loss_rows,
+        row_start,
+        chunk_rows);
 }
 
 } // namespace
@@ -240,6 +399,50 @@ void head_l2wrap_ce_reduce_loss_v4_cuda(torch::Tensor loss_rows, torch::Tensor l
     auto stream = at::cuda::getCurrentCUDAStream();
     reduce_loss_kernel<<<1, 256, 0, stream>>>(
         loss_rows.data_ptr<float>(),
+        loss.data_ptr<float>(),
+        loss_rows.numel());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void head_masked_ce_row_chunk_loss_and_grad_v4_cuda(
+    torch::Tensor logits,
+    torch::Tensor targets,
+    torch::Tensor loss_mask,
+    torch::Tensor mask_sum,
+    torch::Tensor loss_rows,
+    int64_t row_start) {
+    const int64_t chunk_rows = logits.size(0);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    constexpr int threads = 512;
+    if (logits.scalar_type() == torch::kBFloat16) {
+        launch_masked_row_chunk_loss_and_grad<at::BFloat16, threads>(
+            logits.data_ptr<at::BFloat16>(),
+            targets.data_ptr<int64_t>(),
+            loss_mask.data_ptr<float>(),
+            mask_sum.data_ptr<float>(),
+            loss_rows.data_ptr<float>(),
+            row_start,
+            chunk_rows,
+            stream);
+    } else {
+        launch_masked_row_chunk_loss_and_grad<float, threads>(
+            logits.data_ptr<float>(),
+            targets.data_ptr<int64_t>(),
+            loss_mask.data_ptr<float>(),
+            mask_sum.data_ptr<float>(),
+            loss_rows.data_ptr<float>(),
+            row_start,
+            chunk_rows,
+            stream);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void head_masked_ce_reduce_loss_v4_cuda(torch::Tensor loss_rows, torch::Tensor mask_sum, torch::Tensor loss) {
+    auto stream = at::cuda::getCurrentCUDAStream();
+    masked_reduce_loss_kernel<<<1, 256, 0, stream>>>(
+        loss_rows.data_ptr<float>(),
+        mask_sum.data_ptr<float>(),
         loss.data_ptr<float>(),
         loss_rows.numel());
     C10_CUDA_KERNEL_LAUNCH_CHECK();

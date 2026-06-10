@@ -11,6 +11,14 @@ void head_l2wrap_ce_row_chunk_loss_and_grad_v4_cuda(
     int64_t row_start,
     int64_t total_rows);
 void head_l2wrap_ce_reduce_loss_v4_cuda(torch::Tensor loss_rows, torch::Tensor loss);
+void head_masked_ce_row_chunk_loss_and_grad_v4_cuda(
+    torch::Tensor logits,
+    torch::Tensor targets,
+    torch::Tensor loss_mask,
+    torch::Tensor mask_sum,
+    torch::Tensor loss_rows,
+    int64_t row_start);
+void head_masked_ce_reduce_loss_v4_cuda(torch::Tensor loss_rows, torch::Tensor mask_sum, torch::Tensor loss);
 
 namespace {
 
@@ -39,6 +47,17 @@ void check_inputs(const torch::Tensor& hidden, const torch::Tensor& weight, cons
         hidden.scalar_type() == torch::kBFloat16 || hidden.scalar_type() == torch::kFloat32,
         "hidden must be bf16 or fp32");
     TORCH_CHECK(hidden.scalar_type() == weight.scalar_type(), "hidden and weight dtype must match");
+}
+
+void check_masked_inputs(
+    const torch::Tensor& hidden,
+    const torch::Tensor& weight,
+    const torch::Tensor& targets,
+    const torch::Tensor& loss_mask) {
+    check_inputs(hidden, weight, targets);
+    check_cuda_contiguous(loss_mask, "loss_mask");
+    TORCH_CHECK(loss_mask.scalar_type() == torch::kFloat32, "loss_mask must be float32");
+    TORCH_CHECK(loss_mask.numel() == hidden.size(0) * hidden.size(1), "loss_mask shape mismatch");
 }
 
 int64_t choose_chunk_rows(int64_t rows, int64_t channels, int64_t requested) {
@@ -86,6 +105,45 @@ std::vector<torch::Tensor> forward(torch::Tensor hidden, torch::Tensor weight, t
     return {loss, grad_hidden, grad_weight};
 }
 
+std::vector<torch::Tensor> forward_masked(
+    torch::Tensor hidden,
+    torch::Tensor weight,
+    torch::Tensor targets,
+    torch::Tensor loss_mask,
+    int64_t chunk_rows_arg) {
+    check_masked_inputs(hidden, weight, targets, loss_mask);
+    const int64_t rows = hidden.size(0) * hidden.size(1);
+    const int64_t channels = hidden.size(2);
+    const int64_t chunk_rows = choose_chunk_rows(rows, channels, chunk_rows_arg);
+
+    auto h2d = hidden.view({rows, channels});
+    auto flat_targets = targets.view({rows});
+    auto flat_mask = loss_mask.view({rows});
+    auto meta_opts = torch::TensorOptions().device(hidden.device()).dtype(torch::kFloat32);
+    auto loss_rows = torch::empty({rows}, meta_opts);
+    auto mask_sum = flat_mask.sum(torch::kFloat32);
+    auto loss = torch::empty({}, meta_opts);
+    auto grad_hidden = torch::empty_like(hidden);
+    auto grad_h2d = grad_hidden.view({rows, channels});
+    auto grad_weight = torch::zeros_like(weight);
+    auto logits = torch::empty({chunk_rows, HEAD_L2WRAP_CE_VOCAB}, hidden.options());
+
+    for (int64_t start = 0; start < rows; start += chunk_rows) {
+        const int64_t len = std::min(chunk_rows, rows - start);
+        auto h_chunk = h2d.narrow(0, start, len);
+        auto logits_use = logits.narrow(0, 0, len);
+        mm_chunk_out(logits_use, h_chunk, weight);
+        head_masked_ce_row_chunk_loss_and_grad_v4_cuda(logits_use, flat_targets, flat_mask, mask_sum, loss_rows, start);
+        auto grad_h_chunk = grad_h2d.narrow(0, start, len);
+        at::mm_out(grad_h_chunk, logits_use, weight);
+        grad_weight.addmm_(logits_use.transpose(0, 1), h_chunk);
+    }
+
+    head_masked_ce_reduce_loss_v4_cuda(loss_rows, mask_sum, loss);
+    return {loss, grad_hidden, grad_weight};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &forward, "RWKV head + cross entropy + L2Wrap Liger-style forward v4");
+    m.def("forward_masked", &forward_masked, "RWKV head + masked cross entropy Liger-style forward v4");
 }

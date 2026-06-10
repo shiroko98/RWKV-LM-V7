@@ -504,7 +504,7 @@ PY
 
 第三步：在 8 张 H800 上启动 13.3B SFT：
 
-针对 `ctx_len=86016`、160G 级 SFT 数据、完整跑一遍数据的长训，可以直接用这个 wrapper。它默认 `SFT_ONE_PASS=1`，所以不需要 `MAGIC_PRIME`，也不需要手写 `EPOCH_STEPS/EPOCH_COUNT`；`train.py` 会从 `DATA_FILE.idx` 读取 document 数并自动计算一遍数据需要的 optimizer step。默认超参偏保守：`micro_bsz=1`、8 卡、无梯度累计、ZeRO-3-offload、开启 block 级激活检查点、`lr=5e-6`、`weight_decay=0.01`、warmup 200 step。半天保存一次仍用现有 `SAVE_EVERY_N_STEPS`，等你按真实吞吐找出半天对应多少 step 后填进去即可：
+针对 `ctx_len=86016`、160G 级 SFT 数据、完整跑一遍数据的长训，可以直接用这个自包含脚本。它在同一个文件里写明 13.3B 模型结构、SFT 数据、DeepSpeed、LR、checkpoint 和 loss 分块参数；默认 `SFT_ONE_PASS=1`，所以不需要 `MAGIC_PRIME`，也不需要手写 `EPOCH_STEPS/EPOCH_COUNT`；`train.py` 会从 `DATA_FILE.idx` 读取 document 数并自动计算一遍数据需要的 optimizer step。默认超参偏保守：`micro_bsz=1`、8 卡、无梯度累计、ZeRO-3-offload、开启 block 级激活检查点、`lr=5e-6`、`weight_decay=0.01`、warmup 200 step。半天保存一次仍用现有 `SAVE_EVERY_N_STEPS`，等你按真实吞吐找出半天对应多少 step 后填进去即可：
 
 ```bash
 LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b.pth \
@@ -585,7 +585,7 @@ bash run_13b_sft_zero3_offload.sh
 - `EPOCH_COUNT`：跑几遍 SFT 数据。想跑 `N` 遍时，`EPOCH_STEPS` 按一遍数据计算，`EPOCH_COUNT=N`。
 - `SFT_ONE_PASS`：设为 `1` 时，脚本仍会传入 `EPOCH_STEPS/EPOCH_COUNT` 作为整数占位值，但 `train.py` 会自动读取 `DATA_FILE.idx` 的 document 数并覆盖为 `ceil(num_documents / effective_bsz)` 和 `epoch_count=1`，适合只想完整跑一遍数据的场景。直接调用 `train.py` 时可以省略 `--epoch_steps/--epoch_count`；通过这个脚本调用时不用管它们的默认值。
 - `GRAD_CP`：激活检查点。`1` 表示对 block 开启 checkpointing，省显存但更慢；显存足够时可设 `0`。
-- `SFT_MASKED_CE_CHUNK`：SFT masked loss 的 head/CE 分块大小。`0` 表示关闭，使用完整 logits masked CE；正数表示只对 mask=1 的 target token 分块计算 head 和 CE。`ctx_len=86016` 的 wrapper 默认 `512`，用于降低 logits 峰值显存。
+- `SFT_MASKED_CE_CHUNK`：SFT masked loss 的 head/CE 分块大小。`0` 表示关闭，使用完整 logits masked CE；正数表示只对 mask=1 的 target token 分块计算 head 和 CE。`ctx_len=86016` 的自包含脚本默认 `512`，用于降低 logits 峰值显存。
 - `STRATEGY`：默认 `deepspeed_stage_3_offload`，更省显存；显存足够时可以用 `deepspeed_stage_3` 做纯 ZeRO-3。
 - `LR_INIT`、`LR_FINAL`、`WARMUP_STEPS`、`WEIGHT_DECAY`：SFT 学习率计划和正则参数。默认 `LR_WSD_DECAY_ITERS=0` 时，warmup 后保持 `LR_INIT`；设置 `LR_WSD_DECAY_ITERS=K` 后，最后 `K` 个 optimizer step 会按 `LR_WSD_DECAY_STYLE=cosine|linear` 衰减到 `LR_FINAL`。
 - 断点续训 LR：从 DeepSpeed/Lightning checkpoint 恢复时，`trainer.global_step` 会恢复，WSD 会按恢复后的 step 继续衰减。恢复时不要随意改 `EPOCH_STEPS/EPOCH_COUNT/LR_WSD_DECAY_ITERS/LR_WSD_DECAY_STYLE/LR_INIT/LR_FINAL`，否则后续 LR 曲线会按新的配置重新解释当前 step。

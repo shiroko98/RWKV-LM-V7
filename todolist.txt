@@ -4,7 +4,7 @@ Current status
 - SFT preprocessing core path is implemented: UTF-8 JSONL input, recursive directory input, multiprocessing render/tokenize, progress display, best-fit-decreasing packing, bounded shard groups, group cache/resume, error log, trailing tool-result trimming, and aligned token/mask binidx output.
 - SFT training core path is implemented: `data_type=sft_binidx`, automatic mask sidecar loading, shifted next-token loss mask, masked CE, explicit SFT epoch schedule, `--sft_one_pass`, gradient accumulation, WSD final LR decay, DeepSpeed resume, ZeRO checkpoint conversion, and chat-template-rendered converted-checkpoint demo.
 - README / README_CN document that SFT preprocessing worker processes run concurrently while progress is reported in input-order result-consumption order.
-- Added a ctx86016 one-pass 13.3B SFT launcher wrapper with conservative long-run defaults; SFT does not need `MAGIC_PRIME`.
+- Added a self-contained ctx86016 one-pass 13.3B SFT launcher with conservative long-run defaults; SFT does not need `MAGIC_PRIME`.
 - Added switchable SFT chunked masked-head CE: `sft_masked_ce_chunk=0` keeps the old full-logits path, while positive values reduce head/loss logits peak memory for long-context SFT.
 - Added an optional server CUDA equivalence/perf smoke for chunked masked-head CE vs full-logits CE: `RWKV_RUN_CUDA_SFT_MASKED_CE_CHUNK_EQUIV_SMOKE=1`.
 - The historical entries below are kept as an append-only implementation log. Some older `Next` or `TODO` items are already completed by later dated entries.

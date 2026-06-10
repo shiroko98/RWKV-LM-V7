@@ -716,7 +716,7 @@ PY
 
 Step 3: launch 13.3B SFT on 8 H800 GPUs:
 
-For `ctx_len=86016`, 160G-scale SFT data, and one full pass, use this wrapper directly. It defaults to `SFT_ONE_PASS=1`, so `MAGIC_PRIME` is not needed and you do not need to hand-write `EPOCH_STEPS/EPOCH_COUNT`; `train.py` reads `DATA_FILE.idx` and computes the one-pass optimizer step count. The defaults are conservative: `micro_bsz=1`, 8 GPUs, no gradient accumulation, ZeRO-3-offload, block activation checkpointing, `lr=5e-6`, `weight_decay=0.01`, and 200 warmup steps. Half-day checkpointing still uses the existing `SAVE_EVERY_N_STEPS`; fill it in after measuring how many steps correspond to half a day:
+For `ctx_len=86016`, 160G-scale SFT data, and one full pass, use this self-contained launcher directly. It keeps the 13.3B model shape, SFT data, DeepSpeed, LR, checkpoint, and loss-chunk settings in the same file. It defaults to `SFT_ONE_PASS=1`, so `MAGIC_PRIME` is not needed and you do not need to hand-write `EPOCH_STEPS/EPOCH_COUNT`; `train.py` reads `DATA_FILE.idx` and computes the one-pass optimizer step count. The defaults are conservative: `micro_bsz=1`, 8 GPUs, no gradient accumulation, ZeRO-3-offload, block activation checkpointing, `lr=5e-6`, `weight_decay=0.01`, and 200 warmup steps. Half-day checkpointing still uses the existing `SAVE_EVERY_N_STEPS`; fill it in after measuring how many steps correspond to half a day:
 
 ```bash
 LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b.pth \
@@ -797,7 +797,7 @@ Key parameters:
 - `EPOCH_COUNT`: number of SFT passes. For `N` passes over the SFT data, keep `EPOCH_STEPS` from the one-pass formula and set `EPOCH_COUNT=N`.
 - `SFT_ONE_PASS`: set to `1` to let `train.py` read `DATA_FILE.idx` and override the schedule with `epoch_steps=ceil(num_documents / effective_bsz)` and `epoch_count=1`. This is the low-friction option when you want exactly one full pass. Direct `train.py` usage may omit `--epoch_steps/--epoch_count`; this launcher still passes integer placeholders, but you do not need to care about their defaults in one-pass mode.
 - `GRAD_CP`: activation checkpointing. `1` enables block-level checkpointing to save VRAM; `0` disables it and is faster if memory allows.
-- `SFT_MASKED_CE_CHUNK`: head/CE chunk size for SFT masked loss. `0` disables the optimization and uses full-logits masked CE; a positive value computes head and CE only for mask=1 target tokens in chunks. The `ctx_len=86016` wrapper defaults to `512` to lower logits peak memory.
+- `SFT_MASKED_CE_CHUNK`: head/CE chunk size for SFT masked loss. `0` disables the optimization and uses full-logits masked CE; a positive value computes head and CE only for mask=1 target tokens in chunks. The `ctx_len=86016` self-contained launcher defaults to `512` to lower logits peak memory.
 - `STRATEGY`: defaults to `deepspeed_stage_3_offload` for lower VRAM. Use `deepspeed_stage_3` for pure ZeRO-3 if memory allows.
 - `LR_INIT`, `LR_FINAL`, `WARMUP_STEPS`, `WEIGHT_DECAY`: SFT learning-rate schedule and regularization. With the default `LR_WSD_DECAY_ITERS=0`, LR stays at `LR_INIT` after warmup. Set `LR_WSD_DECAY_ITERS=K` to decay over the final `K` optimizer steps to `LR_FINAL` with `LR_WSD_DECAY_STYLE=cosine|linear`.
 - Resume LR: when resuming from a DeepSpeed/Lightning checkpoint, `trainer.global_step` is restored and WSD continues from that step. Do not casually change `EPOCH_STEPS/EPOCH_COUNT/LR_WSD_DECAY_ITERS/LR_WSD_DECAY_STYLE/LR_INIT/LR_FINAL` on resume, or the later LR curve will be reinterpreted from the current step.

@@ -1,3 +1,19 @@
+2026-06-10 SFT trailing tool-result trimming
+
+Completed
+- Added preprocessing-side trimming for trailing `tool` messages before SFT rendering.
+- Final assistant `tool_calls` remain trainable, but external trailing tool results are not rendered into the training document and cannot enter `loss_mask=1`.
+- Middle `tool` messages are preserved as non-trainable context when a later assistant reply is the target.
+- Updated README with the final-assistant target contract and trailing-tool behavior.
+- Kept `data/SFT/sample/chat_template.jinja` untouched.
+
+Validation completed
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_binidx.py::test_build_document_from_record_trains_final_tool_calls_when_content_empty tests\test_sft_binidx.py::test_build_document_from_record_trims_trailing_tool_results tests\test_sft_binidx.py::test_trim_trailing_tool_messages_keeps_middle_tool_context --tb=short` -> 3 passed.
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_binidx.py --cov=src.sft_binidx --cov=data.make_sft_binidx --cov=data.tokenizer.rwkv_tokenizer --cov-report=term-missing --tb=short` -> 87 passed, total 95%; `src.sft_binidx.py` 95%, `data.make_sft_binidx.py` 98%.
+- `D:\anaconda\envs\model\python.exe -m compileall -q src data tests` passed.
+- `git diff --check` passed with repository line-ending warnings only.
+- `git diff -- data/SFT/sample/chat_template.jinja` was empty.
+
 2026-06-03 new_sft branch bootstrap
 
 2026-06-09 SFT preprocessing multiprocessing and group cache

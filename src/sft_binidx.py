@@ -202,6 +202,13 @@ def normalize_record(record: dict) -> dict:
     return normalized
 
 
+def trim_trailing_tool_messages(messages: Sequence[dict]) -> list[dict]:
+    trimmed = copy.deepcopy(list(messages))
+    while trimmed and trimmed[-1].get("role") == "tool":
+        trimmed.pop()
+    return trimmed
+
+
 def render_tool_schema(tools: Sequence[dict]) -> str:
     lines = ["<tools>"]
     for tool in tools:
@@ -645,7 +652,7 @@ def _prepare_render_inputs(
     current_location: str | None = None,
 ) -> tuple[list[dict], list[dict] | None]:
     normalized = normalize_record(record)
-    messages = normalized["messages"]
+    messages = trim_trailing_tool_messages(normalized["messages"])
     if current_date is not None or current_location is not None:
         system_message, _ = split_system_and_conversation(messages)
         if system_message is None:

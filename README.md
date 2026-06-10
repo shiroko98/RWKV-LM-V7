@@ -399,7 +399,7 @@ The final binidx will be like (here "/" means end_of_doc, which is actually toke
 
 ### Convert SFT messages jsonl to binidx + loss mask
 
-SFT preprocessing uses `data/make_sft_binidx.py`. The input is one JSON object per line. Each object should contain `messages`, and may optionally contain `tools`. `messages` follows a chat-style structure with roles such as `system`, `user`, `assistant`, and `tool`. Assistant tool-call arguments are normalized before rendering: JSON strings are parsed into structured arguments, while existing XML-style parameter fragments are preserved.
+SFT preprocessing uses `data/make_sft_binidx.py`. The input is one JSON object per line. Each object should contain `messages`, and may optionally contain `tools`. `messages` follows a chat-style structure with roles such as `system`, `user`, `assistant`, and `tool`. Assistant tool-call arguments are normalized before rendering: JSON strings are parsed into structured arguments, while existing XML-style parameter fragments are preserved. The trainable target is the final assistant message. If a sample ends with one or more `tool` messages, those trailing tool results are trimmed before rendering, so the preceding assistant tool call can still be trained but external tool output is not included in the loss. Tool messages in the middle of a conversation are kept as non-trainable context for a later assistant reply.
 
 Example:
 

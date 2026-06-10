@@ -71,6 +71,7 @@ from src.sft_binidx import (
     shuffled_epoch_lines,
     shuffled_epoch_sources,
     split_system_and_conversation,
+    trim_trailing_tool_messages,
     visible_text,
     write_documents,
 )
@@ -724,6 +725,55 @@ def test_build_document_from_record_trains_final_tool_calls_when_content_empty(
         + "</tool_call><|im_end|>\n<|endoftext|>"
     )
     assert NO_THINKING_PREFIX not in trainable_text
+
+
+def test_build_document_from_record_trims_trailing_tool_results(
+    tokenizer: TRIE_TOKENIZER,
+    chat_template,
+):
+    record = {
+        "messages": [
+            {"role": "user", "content": "查天气"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": {"city": "上海"},
+                        }
+                    }
+                ],
+            },
+            {"role": "tool", "name": "get_weather", "content": "上海晴天"},
+        ]
+    }
+    encoded = build_document_from_record(record, tokenizer=tokenizer, template=chat_template)
+    full_text = tokenizer.decode(encoded.input_ids)
+    trainable_text = masked_text(tokenizer, encoded)
+
+    assert "<tool_call>" in trainable_text
+    assert "<parameter name=\"city\">上海</parameter>" in trainable_text
+    assert "上海晴天" not in full_text
+    assert "上海晴天" not in trainable_text
+
+
+def test_trim_trailing_tool_messages_keeps_middle_tool_context():
+    messages = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "demo", "arguments": {}}}]},
+        {"role": "tool", "name": "demo", "content": "tool result"},
+        {"role": "assistant", "content": "final"},
+        {"role": "tool", "name": "demo2", "content": "trailing"},
+        {"role": "tool", "name": "demo3", "content": "trailing2"},
+    ]
+
+    trimmed = trim_trailing_tool_messages(messages)
+
+    assert [message["role"] for message in trimmed] == ["user", "assistant", "tool", "assistant"]
+    assert trimmed[2]["content"] == "tool result"
+    assert messages[-1]["content"] == "trailing2"
 
 
 def test_build_document_from_record_uses_override_date_and_location(

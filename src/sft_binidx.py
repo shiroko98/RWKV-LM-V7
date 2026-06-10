@@ -81,6 +81,12 @@ class JsonlSourceLine:
     line_number: int
 
 
+@dataclass(frozen=True)
+class BuiltDocument:
+    document: EncodedDocument
+    info_events: list[dict[str, object]]
+
+
 @dataclass
 class FilterStats:
     filtered: int = 0
@@ -207,6 +213,15 @@ def trim_trailing_tool_messages(messages: Sequence[dict]) -> list[dict]:
     while trimmed and trimmed[-1].get("role") == "tool":
         trimmed.pop()
     return trimmed
+
+
+def count_trailing_tool_messages(messages: Sequence[dict]) -> int:
+    count = 0
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            break
+        count += 1
+    return count
 
 
 def render_tool_schema(tools: Sequence[dict]) -> str:
@@ -381,6 +396,24 @@ def _source_error_event(
         event["record"] = record
         event["record_summary"] = _summarize_record_for_error(record)
     return event
+
+
+def _trailing_tool_trim_event(
+    source: JsonlSourceLine,
+    *,
+    record: dict,
+    trimmed_count: int,
+) -> dict[str, object]:
+    return {
+        "event_type": "info",
+        "stage": "render-tokenize",
+        "label": "trim_trailing_tool_messages",
+        "message": "Trimmed trailing tool messages before SFT rendering.",
+        "source_path": source.source_path,
+        "line_number": source.line_number,
+        "trimmed_trailing_tools": trimmed_count,
+        "record_summary": _summarize_record_for_error(record),
+    }
 
 
 def _emit_exception_error(
@@ -1079,20 +1112,31 @@ def _build_document_from_source_line(
     template,
     current_date: str | None = None,
     current_location: str | None = None,
-) -> EncodedDocument:
+) -> BuiltDocument:
     record = None
     try:
         record = json.loads(source.text)
     except json.JSONDecodeError as exc:
         raise SFTDocumentBuildError(_source_error_event(source, exc)) from exc
     try:
-        return build_document_from_record(
+        document = build_document_from_record(
             record,
             tokenizer=tokenizer,
             template=template,
             current_date=current_date,
             current_location=current_location,
         )
+        trimmed_count = count_trailing_tool_messages(record.get("messages") or [])
+        info_events = []
+        if trimmed_count:
+            info_events.append(
+                _trailing_tool_trim_event(
+                    source,
+                    record=record,
+                    trimmed_count=trimmed_count,
+                )
+            )
+        return BuiltDocument(document=document, info_events=info_events)
     except Exception as exc:
         raise SFTDocumentBuildError(_source_error_event(source, exc, record=record)) from exc
 
@@ -1115,7 +1159,7 @@ def _init_document_worker(
     _PROCESS_CURRENT_LOCATION = current_location
 
 
-def _build_document_from_source_line_in_worker(source: JsonlSourceLine) -> EncodedDocument:
+def _build_document_from_source_line_in_worker(source: JsonlSourceLine) -> BuiltDocument:
     if _PROCESS_TOKENIZER is None or _PROCESS_TEMPLATE is None:
         raise RuntimeError("SFT document worker was not initialized.")
     return _build_document_from_source_line(
@@ -1187,7 +1231,7 @@ def build_documents_from_sources(
         done = 0
         for source in sources:
             try:
-                document = _build_document_from_source_line(
+                built = _build_document_from_source_line(
                     source,
                     tokenizer=tokenizer,
                     template=template,
@@ -1197,6 +1241,9 @@ def build_documents_from_sources(
             except Exception as exc:
                 _emit_exception_error(error_callback, exc, source=source)
                 raise
+            if error_callback is not None:
+                for event in built.info_events:
+                    error_callback(event)
             done += 1
             _emit_document_progress(
                 progress_callback,
@@ -1206,7 +1253,7 @@ def build_documents_from_sources(
                 group_index=progress_group_index,
                 group_count=progress_group_count,
             )
-            yield document
+            yield built.document
         return
 
     if vocab_path is None or template_path is None:
@@ -1229,7 +1276,10 @@ def build_documents_from_sources(
             chunksize=worker_chunksize,
         )
         try:
-            for source, document in zip(sources, mapped_documents):
+            for source, built in zip(sources, mapped_documents):
+                if error_callback is not None:
+                    for event in built.info_events:
+                        error_callback(event)
                 done += 1
                 _emit_document_progress(
                     progress_callback,
@@ -1239,7 +1289,7 @@ def build_documents_from_sources(
                     group_index=progress_group_index,
                     group_count=progress_group_count,
                 )
-                yield document
+                yield built.document
         except Exception as exc:
             _emit_exception_error(error_callback, exc)
             raise

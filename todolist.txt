@@ -1,3 +1,20 @@
+2026-06-10 SFT trailing tool trim info log
+
+Completed
+- Kept the trailing `tool` trimming behavior from `7457700`.
+- Added tagged non-error `--error-log` events for samples whose trailing tool messages are trimmed:
+  `event_type=info`, `label=trim_trailing_tool_messages`, source path, line number, trimmed count, and record summary.
+- Multiprocessing workers return the tagged info event to the main process; workers still do not write the log directly.
+- Updated README error-log description to mention tagged informational trim events.
+- Kept `data/SFT/sample/chat_template.jinja` untouched.
+
+Validation completed
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_binidx.py::test_build_document_from_record_trims_trailing_tool_results tests\test_sft_binidx.py::test_trim_trailing_tool_messages_keeps_middle_tool_context tests\test_sft_binidx.py::test_build_documents_from_sources_logs_trailing_tool_trim_info --tb=short` -> 3 passed.
+- `D:\anaconda\envs\model\python.exe -m pytest -q tests\test_sft_binidx.py --cov=src.sft_binidx --cov=data.make_sft_binidx --cov=data.tokenizer.rwkv_tokenizer --cov-report=term-missing --tb=short` -> 88 passed, total 95%; `src.sft_binidx.py` 95%, `data.make_sft_binidx.py` 98%.
+- `D:\anaconda\envs\model\python.exe -m compileall -q src data tests` passed.
+- `git diff --check` passed with repository line-ending warnings only.
+- `git diff -- data/SFT/sample/chat_template.jinja` was empty.
+
 2026-06-10 SFT trailing tool-result trimming
 
 Completed

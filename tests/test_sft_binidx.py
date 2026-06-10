@@ -776,6 +776,58 @@ def test_trim_trailing_tool_messages_keeps_middle_tool_context():
     assert messages[-1]["content"] == "trailing2"
 
 
+def test_build_documents_from_sources_logs_trailing_tool_trim_info(
+    tokenizer: TRIE_TOKENIZER,
+    chat_template,
+):
+    record = {
+        "messages": [
+            {"role": "user", "content": "查天气"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"function": {"name": "get_weather", "arguments": {"city": "上海"}}}],
+            },
+            {"role": "tool", "name": "get_weather", "content": "上海晴天"},
+            {"role": "tool", "name": "get_air_quality", "content": "空气优"},
+        ]
+    }
+    source = JsonlSourceLine(
+        text=json.dumps(record, ensure_ascii=False),
+        source_path="tools.jsonl",
+        line_number=9,
+    )
+    events = []
+
+    documents = list(
+        build_documents_from_sources(
+            [source],
+            tokenizer=tokenizer,
+            template=chat_template,
+            error_callback=events.append,
+        )
+    )
+
+    full_text = tokenizer.decode(documents[0].input_ids)
+    trainable_text = masked_text(tokenizer, documents[0])
+    assert "上海晴天" not in full_text
+    assert "空气优" not in full_text
+    assert "<tool_call>" in trainable_text
+    assert events == [
+        {
+            "event_type": "info",
+            "stage": "render-tokenize",
+            "label": "trim_trailing_tool_messages",
+            "message": "Trimmed trailing tool messages before SFT rendering.",
+            "source_path": "tools.jsonl",
+            "line_number": 9,
+            "trimmed_trailing_tools": 2,
+            "record_summary": events[0]["record_summary"],
+        }
+    ]
+    assert events[0]["record_summary"]["roles"] == ["user", "assistant", "tool", "tool"]
+
+
 def test_build_document_from_record_uses_override_date_and_location(
     tokenizer: TRIE_TOKENIZER,
     chat_template,

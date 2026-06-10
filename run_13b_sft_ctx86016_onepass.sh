@@ -51,6 +51,10 @@ HEAD_CHUNK="0"             # 0 => faster, more VRAM; larger values => slower, le
 SFT_MASKED_CE_CHUNK="0"    # Keep 0 for production; positive chunked SFT CE currently times out under 13B ZeRO-3.
 SFT_MASKED_FUSED_CE_CHUNK="0" # Experimental CUDA fused masked head CE. Try 4096/8192 on H800 after smoke tests pass.
 DS_BUCKET_MB="64"
+DS_OFFLOAD_PIN_MEMORY="1"  # -1 => keep DeepSpeed default; 0/1 force offload pin_memory.
+DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD="100000" # Keep small params replicated to reduce tiny gathers.
+DS_STAGE3_PREFETCH_BUCKET_SIZE="20000000"      # DeepSpeed parameter elements, not bytes.
+DS_STAGE3_MAX_LIVE_PARAMETERS="1000000000"     # DeepSpeed parameter elements, not bytes.
 KERNEL="@rwkv3"            # Usually faster on H100 / H800.
 
 LR_INIT="5e-6"
@@ -111,6 +115,9 @@ python train.py --load_model "$LOAD_MODEL" --wandb "$WANDB_PROJECT" --proj_dir "
  --data_type "sft_binidx" --vocab_size "$VOCAB_SIZE" \
  --weight_decay "$WEIGHT_DECAY" --epoch_save "$EPOCH_SAVE" --save_every_n_steps "$SAVE_EVERY_N_STEPS" --keep_last_n_checkpoints "$KEEP_LAST_N_CHECKPOINTS" \
  --head_size "$HEAD_SIZE" --head_chunk "$HEAD_CHUNK" \
- --accelerator gpu --devices "$GPU_PER_NODE" --precision bf16 --strategy "$STRATEGY" --grad_cp "$GRAD_CP" --enable_progress_bar True --ds_bucket_mb "$DS_BUCKET_MB" --master_port "$MASTER_PORT" \
+ --accelerator gpu --devices "$GPU_PER_NODE" --precision bf16 --strategy "$STRATEGY" --grad_cp "$GRAD_CP" --enable_progress_bar True --ds_bucket_mb "$DS_BUCKET_MB" \
+ --ds_offload_pin_memory "$DS_OFFLOAD_PIN_MEMORY" --ds_stage3_param_persistence_threshold "$DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD" \
+ --ds_stage3_prefetch_bucket_size "$DS_STAGE3_PREFETCH_BUCKET_SIZE" --ds_stage3_max_live_parameters "$DS_STAGE3_MAX_LIVE_PARAMETERS" \
+ --master_port "$MASTER_PORT" \
  --d_decay_lora "$D_DECAY_LORA" --d_aaa_lora "$D_AAA_LORA" --d_mv_lora "$D_MV_LORA" --d_gate_lora "$D_GATE_LORA" \
  "${EXTRA_ARGS[@]}"

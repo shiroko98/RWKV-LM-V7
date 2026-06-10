@@ -448,6 +448,86 @@ def test_validate_sft_loss_settings_accepts_one_backend_and_rejects_invalid_valu
         train.validate_sft_loss_settings(SimpleNamespace(sft_masked_ce_chunk=128, sft_masked_fused_ce_chunk=4096))
 
 
+def test_configure_deepspeed_zero3_config_applies_sft_tuning_options():
+    args = SimpleNamespace(
+        strategy="deepspeed_stage_3_offload",
+        ds_bucket_mb=128,
+        ds_offload_pin_memory=1,
+        ds_stage3_param_persistence_threshold=100000,
+        ds_stage3_prefetch_bucket_size=20000000,
+        ds_stage3_max_live_parameters=1000000000,
+    )
+    config = {
+        "zero_optimization": {
+            "stage": 3,
+            "offload_optimizer": {"device": "cpu", "pin_memory": False},
+            "offload_param": {"device": "cpu", "pin_memory": False},
+        }
+    }
+
+    train.configure_deepspeed_zero3_config(args, config)
+    zero = config["zero_optimization"]
+
+    assert zero["allgather_bucket_size"] == 128_000_000
+    assert zero["reduce_bucket_size"] == 128_000_000
+    assert zero["offload_optimizer"]["pin_memory"] is True
+    assert zero["offload_param"]["pin_memory"] is True
+    assert zero["stage3_param_persistence_threshold"] == 100000
+    assert zero["stage3_prefetch_bucket_size"] == 20000000
+    assert zero["stage3_max_live_parameters"] == 1000000000
+
+
+def test_configure_deepspeed_zero3_config_keeps_disabled_options_unchanged():
+    non_ds_config = {"zero_optimization": {"allgather_bucket_size": 1}}
+    train.configure_deepspeed_zero3_config(SimpleNamespace(strategy="ddp", ds_bucket_mb=256), non_ds_config)
+    assert non_ds_config["zero_optimization"]["allgather_bucket_size"] == 1
+
+    args = SimpleNamespace(
+        strategy="deepspeed_stage_3_offload",
+        ds_bucket_mb=0,
+        ds_offload_pin_memory=-1,
+        ds_stage3_param_persistence_threshold=-1,
+        ds_stage3_prefetch_bucket_size=-1,
+        ds_stage3_max_live_parameters=-1,
+    )
+    config = {
+        "zero_optimization": {
+            "offload_optimizer": {"pin_memory": False},
+            "offload_param": {"pin_memory": True},
+        }
+    }
+    train.configure_deepspeed_zero3_config(args, config)
+    zero = config["zero_optimization"]
+    assert "allgather_bucket_size" not in zero
+    assert "stage3_prefetch_bucket_size" not in zero
+    assert zero["offload_optimizer"]["pin_memory"] is False
+    assert zero["offload_param"]["pin_memory"] is True
+
+
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        ({"ds_bucket_mb": -1}, "ds_bucket_mb"),
+        ({"ds_offload_pin_memory": 2}, "ds_offload_pin_memory"),
+        ({"ds_stage3_param_persistence_threshold": -2}, "ds_stage3_param_persistence_threshold"),
+        ({"ds_stage3_prefetch_bucket_size": -2}, "ds_stage3_prefetch_bucket_size"),
+        ({"ds_stage3_max_live_parameters": -2}, "ds_stage3_max_live_parameters"),
+    ],
+)
+def test_configure_deepspeed_zero3_config_validates_values(overrides, match):
+    base = dict(
+        strategy="deepspeed_stage_3_offload",
+        ds_bucket_mb=64,
+        ds_offload_pin_memory=-1,
+        ds_stage3_param_persistence_threshold=-1,
+        ds_stage3_prefetch_bucket_size=-1,
+        ds_stage3_max_live_parameters=-1,
+    )
+    base.update(overrides)
+    with pytest.raises(ValueError, match=match):
+        train.configure_deepspeed_zero3_config(SimpleNamespace(**base), {"zero_optimization": {}})
+
+
 def test_checkpoint_path_helpers_handle_empty_regular_and_unreadable_paths(tmp_path, monkeypatch):
     assert train.resolve_resume_checkpoint_path("", "deepspeed_stage_2") is None
     assert train.resolve_resume_checkpoint_path(str(tmp_path / "plain.pth"), "deepspeed_stage_2") is None

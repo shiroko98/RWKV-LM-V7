@@ -621,7 +621,11 @@ bash run_13b_sft_zero3_offload.sh
 - `WANDB_PROJECT`：空字符串表示不启用 wandb；非空则记录到对应项目。
 - `KERNEL`：RWKV7 CUDA kernel 选择，默认 `@rwkv3`。
 - `HEAD_CHUNK`：head 分块设置，默认 `0`，一般先保持默认。
-- `DS_BUCKET_MB`：DeepSpeed bucket 大小，默认 `64` MB；显存/通信行为异常时再调。
+- `DS_BUCKET_MB`：DeepSpeed all-gather / reduce-scatter bucket 大小，默认 `64` MB；调大可能减少碎通信，但会增加显存压力。
+- `DS_OFFLOAD_PIN_MEMORY`：DeepSpeed offload 的 `pin_memory` 开关。`-1` 表示保留 strategy 默认值，`0/1` 表示强制关闭/开启。13B profiling/ctx86016 脚本默认设为 `1`，用于减少 CPU offload H2D/D2H 拷贝等待。
+- `DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD`：写入 DeepSpeed `stage3_param_persistence_threshold`，单位是参数元素个数，不是字节。大于等于 `0` 时生效，`-1` 保留默认。它会让小参数保持常驻，减少很多小 AllGather；阈值越大越吃显存。
+- `DS_STAGE3_PREFETCH_BUCKET_SIZE`：写入 DeepSpeed `stage3_prefetch_bucket_size`，单位是参数元素个数。用于控制 ZeRO-3 参数预取规模；调大可能减少等待/碎 gather，但增加显存峰值。
+- `DS_STAGE3_MAX_LIVE_PARAMETERS`：写入 DeepSpeed `stage3_max_live_parameters`，单位是参数元素个数。限制同一时间 live 参数量；调大可能减少反复释放/重新 gather，但会增加显存压力。
 - `MASTER_ADDR`、`MASTER_PORT`、`CUDA_VISIBLE_DEVICES`：单机多卡 torchrun / distributed 初始化相关参数。
 - `TORCH_EXTENSIONS_DIR`、`TORCH_CUDA_ARCH_LIST`、`MAX_JOBS`：CUDA 扩展编译缓存、架构和并行编译设置。H800 常用 `TORCH_CUDA_ARCH_LIST=9.0`。
 
@@ -750,17 +754,40 @@ bash run_13b_sft_profile.sh
 - 如果显存已经接近满，`SFT_MASKED_FUSED_CE_CHUNK` 不要继续加大；偶发 OOM 时先降到 `2048`。`SFT_MASKED_CE_CHUNK` 仍保持 `0`。
 - 对比 offload 影响时，只改 `STRATEGY`，其他参数保持一致：`deepspeed_stage_3_offload` 更省显存但可能慢，`deepspeed_stage_3` 更吃显存但能判断 CPU offload 是否是瓶颈。
 
-如果显存允许，可以用同一条命令对比纯 ZeRO-3：
+一次 13.3B / ctx86016 / 8xH800 / ZeRO-3-offload / `SFT_MASKED_FUSED_CE_CHUNK=4096` 的 6-step nsys 结果如下。这里的百分比是多 GPU kernel 累加时间占比，用来排序瓶颈，不等同于单步 wall-clock：
+
+| 类别 | 占比 | 现象 | 优化方向 |
+| --- | ---: | --- | --- |
+| `wkv7/clampw` forward/backward | 38.7% | RWKV 时序核心最大单项 | 后续若继续写 CUDA，应优先看 `wkv7_cuda` / `rwkv7_clampw_v3` 在 `B=1,T=86016,H=64,head_size=64` 下的专门调优 |
+| cuBLASLt GEMM | 37.9% | 模型 Linear 和 head projection/grad GEMM 很重 | 主要靠 batch/ZeRO/显存策略；CE 小 kernel 已不是瓶颈 |
+| NCCL kernels | 11.9% | `AllGather` 约 8.1%，`ReduceScatter` 约 2.2%，小 AllGather 很多 | 测 `deepspeed_stage_3` 非 offload；或调大 bucket、开启 pin memory、调 stage3 persistence/prefetch/live 参数 |
+| RWKV 自定义 pointwise | 7.4% | tmix/cmix/vres/a_gate 等 | 不是第一优先级，除非 profiler 显示某个 kernel 异常 |
+| PyTorch elementwise/reduce/copy | 2.8% | 零散 tensor 操作 | 低优先级 |
+| PyTorch LayerNorm | 1.2% | LN 不是主要瓶颈 | fused LN 收益有限，暂不优先 |
+| SFT fused masked CE 小 kernel | 0.1% | mask/softmax 小 kernel 很轻 | 已达到避免 full logits OOM/timeout 的目标，继续优化 CE 收益主要只剩 head GEMM/active-row compact |
+
+这组结果还显示 GPU 采样约 `66%` 平均利用率、显存峰值约 `80.1GiB / 81.6GiB`，CPU 和磁盘 IO 基本不忙；GPU memops 中 D2H/H2D 拷贝很多，说明 offload 和 ZeRO 参数流动确实在消耗时间。下一步优先比较纯 ZeRO-3 和调参后的 ZeRO-3-offload：
 
 ```bash
 LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b-20260415-ctx8192.pth \
 DATA_FILE=/mnt/data/Datasets/SFT_RWKV7_13B/results/SFT_RWKV7_13B \
 PROFILE_STEPS=10 \
-PROFILE_MODE=nsys \
-NCCL_DEBUG=INFO \
-SFT_MASKED_FUSED_CE_CHUNK=4096 \
 STRATEGY=deepspeed_stage_3 \
+SFT_MASKED_FUSED_CE_CHUNK=4096 \
 RUN_TAG=zero3-no-offload \
+bash run_13b_sft_profile.sh
+
+LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b-20260415-ctx8192.pth \
+DATA_FILE=/mnt/data/Datasets/SFT_RWKV7_13B/results/SFT_RWKV7_13B \
+PROFILE_STEPS=10 \
+STRATEGY=deepspeed_stage_3_offload \
+SFT_MASKED_FUSED_CE_CHUNK=4096 \
+DS_BUCKET_MB=128 \
+DS_OFFLOAD_PIN_MEMORY=1 \
+DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD=100000 \
+DS_STAGE3_PREFETCH_BUCKET_SIZE=20000000 \
+DS_STAGE3_MAX_LIVE_PARAMETERS=1000000000 \
+RUN_TAG=zero3-offload-tuned \
 bash run_13b_sft_profile.sh
 ```
 

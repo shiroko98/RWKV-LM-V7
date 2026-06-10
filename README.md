@@ -833,7 +833,11 @@ Key parameters:
 - `WANDB_PROJECT`: empty disables wandb; a non-empty value enables logging under that project.
 - `KERNEL`: RWKV7 CUDA kernel selector. The default is `@rwkv3`.
 - `HEAD_CHUNK`: head chunking setting. The default is `0`; keep it unchanged unless you are intentionally testing memory/perf behavior.
-- `DS_BUCKET_MB`: DeepSpeed bucket size in MB. The script defaults to `64`.
+- `DS_BUCKET_MB`: DeepSpeed all-gather / reduce-scatter bucket size in MB. Larger values can reduce fragmented communication, but increase VRAM pressure.
+- `DS_OFFLOAD_PIN_MEMORY`: DeepSpeed offload `pin_memory` switch. `-1` keeps the strategy default; `0/1` forces disabled/enabled. The 13B profiling and ctx86016 scripts default to `1` to reduce CPU offload H2D/D2H wait.
+- `DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD`: maps to DeepSpeed `stage3_param_persistence_threshold`, measured in parameter elements, not bytes. Values >= 0 enable it, while `-1` keeps the default. It keeps small parameters resident to reduce many tiny AllGathers; larger thresholds use more VRAM.
+- `DS_STAGE3_PREFETCH_BUCKET_SIZE`: maps to DeepSpeed `stage3_prefetch_bucket_size`, measured in parameter elements. Larger values can reduce wait/fragmented gathers, but raise peak VRAM.
+- `DS_STAGE3_MAX_LIVE_PARAMETERS`: maps to DeepSpeed `stage3_max_live_parameters`, measured in parameter elements. Larger values can reduce repeated release/re-gather cycles, but raise VRAM pressure.
 - `MASTER_ADDR`, `MASTER_PORT`, `CUDA_VISIBLE_DEVICES`: single-node torchrun / distributed initialization settings.
 - `TORCH_EXTENSIONS_DIR`, `TORCH_CUDA_ARCH_LIST`, `MAX_JOBS`: CUDA extension cache, target architecture, and parallel build settings. H800 commonly uses `TORCH_CUDA_ARCH_LIST=9.0`.
 
@@ -962,17 +966,40 @@ Read the artifacts with these rules of thumb:
 - If VRAM is already close to full, do not increase `SFT_MASKED_FUSED_CE_CHUNK`; drop it to `2048` for stability if OOMs appear. Keep `SFT_MASKED_CE_CHUNK=0`.
 - To compare offload overhead, change only `STRATEGY`: `deepspeed_stage_3_offload` saves VRAM but can be slower, while `deepspeed_stage_3` uses more VRAM and helps confirm whether CPU offload is the bottleneck.
 
-If memory allows, compare pure ZeRO-3 with the same settings:
+One 13.3B / ctx86016 / 8xH800 / ZeRO-3-offload / `SFT_MASKED_FUSED_CE_CHUNK=4096` 6-step nsys run produced the table below. Percentages are accumulated multi-GPU kernel-time shares, useful for ranking bottlenecks but not equal to per-step wall-clock:
+
+| Category | Share | Observation | Optimization Direction |
+| --- | ---: | --- | --- |
+| `wkv7/clampw` forward/backward | 38.7% | RWKV recurrent core is the largest single item | If writing more CUDA, prioritize `wkv7_cuda` / `rwkv7_clampw_v3` tuning for `B=1,T=86016,H=64,head_size=64` |
+| cuBLASLt GEMM | 37.9% | Linear layers plus head projection/grad GEMMs are heavy | Mostly affected by batch/ZeRO/VRAM strategy; CE small kernels are no longer the bottleneck |
+| NCCL kernels | 11.9% | `AllGather` about 8.1%, `ReduceScatter` about 2.2%, many tiny AllGathers | Test non-offload `deepspeed_stage_3`; otherwise tune bucket size, pin memory, stage3 persistence/prefetch/live parameters |
+| RWKV custom pointwise | 7.4% | tmix/cmix/vres/a_gate kernels | Not first priority unless a later profile shows one kernel is abnormal |
+| PyTorch elementwise/reduce/copy | 2.8% | Scattered tensor ops | Low priority |
+| PyTorch LayerNorm | 1.2% | LN is not a main bottleneck | Fused LN is unlikely to move the needle much right now |
+| SFT fused masked CE small kernels | 0.1% | mask/softmax small kernels are light | The fused CE path has met its OOM/timeout goal; further CE gains would mainly come from head GEMM / active-row compaction |
+
+The same run also showed roughly `66%` average sampled GPU utilization, peak VRAM around `80.1GiB / 81.6GiB`, and low CPU / disk IO pressure. GPU memops included substantial D2H/H2D time, so offload and ZeRO parameter movement are real costs. Compare pure ZeRO-3 against tuned ZeRO-3-offload next:
 
 ```bash
 LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b-20260415-ctx8192.pth \
 DATA_FILE=/mnt/data/Datasets/SFT_RWKV7_13B/results/SFT_RWKV7_13B \
 PROFILE_STEPS=10 \
-PROFILE_MODE=nsys \
-NCCL_DEBUG=INFO \
-SFT_MASKED_FUSED_CE_CHUNK=4096 \
 STRATEGY=deepspeed_stage_3 \
+SFT_MASKED_FUSED_CE_CHUNK=4096 \
 RUN_TAG=zero3-no-offload \
+bash run_13b_sft_profile.sh
+
+LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b-20260415-ctx8192.pth \
+DATA_FILE=/mnt/data/Datasets/SFT_RWKV7_13B/results/SFT_RWKV7_13B \
+PROFILE_STEPS=10 \
+STRATEGY=deepspeed_stage_3_offload \
+SFT_MASKED_FUSED_CE_CHUNK=4096 \
+DS_BUCKET_MB=128 \
+DS_OFFLOAD_PIN_MEMORY=1 \
+DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD=100000 \
+DS_STAGE3_PREFETCH_BUCKET_SIZE=20000000 \
+DS_STAGE3_MAX_LIVE_PARAMETERS=1000000000 \
+RUN_TAG=zero3-offload-tuned \
 bash run_13b_sft_profile.sh
 ```
 

@@ -149,6 +149,51 @@ def validate_sft_loss_settings(args):
         raise ValueError("Use either sft_masked_ce_chunk or sft_masked_fused_ce_chunk, not both.")
 
 
+def _deepspeed_int_arg(args, name: str, default: int = -1) -> int:
+    value = getattr(args, name, default)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer.") from exc
+
+
+def configure_deepspeed_zero3_config(args, strategy_config):
+    if not is_deepspeed_strategy(getattr(args, "strategy", "")):
+        return
+
+    zero = strategy_config.setdefault("zero_optimization", {})
+    ds_bucket_mb = _deepspeed_int_arg(args, "ds_bucket_mb", 0)
+    if ds_bucket_mb < 0:
+        raise ValueError("ds_bucket_mb must be non-negative.")
+    if ds_bucket_mb > 0:
+        bucket_bytes = ds_bucket_mb * 1000 * 1000
+        zero["allgather_bucket_size"] = bucket_bytes
+        zero["reduce_bucket_size"] = bucket_bytes
+
+    pin_memory = _deepspeed_int_arg(args, "ds_offload_pin_memory", -1)
+    if pin_memory not in (-1, 0, 1):
+        raise ValueError("ds_offload_pin_memory must be -1, 0, or 1.")
+    if pin_memory >= 0:
+        for offload_key in ("offload_optimizer", "offload_param"):
+            offload_config = zero.get(offload_key)
+            if isinstance(offload_config, dict):
+                offload_config["pin_memory"] = bool(pin_memory)
+
+    stage3_options = {
+        "ds_stage3_param_persistence_threshold": "stage3_param_persistence_threshold",
+        "ds_stage3_prefetch_bucket_size": "stage3_prefetch_bucket_size",
+        "ds_stage3_max_live_parameters": "stage3_max_live_parameters",
+    }
+    for arg_name, zero_key in stage3_options.items():
+        value = _deepspeed_int_arg(args, arg_name, -1)
+        if value < -1:
+            raise ValueError(f"{arg_name} must be -1 or non-negative.")
+        if value >= 0:
+            zero[zero_key] = value
+
+
 if __name__ == "__main__":  # pragma: no cover
     import os
     import subprocess
@@ -205,6 +250,10 @@ if __name__ == "__main__":  # pragma: no cover
 
     parser.add_argument("--train_stage", default=0, type=int)  # my special pile mode
     parser.add_argument("--ds_bucket_mb", default=200, type=int)  # deepspeed bucket size in MB. 200 seems enough
+    parser.add_argument("--ds_offload_pin_memory", default=-1, type=int)  # -1 keep strategy default, 0 false, 1 true
+    parser.add_argument("--ds_stage3_param_persistence_threshold", default=-1, type=int)  # -1 keep strategy default
+    parser.add_argument("--ds_stage3_prefetch_bucket_size", default=-1, type=int)  # DeepSpeed param elements, -1 keep default
+    parser.add_argument("--ds_stage3_max_live_parameters", default=-1, type=int)  # DeepSpeed param elements, -1 keep default
     parser.add_argument("--dist_timeout_sec", default=1800, type=int)
     parser.add_argument("--master_port", default=29501, type=int)
 
@@ -512,8 +561,7 @@ if __name__ == "__main__":  # pragma: no cover
             print(f"{s0.ljust(5)} {s1.ljust(5)} {s2.ljust(5)} {s3.ljust(5)} {n}")
 
     if "deepspeed" in args.strategy:
-        trainer.strategy.config["zero_optimization"]["allgather_bucket_size"] = args.ds_bucket_mb * 1000 * 1000
-        trainer.strategy.config["zero_optimization"]["reduce_bucket_size"] = args.ds_bucket_mb * 1000 * 1000
+        configure_deepspeed_zero3_config(args, trainer.strategy.config)
 
     # must set shuffle=False, persistent_workers=False (because worker is in another thread)
     data_loader = DataLoader(train_data, shuffle=False, pin_memory=True, batch_size=args.micro_bsz, num_workers=1, persistent_workers=False, drop_last=True)

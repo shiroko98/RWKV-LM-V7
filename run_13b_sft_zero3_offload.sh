@@ -78,6 +78,10 @@ N_NODE="${N_NODE:-1}"
 GPU_PER_NODE="${GPU_PER_NODE:-8}"
 STRATEGY="${STRATEGY:-deepspeed_stage_3_offload}"
 DS_BUCKET_MB="${DS_BUCKET_MB:-64}"
+DS_OFFLOAD_PIN_MEMORY="${DS_OFFLOAD_PIN_MEMORY:--1}"
+DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD="${DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD:--1}"
+DS_STAGE3_PREFETCH_BUCKET_SIZE="${DS_STAGE3_PREFETCH_BUCKET_SIZE:--1}"
+DS_STAGE3_MAX_LIVE_PARAMETERS="${DS_STAGE3_MAX_LIVE_PARAMETERS:--1}"
 MASTER_PORT="${MASTER_PORT:-29501}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
@@ -119,6 +123,9 @@ python train.py --load_model "$LOAD_MODEL" --wandb "${WANDB_PROJECT:-}" --proj_d
  --data_type "sft_binidx" --vocab_size "$VOCAB_SIZE" \
  --weight_decay "$WEIGHT_DECAY" --epoch_save "$EPOCH_SAVE" --save_every_n_steps "$SAVE_EVERY_N_STEPS" --keep_last_n_checkpoints "$KEEP_LAST_N_CHECKPOINTS" \
  --head_size "$HEAD_SIZE" --head_chunk "$HEAD_CHUNK" \
- --accelerator gpu --devices "$GPU_PER_NODE" --precision bf16 --strategy "$STRATEGY" --grad_cp "$GRAD_CP" --enable_progress_bar True --ds_bucket_mb "$DS_BUCKET_MB" --master_port "$MASTER_PORT" \
+ --accelerator gpu --devices "$GPU_PER_NODE" --precision bf16 --strategy "$STRATEGY" --grad_cp "$GRAD_CP" --enable_progress_bar True --ds_bucket_mb "$DS_BUCKET_MB" \
+ --ds_offload_pin_memory "$DS_OFFLOAD_PIN_MEMORY" --ds_stage3_param_persistence_threshold "$DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD" \
+ --ds_stage3_prefetch_bucket_size "$DS_STAGE3_PREFETCH_BUCKET_SIZE" --ds_stage3_max_live_parameters "$DS_STAGE3_MAX_LIVE_PARAMETERS" \
+ --master_port "$MASTER_PORT" \
  --d_decay_lora "$D_DECAY_LORA" --d_aaa_lora "$D_AAA_LORA" --d_mv_lora "$D_MV_LORA" --d_gate_lora "$D_GATE_LORA" \
  "${EXTRA_ARGS[@]}"

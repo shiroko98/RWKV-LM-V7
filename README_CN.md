@@ -432,6 +432,7 @@ WSD 衰减区间的计算方式：
 - CUDA smoke 第二档：`RWKV_RUN_TRAIN_PY_SFT_SMOKE=1` 会启动 `train.py` 跑 1 个 SFT step，覆盖 Lightning、DeepSpeed、optimizer、多卡 torchrun 链路。可用 `RWKV_SFT_SMOKE_ACCUMULATE_GRAD_BATCHES=2` 之类的环境变量额外覆盖梯度累计路径。
 - CUDA smoke 第三档：`RWKV_RUN_TRAIN_PY_SFT_RESUME_SMOKE=1` 会保存 `rwkv-step-1.pth` 并从它恢复，覆盖 SFT 断点续训和 DeepSpeed 分片 checkpoint 加载。
 - CUDA smoke 第四档：`RWKV_RUN_TRAIN_PY_SFT_WSD_RESUME_SMOKE=1` 会用 DeepSpeed 先保存 step checkpoint，再恢复并检查恢复后的 `train_log.txt` 里 LR 已经处在 WSD 衰减后的正确位置。
+- CUDA smoke 第五档：`RWKV_RUN_CUDA_SFT_MASKED_CE_CHUNK_EQUIV_SMOKE=1` 会在单卡上用同一个 checkpoint、同一批 synthetic SFT binidx、同样的优化器步数分别跑完整 logits CE 和 `--sft_masked_ce_chunk` 分块 CE，对比 loss 序列、梯度范数、参数采样差异、耗时和 CUDA peak memory。这个测试用于确认新分块 loss 对训练数值基本等价，并量化显存/速度变化。
 
 当前已验证结果：
 
@@ -446,6 +447,7 @@ WSD 衰减区间的计算方式：
   - `RWKV_RUN_CUDA_SFT_ACCUM_EQUIV_SMOKE=1` -> `1 passed in 14.74s`。
   - `RWKV_RUN_TRAIN_PY_SFT_DP_ZERO_ACCUM_EQUIV_SMOKE=1` + `RWKV_SFT_SMOKE_DEVICES=8` + `deepspeed_stage_3_offload` -> `1 passed in 81.06s`。
   - `RWKV_RUN_TRAIN_PY_SFT_MERGE_SMOKE=1` + `RWKV_SFT_SMOKE_DEVICES=8` + `deepspeed_stage_3_offload` -> `1 passed in 284.01s`。
+- 待服务器验证：`RWKV_RUN_CUDA_SFT_MASKED_CE_CHUNK_EQUIV_SMOKE=1` 用于较大型对比分块 masked-head CE 和完整 logits masked CE；本地未启用 CUDA 环境变量时该测试会 skip。
 
 ## 13.3B SFT 启动脚本操作手册
 

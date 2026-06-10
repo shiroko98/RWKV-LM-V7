@@ -644,6 +644,7 @@ Validation coverage:
 - `RWKV_RUN_TRAIN_PY_SFT_SMOKE=1` launches `train.py` for one SFT step and covers Lightning, DeepSpeed, optimizer, and multi-card torchrun. Set `RWKV_SFT_SMOKE_ACCUMULATE_GRAD_BATCHES=2` or a similar value to cover the gradient-accumulation path.
 - `RWKV_RUN_TRAIN_PY_SFT_RESUME_SMOKE=1` saves `rwkv-step-1.pth` and resumes from it, covering SFT checkpoint resume and DeepSpeed sharded checkpoint loading.
 - `RWKV_RUN_TRAIN_PY_SFT_WSD_RESUME_SMOKE=1` uses DeepSpeed to save a step checkpoint, resumes from it, and checks that `train_log.txt` records the LR at the expected WSD decay position.
+- `RWKV_RUN_CUDA_SFT_MASKED_CE_CHUNK_EQUIV_SMOKE=1` runs a single-GPU comparison from the same checkpoint and synthetic SFT binidx, training once with full-logits CE and once with `--sft_masked_ce_chunk`. It compares loss sequence, gradient norms, sampled parameter differences, elapsed time, and CUDA peak memory, so it is the larger smoke for checking numerical equivalence and memory/speed impact of the new chunked masked-head loss.
 
 Current validation results:
 
@@ -658,6 +659,7 @@ Current validation results:
   - `RWKV_RUN_CUDA_SFT_ACCUM_EQUIV_SMOKE=1` -> `1 passed in 14.74s`.
   - `RWKV_RUN_TRAIN_PY_SFT_DP_ZERO_ACCUM_EQUIV_SMOKE=1` + `RWKV_SFT_SMOKE_DEVICES=8` + `deepspeed_stage_3_offload` -> `1 passed in 81.06s`.
   - `RWKV_RUN_TRAIN_PY_SFT_MERGE_SMOKE=1` + `RWKV_SFT_SMOKE_DEVICES=8` + `deepspeed_stage_3_offload` -> `1 passed in 284.01s`.
+- Pending server validation: `RWKV_RUN_CUDA_SFT_MASKED_CE_CHUNK_EQUIV_SMOKE=1` compares chunked masked-head CE with full-logits masked CE; it skips locally unless the CUDA env flag is enabled.
 
 ## 13.3B SFT Launcher Operations
 

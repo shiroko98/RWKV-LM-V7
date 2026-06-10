@@ -928,7 +928,7 @@ This demo validates that the converted checkpoint loads, runs forward, and gener
 - `gpu_monitor.csv`: background `nvidia-smi` samples with GPU utilization, memory, and power.
 - `vmstat.log`: coarse CPU / IO samples; skipped automatically when `vmstat` is unavailable.
 - `nccl.*.log`: one NCCL log per process when `NCCL_DEBUG=INFO`.
-- `nsys_sft_profile.nsys-rep` / `nsys_stats.txt`: CUDA / cuBLAS / NCCL timeline and summary when `PROFILE_MODE=nsys`.
+- `nsys_sft_profile.nsys-rep` / `nsys_stats.txt`: CUDA / cuBLAS timeline and summary when `PROFILE_MODE=nsys`; use `NCCL_DEBUG_FILE` for NCCL details. Some nsys versions also show NCCL kernels as CUDA kernels.
 
 First run without nsys to confirm real step time and GPU utilization:
 
@@ -941,7 +941,7 @@ STRATEGY=deepspeed_stage_3_offload \
 bash run_13b_sft_profile.sh
 ```
 
-Then run a short nsys capture to see CUDA kernels, cuBLAS, and NCCL on the timeline. The trace can be large, so start with 4-8 steps:
+Then run a short nsys capture to see CUDA kernels, cuBLAS, and any visible NCCL kernels on the timeline. The trace can be large, so start with 4-8 steps:
 
 ```bash
 LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b-20260415-ctx8192.pth \
@@ -957,7 +957,7 @@ bash run_13b_sft_profile.sh
 Read the artifacts with these rules of thumb:
 
 - If `gpu_monitor.csv` shows low GPU utilization for long stretches while `train.log` step time is high, the run is likely waiting on CPU offload, IO, synchronization, or communication rather than raw CUDA math.
-- If the nsys timeline or `nsys_stats.txt` is dominated by `nccl*` kernels or NCCL waits, ZeRO all-gather / reduce-scatter / communication synchronization is the bottleneck.
+- If `NCCL_DEBUG_FILE` shows dense collectives, or if the nsys timeline / `nsys_stats.txt` is dominated by `nccl*` kernels, ZeRO all-gather / reduce-scatter / communication synchronization is the bottleneck. Some nsys versions do not support `--trace=nccl`; the script defaults to `cuda,nvtx,osrt,cublas`, which is expected.
 - If `cublas*gemm*`, `rwkv7_*`, or `wkv7*` kernels dominate and GPU utilization is high, the bottleneck is in the model trunk, matrix multiplies, or custom CUDA kernels.
 - If VRAM is already close to full, do not increase `SFT_MASKED_FUSED_CE_CHUNK`; drop it to `2048` for stability if OOMs appear. Keep `SFT_MASKED_CE_CHUNK=0`.
 - To compare offload overhead, change only `STRATEGY`: `deepspeed_stage_3_offload` saves VRAM but can be slower, while `deepspeed_stage_3` uses more VRAM and helps confirm whether CPU offload is the bottleneck.

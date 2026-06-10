@@ -36,7 +36,7 @@ PROJ_DIR="${PROJ_DIR:-${PROFILE_ROOT}/${RUN_TAG}}"
 
 PROFILE_STEPS="${PROFILE_STEPS:-8}"
 PROFILE_MODE="${PROFILE_MODE:-none}" # none | nsys
-NSYS_TRACE="${NSYS_TRACE:-cuda,nvtx,osrt,cublas,nccl}"
+NSYS_TRACE="${NSYS_TRACE:-cuda,nvtx,osrt,cublas}"
 NSYS_STATS="${NSYS_STATS:-1}"
 
 GPU_MONITOR="${GPU_MONITOR:-1}"

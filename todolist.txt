@@ -39,6 +39,7 @@ Completed
 - Added `run_13b_sft_profile.sh`, a short 13.3B ctx86016 SFT diagnostic launcher.
 - The script uses the production SFT mask/fused CE settings by default, runs only `PROFILE_STEPS`, disables wandb/checkpoint saves, and writes `train.log`, `gpu_monitor.csv`, optional `vmstat.log`, optional NCCL logs, and optional Nsight Systems trace/stats to `PROJ_DIR`.
 - Documented how to compare `deepspeed_stage_3_offload` and `deepspeed_stage_3`, and how to interpret low GPU utilization, high NCCL time, or model-kernel-heavy traces in README / README_CN.
+- Updated the default `NSYS_TRACE` to `cuda,nvtx,osrt,cublas` after server feedback showed this Nsight Systems version rejects `--trace=nccl`; NCCL details remain available through `NCCL_DEBUG_FILE`.
 
 2026-06-10 Disable production SFT masked CE chunking
 

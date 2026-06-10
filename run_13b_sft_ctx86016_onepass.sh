@@ -48,7 +48,7 @@ ACCUMULATE_GRAD_BATCHES="1"
 STRATEGY="deepspeed_stage_3_offload"
 GRAD_CP="1"                # 1 => slower, save VRAM; 0 => faster, more VRAM.
 HEAD_CHUNK="0"             # 0 => faster, more VRAM; larger values => slower, less pretrain CE VRAM.
-SFT_MASKED_CE_CHUNK="512"  # 0 => full logits masked CE; 512/1024 => lower SFT head/loss VRAM.
+SFT_MASKED_CE_CHUNK="0"    # Keep 0 for production; positive chunked SFT CE currently times out under 13B ZeRO-3.
 DS_BUCKET_MB="64"
 KERNEL="@rwkv3"            # Usually faster on H100 / H800.
 

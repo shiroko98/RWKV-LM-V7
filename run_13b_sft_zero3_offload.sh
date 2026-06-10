@@ -69,6 +69,7 @@ WARMUP_STEPS="${WARMUP_STEPS:-10}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0}"
 GRAD_CP="${GRAD_CP:-1}"
 HEAD_CHUNK="${HEAD_CHUNK:-0}"
+# Keep this at 0 for production; the current positive chunked SFT CE path can timeout under 13B ZeRO-3.
 SFT_MASKED_CE_CHUNK="${SFT_MASKED_CE_CHUNK:-0}"
 KERNEL="${KERNEL:-@rwkv3}"
 

@@ -391,7 +391,7 @@ python train.py \
 
 训练端使用 next-token label，所以每个 SFT document 需要提供 `ctx_len + 1` 个 token。document 比这个短时，dataloader 会在内存里用 `--sft_pad_token_id` padding，并把 padding mask 设为 `0`；document 更长时会直接报错。为了让训练长度稳定，建议预处理时使用 `--ctx-len CTX_LEN --pack` 或 `--ctx-len CTX_LEN --pad`，预处理会自动写出 `CTX_LEN + 1` 个 token，训练时再设置 `--ctx_len CTX_LEN`。RWKV7 x070 的 `ctx_len` 需要能被 16 整除。
 
-长上下文 SFT 可以用 `--sft_masked_ce_chunk N` 降低 head/loss 的显存峰值。默认 `0` 表示关闭，仍走旧的完整 logits masked CE；设为正数时，SFT loss 不再一次性生成 `[batch, ctx_len, vocab]` logits，而是只取 `loss_mask=1` 的 target token，并按 `N` 个 trainable token 一块计算 head projection 和 CE。这个优化对 `ctx_len=86016` 很重要：即使 `micro_bsz=1`，完整 logits 也会非常大。你的 13B 数据 mask density 约 `0.821`，所以这个开关主要降低显存峰值，计算量不会大幅下降，且分块和 checkpoint 重算可能让速度变慢。建议从 `512` 开始，稳定后可试 `1024`；如果仍 OOM，可降到 `256`。
+`--sft_masked_ce_chunk` 目前先保持 `0`。`0` 表示关闭实验性的 Python 分块 masked-head CE，SFT 走旧的完整 logits masked CE；这个设置本身不会引入额外分块、checkpoint 重算或 ZeRO-3 反复 all-gather 的效率损耗。注意它仍会物化完整 `[batch, ctx_len, vocab]` logits，所以长上下文显存压力仍然很大。正数 chunk 路径虽然能降低 Python loss 侧的 logits 峰值，但服务器反馈 `4096/8192` 在 13B + ZeRO-3 长上下文下仍会 timeout，因此生产训练暂时不要开启。后续更合适的方向是专门做 masked head fused CE CUDA op。
 
 上面示例里的 0.4B checkpoint 是 `L24-D1024`，对应 `dim_ffn=4096`、`vocab_size=65536`、`head_size=64`，RWKV7 G1 LoRA 维度为 `64/64/32/128`。如果换用其他 checkpoint，需要先看对应架构文本，保证这些形状参数和 checkpoint 一致。
 
@@ -405,7 +405,7 @@ SFT mask 训练的实现框架：
 5. dataloader 返回三元组 `(x, y, loss_mask)`：`x = token_ids[:-1]`，`y = token_ids[1:]`，`loss_mask = raw_mask[1:]`。mask 右移是为了和 next-token label 对齐，也就是 mask 标记的是“这个 target token 是否参与 loss”。
 6. `src/model.py` 的 `training_step` 根据 batch 长度分流：普通预训练 `(x, y)` 继续走原来的 fused CE 快路径；SFT `(x, y, loss_mask)` 默认走 `src/sft_loss.py::masked_cross_entropy`。这样 SFT 不影响预训练性能路径。
 7. `masked_cross_entropy` 先用标准 CE 得到每个 token 的 loss，再只对 `loss_mask=1` 的位置求平均。如果一个 batch 的 mask 全为 `0`，返回可反传的 0 loss，避免除零和梯度图断裂。
-8. 当 `--sft_masked_ce_chunk N` 设为正数时，SFT 会改走 `src/sft_loss.py::masked_head_cross_entropy`：模型主体只输出 hidden，不先生成完整 logits；loss 函数只收集 mask=1 的 target token，并按 `N` 个 trainable token 一块执行 `hidden @ head.weight.T` 和 CE，再加权平均。每个 chunk 默认用 checkpoint 包住，反向时重算 chunk logits，减少保存中间 logits 的显存。`0` 表示关闭这个优化，便于和旧路径对比。
+8. `--sft_masked_ce_chunk` 当前建议保持 `0`，也就是 SFT 默认走完整 logits masked CE。正数会改走 `src/sft_loss.py::masked_head_cross_entropy`：模型主体只输出 hidden，不先生成完整 logits；loss 函数只收集 mask=1 的 target token，并按 `N` 个 trainable token 一块执行 `hidden @ head.weight.T` 和 CE，再加权平均。这个 Python 分块路径可用于小模型/单卡数值对比，但在 13B ZeRO-3 长上下文下会反复触发 head weight all-gather，服务器实测会 timeout，因此不作为生产推荐路径。
 9. 梯度累计由 Lightning 的 `--accumulate_grad_batches` 执行；SFT dataset 会同步使用这个参数来计算 epoch 长度、完整数据遍历步数和 step checkpoint 的 mid-epoch 恢复偏移。也就是说，从 `rwkv-step-N.pth` 恢复时会跳过 `N * accumulate_grad_batches` 个 micro-batch，而不是只跳过 `N` 个 micro-batch。
 10. SFT 学习率默认只做 warmup，warmup 后保持 `lr_init`。启用 `--lr_wsd_decay_iters K` 后，调度器会用 `total_steps = epoch_steps * epoch_count` 定位最后 `K` 个 optimizer step，并按 `--lr_wsd_decay_style linear|cosine` 从 `lr_init` 衰减到 `lr_final`；这个 SFT WSD 调度不依赖 `my_exit_tokens`，也不会触发预训练的 token-limit 退出逻辑。
    WSD 的 step 使用 Lightning 恢复出的 `global_step`，所以从 DeepSpeed/Lightning checkpoint 断点续训时，LR 会继续处在原曲线的位置。断点续训时应保持 `epoch_steps`、`epoch_count`、`lr_wsd_decay_iters`、`lr_wsd_decay_style`、`lr_init`、`lr_final` 和原训练一致；如果你有意改变它们，就等价于从当前 step 接到一条新的 LR 曲线。
@@ -432,7 +432,7 @@ WSD 衰减区间的计算方式：
 - CUDA smoke 第二档：`RWKV_RUN_TRAIN_PY_SFT_SMOKE=1` 会启动 `train.py` 跑 1 个 SFT step，覆盖 Lightning、DeepSpeed、optimizer、多卡 torchrun 链路。可用 `RWKV_SFT_SMOKE_ACCUMULATE_GRAD_BATCHES=2` 之类的环境变量额外覆盖梯度累计路径。
 - CUDA smoke 第三档：`RWKV_RUN_TRAIN_PY_SFT_RESUME_SMOKE=1` 会保存 `rwkv-step-1.pth` 并从它恢复，覆盖 SFT 断点续训和 DeepSpeed 分片 checkpoint 加载。
 - CUDA smoke 第四档：`RWKV_RUN_TRAIN_PY_SFT_WSD_RESUME_SMOKE=1` 会用 DeepSpeed 先保存 step checkpoint，再恢复并检查恢复后的 `train_log.txt` 里 LR 已经处在 WSD 衰减后的正确位置。
-- CUDA smoke 第五档：`RWKV_RUN_CUDA_SFT_MASKED_CE_CHUNK_EQUIV_SMOKE=1` 会在单卡上用同一个 checkpoint、同一批 synthetic SFT binidx、同样的优化器步数分别跑完整 logits CE 和 `--sft_masked_ce_chunk` 分块 CE，对比 loss 序列、梯度范数、参数采样差异、耗时和 CUDA peak memory。这个测试用于确认新分块 loss 对训练数值基本等价，并量化显存/速度变化。
+- CUDA smoke 第五档：`RWKV_RUN_CUDA_SFT_MASKED_CE_CHUNK_EQUIV_SMOKE=1` 会在单卡上用同一个 checkpoint、同一批 synthetic SFT binidx、同样的优化器步数分别跑完整 logits CE 和 `--sft_masked_ce_chunk` 分块 CE，对比 loss 序列、梯度范数、参数采样差异、耗时和 CUDA peak memory。这个测试只保留为实验路径的数值对比；13B ZeRO-3 生产训练暂时不要开启正数 chunk。
 
 当前已验证结果：
 
@@ -447,7 +447,7 @@ WSD 衰减区间的计算方式：
   - `RWKV_RUN_CUDA_SFT_ACCUM_EQUIV_SMOKE=1` -> `1 passed in 14.74s`。
   - `RWKV_RUN_TRAIN_PY_SFT_DP_ZERO_ACCUM_EQUIV_SMOKE=1` + `RWKV_SFT_SMOKE_DEVICES=8` + `deepspeed_stage_3_offload` -> `1 passed in 81.06s`。
   - `RWKV_RUN_TRAIN_PY_SFT_MERGE_SMOKE=1` + `RWKV_SFT_SMOKE_DEVICES=8` + `deepspeed_stage_3_offload` -> `1 passed in 284.01s`。
-- 待服务器验证：`RWKV_RUN_CUDA_SFT_MASKED_CE_CHUNK_EQUIV_SMOKE=1` 用于较大型对比分块 masked-head CE 和完整 logits masked CE；本地未启用 CUDA 环境变量时该测试会 skip。
+- 服务器反馈：`--sft_masked_ce_chunk 4096/8192` 在 13B + ZeRO-3 长上下文下仍会 timeout；生产脚本默认保持 `SFT_MASKED_CE_CHUNK=0`，等待后续 masked head fused CE CUDA op。
 
 ## 13.3B SFT 启动脚本操作手册
 
@@ -582,7 +582,7 @@ bash run_13b_sft_zero3_offload.sh
 - `EPOCH_COUNT`：跑几遍 SFT 数据。想跑 `N` 遍时，`EPOCH_STEPS` 按一遍数据计算，`EPOCH_COUNT=N`。
 - `SFT_ONE_PASS`：设为 `1` 时，脚本仍会传入 `EPOCH_STEPS/EPOCH_COUNT` 作为整数占位值，但 `train.py` 会自动读取 `DATA_FILE.idx` 的 document 数并覆盖为 `ceil(num_documents / effective_bsz)` 和 `epoch_count=1`，适合只想完整跑一遍数据的场景。直接调用 `train.py` 时可以省略 `--epoch_steps/--epoch_count`；通过这个脚本调用时不用管它们的默认值。
 - `GRAD_CP`：激活检查点。`1` 表示对 block 开启 checkpointing，省显存但更慢；显存足够时可设 `0`。
-- `SFT_MASKED_CE_CHUNK`：SFT masked loss 的 head/CE 分块大小。`0` 表示关闭，使用完整 logits masked CE；正数表示只对 mask=1 的 target token 分块计算 head 和 CE。`ctx_len=86016` 的自包含脚本默认 `512`，用于降低 logits 峰值显存。
+- `SFT_MASKED_CE_CHUNK`：SFT masked loss 的实验性 head/CE 分块大小。生产默认保持 `0`，使用完整 logits masked CE；`0` 本身没有额外分块效率损耗，但会物化完整 logits。正数会只对 mask=1 的 target token 分块计算 head 和 CE，目前在 13B ZeRO-3 长上下文下会 timeout，暂不推荐生产使用。
 - `STRATEGY`：默认 `deepspeed_stage_3_offload`，更省显存；显存足够时可以用 `deepspeed_stage_3` 做纯 ZeRO-3。
 - `LR_INIT`、`LR_FINAL`、`WARMUP_STEPS`、`WEIGHT_DECAY`：SFT 学习率计划和正则参数。默认 `LR_WSD_DECAY_ITERS=0` 时，warmup 后保持 `LR_INIT`；设置 `LR_WSD_DECAY_ITERS=K` 后，最后 `K` 个 optimizer step 会按 `LR_WSD_DECAY_STYLE=cosine|linear` 衰减到 `LR_FINAL`。
 - 断点续训 LR：从 DeepSpeed/Lightning checkpoint 恢复时，`trainer.global_step` 会恢复，WSD 会按恢复后的 step 继续衰减。恢复时不要随意改 `EPOCH_STEPS/EPOCH_COUNT/LR_WSD_DECAY_ITERS/LR_WSD_DECAY_STYLE/LR_INIT/LR_FINAL`，否则后续 LR 曲线会按新的配置重新解释当前 step。

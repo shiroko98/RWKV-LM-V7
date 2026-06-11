@@ -49,12 +49,12 @@ STRATEGY="deepspeed_stage_3_offload"
 GRAD_CP="1"                # 1 => slower, save VRAM; 0 => faster, more VRAM.
 HEAD_CHUNK="0"             # 0 => faster, more VRAM; larger values => slower, less pretrain CE VRAM.
 SFT_MASKED_CE_CHUNK="0"    # Keep 0 for production; positive chunked SFT CE currently times out under 13B ZeRO-3.
-SFT_MASKED_FUSED_CE_CHUNK="0" # Experimental CUDA fused masked head CE. Try 4096/8192 on H800 after smoke tests pass.
+SFT_MASKED_FUSED_CE_CHUNK="4096" # CUDA fused masked head CE; set 2048 if long-run OOM appears.
 DS_BUCKET_MB="64"
 DS_OFFLOAD_PIN_MEMORY="1"  # -1 => keep DeepSpeed default; 0/1 force offload pin_memory.
-DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD="100000" # Keep small params replicated to reduce tiny gathers.
-DS_STAGE3_PREFETCH_BUCKET_SIZE="20000000"      # DeepSpeed parameter elements, not bytes.
-DS_STAGE3_MAX_LIVE_PARAMETERS="1000000000"     # DeepSpeed parameter elements, not bytes.
+DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD="0"       # Lowmem A/B winner: do not persist extra small params.
+DS_STAGE3_PREFETCH_BUCKET_SIZE="5000000"        # DeepSpeed parameter elements, not bytes.
+DS_STAGE3_MAX_LIVE_PARAMETERS="200000000"       # DeepSpeed parameter elements, not bytes.
 KERNEL="@rwkv3"            # Usually faster on H100 / H800.
 
 LR_INIT="5e-6"

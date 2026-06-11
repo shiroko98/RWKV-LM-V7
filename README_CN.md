@@ -638,7 +638,7 @@ bash run_13b_sft_zero3_offload.sh
 - `SFT_ONE_PASS`：设为 `1` 时，脚本仍会传入 `EPOCH_STEPS/EPOCH_COUNT` 作为整数占位值，但 `train.py` 会自动读取 `DATA_FILE.idx` 的 document 数并覆盖为 `ceil(num_documents / effective_bsz)` 和 `epoch_count=1`，适合只想完整跑一遍数据的场景。直接调用 `train.py` 时可以省略 `--epoch_steps/--epoch_count`；通过这个脚本调用时不用管它们的默认值。
 - `GRAD_CP`：激活检查点。`1` 表示对 block 开启 checkpointing，省显存但更慢；显存足够时可设 `0`。
 - `SFT_MASKED_CE_CHUNK`：SFT masked loss 的实验性 head/CE 分块大小。生产默认保持 `0`，使用完整 logits masked CE；`0` 本身没有额外分块效率损耗，但会物化完整 logits。正数会只对 mask=1 的 target token 分块计算 head 和 CE，目前在 13B ZeRO-3 长上下文下会 timeout，暂不推荐生产使用。
-- `SFT_MASKED_FUSED_CE_CHUNK`：新的 CUDA fused masked head CE 内部 chunk 行数。默认 `0` 关闭；服务器 smoke 通过后可以试 `4096` 或 `8192`。不要和 `SFT_MASKED_CE_CHUNK` 同时设为正数。
+- `SFT_MASKED_FUSED_CE_CHUNK`：新的 CUDA fused masked head CE 内部 chunk 行数。13B 脚本默认 `4096`，这是当前 ctx86016 SFT 的推荐生产路径；若长跑偶发 OOM，可先降到 `2048`。不要和 `SFT_MASKED_CE_CHUNK` 同时设为正数。
 - `STRATEGY`：默认 `deepspeed_stage_3_offload`，更省显存；显存足够时可以用 `deepspeed_stage_3` 做纯 ZeRO-3。
 - `LR_INIT`、`LR_FINAL`、`WARMUP_STEPS`、`WEIGHT_DECAY`：SFT 学习率计划和正则参数。默认 `LR_WSD_DECAY_ITERS=0` 时，warmup 后保持 `LR_INIT`；设置 `LR_WSD_DECAY_ITERS=K` 后，最后 `K` 个 optimizer step 会按 `LR_WSD_DECAY_STYLE=cosine|linear` 衰减到 `LR_FINAL`。
 - 断点续训 LR：从 DeepSpeed/Lightning checkpoint 恢复时，`trainer.global_step` 会恢复，WSD 会按恢复后的 step 继续衰减。恢复时不要随意改 `EPOCH_STEPS/EPOCH_COUNT/LR_WSD_DECAY_ITERS/LR_WSD_DECAY_STYLE/LR_INIT/LR_FINAL`，否则后续 LR 曲线会按新的配置重新解释当前 step。
@@ -647,11 +647,11 @@ bash run_13b_sft_zero3_offload.sh
 - `WANDB_PROJECT`：空字符串表示不启用 wandb；非空则记录到对应项目。
 - `KERNEL`：RWKV7 CUDA kernel 选择，默认 `@rwkv3`。
 - `HEAD_CHUNK`：head 分块设置，默认 `0`，一般先保持默认。
-- `DS_BUCKET_MB`：DeepSpeed all-gather / reduce-scatter bucket 大小，默认 `64` MB；调大可能减少碎通信，但会增加显存压力。
-- `DS_OFFLOAD_PIN_MEMORY`：DeepSpeed offload 的 `pin_memory` 开关。`-1` 表示保留 strategy 默认值，`0/1` 表示强制关闭/开启。13B profiling/ctx86016 脚本默认设为 `1`，用于减少 CPU offload H2D/D2H 拷贝等待。
-- `DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD`：写入 DeepSpeed `stage3_param_persistence_threshold`，单位是参数元素个数，不是字节。大于等于 `0` 时生效，`-1` 保留默认。它会让小参数保持常驻，减少很多小 AllGather；阈值越大越吃显存。
-- `DS_STAGE3_PREFETCH_BUCKET_SIZE`：写入 DeepSpeed `stage3_prefetch_bucket_size`，单位是参数元素个数。用于控制 ZeRO-3 参数预取规模；调大可能减少等待/碎 gather，但增加显存峰值。
-- `DS_STAGE3_MAX_LIVE_PARAMETERS`：写入 DeepSpeed `stage3_max_live_parameters`，单位是参数元素个数。限制同一时间 live 参数量；调大可能减少反复释放/重新 gather，但会增加显存压力。
+- `DS_BUCKET_MB`：DeepSpeed all-gather / reduce-scatter bucket 大小，13B 脚本默认 `64` MB；实测 bucket-only `128` 没有提速，反而略慢。
+- `DS_OFFLOAD_PIN_MEMORY`：DeepSpeed offload 的 `pin_memory` 开关。`-1` 表示保留 strategy 默认值，`0/1` 表示强制关闭/开启。13B 脚本默认设为 `1`，用于减少 CPU offload H2D/D2H 拷贝等待。
+- `DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD`：写入 DeepSpeed `stage3_param_persistence_threshold`，单位是参数元素个数，不是字节。13B 脚本默认 `0`，也就是不额外常驻小参数，保留更健康的显存余量。
+- `DS_STAGE3_PREFETCH_BUCKET_SIZE`：写入 DeepSpeed `stage3_prefetch_bucket_size`，单位是参数元素个数。13B 脚本默认 `5000000`，这是当前 A/B 中 lowmem 推荐组合的一部分。
+- `DS_STAGE3_MAX_LIVE_PARAMETERS`：写入 DeepSpeed `stage3_max_live_parameters`，单位是参数元素个数。13B 脚本默认 `200000000`，用于限制 live 参数量并控制显存峰值。
 - `MASTER_ADDR`、`MASTER_PORT`、`CUDA_VISIBLE_DEVICES`：单机多卡 torchrun / distributed 初始化相关参数。
 - `TORCH_EXTENSIONS_DIR`、`TORCH_CUDA_ARCH_LIST`、`MAX_JOBS`：CUDA 扩展编译缓存、架构和并行编译设置。H800 常用 `TORCH_CUDA_ARCH_LIST=9.0`。
 

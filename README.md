@@ -850,7 +850,7 @@ Key parameters:
 - `SFT_ONE_PASS`: set to `1` to let `train.py` read `DATA_FILE.idx` and override the schedule with `epoch_steps=ceil(num_documents / effective_bsz)` and `epoch_count=1`. This is the low-friction option when you want exactly one full pass. Direct `train.py` usage may omit `--epoch_steps/--epoch_count`; this launcher still passes integer placeholders, but you do not need to care about their defaults in one-pass mode.
 - `GRAD_CP`: activation checkpointing. `1` enables block-level checkpointing to save VRAM; `0` disables it and is faster if memory allows.
 - `SFT_MASKED_CE_CHUNK`: experimental head/CE chunk size for SFT masked loss. Production defaults to `0`, which uses full-logits masked CE; `0` itself has no extra chunking overhead, but it materializes full logits. Positive values compute head and CE only for mask=1 target tokens in chunks, but currently timeout under 13B ZeRO-3 long-context training and are not recommended for production.
-- `SFT_MASKED_FUSED_CE_CHUNK`: internal row chunk size for the new CUDA fused masked head CE. Default `0` disables it; after server smokes pass, try `4096` or `8192`. Do not set it positive together with `SFT_MASKED_CE_CHUNK`.
+- `SFT_MASKED_FUSED_CE_CHUNK`: internal row chunk size for the new CUDA fused masked head CE. The 13B launchers default to `4096`, which is the current recommended production path for ctx86016 SFT; if long runs hit occasional OOMs, try `2048` first. Do not set it positive together with `SFT_MASKED_CE_CHUNK`.
 - `STRATEGY`: defaults to `deepspeed_stage_3_offload` for lower VRAM. Use `deepspeed_stage_3` for pure ZeRO-3 if memory allows.
 - `LR_INIT`, `LR_FINAL`, `WARMUP_STEPS`, `WEIGHT_DECAY`: SFT learning-rate schedule and regularization. With the default `LR_WSD_DECAY_ITERS=0`, LR stays at `LR_INIT` after warmup. Set `LR_WSD_DECAY_ITERS=K` to decay over the final `K` optimizer steps to `LR_FINAL` with `LR_WSD_DECAY_STYLE=cosine|linear`.
 - Resume LR: when resuming from a DeepSpeed/Lightning checkpoint, `trainer.global_step` is restored and WSD continues from that step. Do not casually change `EPOCH_STEPS/EPOCH_COUNT/LR_WSD_DECAY_ITERS/LR_WSD_DECAY_STYLE/LR_INIT/LR_FINAL` on resume, or the later LR curve will be reinterpreted from the current step.
@@ -859,11 +859,11 @@ Key parameters:
 - `WANDB_PROJECT`: empty disables wandb; a non-empty value enables logging under that project.
 - `KERNEL`: RWKV7 CUDA kernel selector. The default is `@rwkv3`.
 - `HEAD_CHUNK`: head chunking setting. The default is `0`; keep it unchanged unless you are intentionally testing memory/perf behavior.
-- `DS_BUCKET_MB`: DeepSpeed all-gather / reduce-scatter bucket size in MB. Larger values can reduce fragmented communication, but increase VRAM pressure.
-- `DS_OFFLOAD_PIN_MEMORY`: DeepSpeed offload `pin_memory` switch. `-1` keeps the strategy default; `0/1` forces disabled/enabled. The 13B profiling and ctx86016 scripts default to `1` to reduce CPU offload H2D/D2H wait.
-- `DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD`: maps to DeepSpeed `stage3_param_persistence_threshold`, measured in parameter elements, not bytes. Values >= 0 enable it, while `-1` keeps the default. It keeps small parameters resident to reduce many tiny AllGathers; larger thresholds use more VRAM.
-- `DS_STAGE3_PREFETCH_BUCKET_SIZE`: maps to DeepSpeed `stage3_prefetch_bucket_size`, measured in parameter elements. Larger values can reduce wait/fragmented gathers, but raise peak VRAM.
-- `DS_STAGE3_MAX_LIVE_PARAMETERS`: maps to DeepSpeed `stage3_max_live_parameters`, measured in parameter elements. Larger values can reduce repeated release/re-gather cycles, but raise VRAM pressure.
+- `DS_BUCKET_MB`: DeepSpeed all-gather / reduce-scatter bucket size in MB. The 13B launchers default to `64`; the bucket-only `128` test did not improve speed and was slightly slower.
+- `DS_OFFLOAD_PIN_MEMORY`: DeepSpeed offload `pin_memory` switch. `-1` keeps the strategy default; `0/1` forces disabled/enabled. The 13B launchers default to `1` to reduce CPU offload H2D/D2H wait.
+- `DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD`: maps to DeepSpeed `stage3_param_persistence_threshold`, measured in parameter elements, not bytes. The 13B launchers default to `0`, which avoids extra small-parameter residency and keeps healthier VRAM headroom.
+- `DS_STAGE3_PREFETCH_BUCKET_SIZE`: maps to DeepSpeed `stage3_prefetch_bucket_size`, measured in parameter elements. The 13B launchers default to `5000000`, part of the current lowmem A/B winner.
+- `DS_STAGE3_MAX_LIVE_PARAMETERS`: maps to DeepSpeed `stage3_max_live_parameters`, measured in parameter elements. The 13B launchers default to `200000000` to limit live parameters and control peak VRAM.
 - `MASTER_ADDR`, `MASTER_PORT`, `CUDA_VISIBLE_DEVICES`: single-node torchrun / distributed initialization settings.
 - `TORCH_EXTENSIONS_DIR`, `TORCH_CUDA_ARCH_LIST`, `MAX_JOBS`: CUDA extension cache, target architecture, and parallel build settings. H800 commonly uses `TORCH_CUDA_ARCH_LIST=9.0`.
 

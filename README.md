@@ -870,7 +870,7 @@ Key parameters:
 - `EPOCH_SAVE`, `SAVE_EVERY_N_STEPS`, `KEEP_LAST_N_CHECKPOINTS`: checkpoint cadence and retention.
 - `PROJ_DIR`: output directory for logs and checkpoints.
 - `WANDB_PROJECT`: empty disables wandb; a non-empty value enables logging under that project.
-- wandb training metrics: `train/loss` is the current-step loss, `train/epoch_loss` is the running epoch-average loss, `train/lr` / `train/weight_decay` are optimizer settings, `train/samples` is cumulative trained samples, and `train/tokens` / `train/tokens_b` are cumulative trained tokens plus the billion-token view. Throughput metrics live under `perf/*`: `perf/iteration_time_sec`, `perf/optimizer_steps_per_sec`, `perf/tokens_per_sec`, `perf/ktokens_per_sec`, and `perf/samples_per_sec`.
+- wandb training metrics: `train/loss` is the current-step loss, `train/epoch_loss` is the running epoch-average loss, `train/lr` / `train/weight_decay` are optimizer settings, `train/grad_norm` is logged when a global grad norm is available, `train/samples` is cumulative trained samples, and `train/tokens` / `train/tokens_b` are cumulative trained tokens plus the billion-token view. Throughput metrics live under `perf/*`: `perf/iteration_time_sec`, `perf/optimizer_steps_per_sec`, `perf/tokens_per_sec`, `perf/ktokens_per_sec`, and `perf/samples_per_sec`.
 - `KERNEL`: RWKV7 CUDA kernel selector. The default is `@rwkv3`.
 - `HEAD_CHUNK`: head chunking setting. The default is `0`; keep it unchanged unless you are intentionally testing memory/perf behavior.
 - `DS_BUCKET_MB`: DeepSpeed all-gather / reduce-scatter bucket size in MB. The 13B launchers default to `64`; the bucket-only `128` test did not improve speed and was slightly slower.

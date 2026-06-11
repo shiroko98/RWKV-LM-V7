@@ -658,7 +658,7 @@ bash run_13b_sft_zero3_offload.sh
 - `EPOCH_SAVE`、`SAVE_EVERY_N_STEPS`、`KEEP_LAST_N_CHECKPOINTS`：checkpoint 保存频率和保留数量。
 - `PROJ_DIR`：训练日志和 checkpoint 输出目录。
 - `WANDB_PROJECT`：空字符串表示不启用 wandb；非空则记录到对应项目。
-- wandb 训练指标：`train/loss` 是当前 step loss，`train/epoch_loss` 是当前 epoch 内累计平均 loss，`train/lr` / `train/weight_decay` 是当前优化器参数，`train/samples` 是累计训练样本数，`train/tokens` / `train/tokens_b` 是累计训练 token 数及其十亿 token 视图。吞吐相关指标写在 `perf/*` 下，包括 `perf/iteration_time_sec`、`perf/optimizer_steps_per_sec`、`perf/tokens_per_sec`、`perf/ktokens_per_sec` 和 `perf/samples_per_sec`。
+- wandb 训练指标：`train/loss` 是当前 step loss，`train/epoch_loss` 是当前 epoch 内累计平均 loss，`train/lr` / `train/weight_decay` 是当前优化器参数，`train/grad_norm` 是可获取时的全局梯度范数，`train/samples` 是累计训练样本数，`train/tokens` / `train/tokens_b` 是累计训练 token 数及其十亿 token 视图。吞吐相关指标写在 `perf/*` 下，包括 `perf/iteration_time_sec`、`perf/optimizer_steps_per_sec`、`perf/tokens_per_sec`、`perf/ktokens_per_sec` 和 `perf/samples_per_sec`。
 - `KERNEL`：RWKV7 CUDA kernel 选择，默认 `@rwkv3`。
 - `HEAD_CHUNK`：head 分块设置，默认 `0`，一般先保持默认。
 - `DS_BUCKET_MB`：DeepSpeed all-gather / reduce-scatter bucket 大小，13B 脚本默认 `64` MB；实测 bucket-only `128` 没有提速，反而略慢。

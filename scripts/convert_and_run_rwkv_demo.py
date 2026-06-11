@@ -47,6 +47,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--current-location", default="", help="Optional current_location field for chat-template rendering")
     parser.add_argument("--add-generation-prompt", action=argparse.BooleanOptionalAction, default=True, help="Append assistant generation prompt when rendering chat messages")
     parser.add_argument("--enable-thinking", action="store_true", help="Open a <think> block in the assistant generation prompt")
+    parser.add_argument("--force-thinking", action="store_true", help="Alias of --enable-thinking; force the prompt to end with an open <think> block")
     parser.add_argument("--no-add-thinking", action="store_true", help="Do not add an empty <think> block in the assistant generation prompt")
     parser.add_argument("--device", default="cuda", help="Inference device for the demo")
     parser.add_argument("--runtime-dtype", choices=("auto", "bf16", "fp16", "fp32"), default="auto", help="Runtime dtype for inference. 'auto' follows checkpoint dtype")
@@ -122,7 +123,9 @@ def build_demo_command(args: argparse.Namespace, model_path: Path) -> list[str]:
     if args.current_location:
         command.extend(["--current-location", args.current_location])
     command.append("--add-generation-prompt" if args.add_generation_prompt else "--no-add-generation-prompt")
-    if args.enable_thinking:
+    if args.force_thinking:
+        command.append("--force-thinking")
+    elif args.enable_thinking:
         command.append("--enable-thinking")
     if args.no_add_thinking:
         command.append("--no-add-thinking")

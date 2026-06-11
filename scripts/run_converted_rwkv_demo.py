@@ -41,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--current-location", default="", help="Optional current_location field injected into the rendered system message")
     parser.add_argument("--add-generation-prompt", action=argparse.BooleanOptionalAction, default=True, help="When rendering chat messages, append the assistant generation prompt")
     parser.add_argument("--enable-thinking", action="store_true", help="When rendering chat messages, open a <think> block in the assistant generation prompt")
+    parser.add_argument("--force-thinking", action="store_true", help="Alias of --enable-thinking; force the prompt to end with an open <think> block")
     parser.add_argument("--no-add-thinking", action="store_true", help="When rendering chat messages, do not add an empty <think> block")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Inference device")
     parser.add_argument("--dtype", choices=sorted(DTYPE_MAP), default="auto", help="Runtime dtype. 'auto' follows the checkpoint dtype.")

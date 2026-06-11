@@ -106,6 +106,7 @@ def test_build_commands_forward_optional_flags(tmp_path: Path):
             "--exclude-frozen-parameters",
             "--raw-prompt",
             "--no-add-generation-prompt",
+            "--force-thinking",
             "--enable-thinking",
             "--no-add-thinking",
         ]
@@ -119,7 +120,8 @@ def test_build_commands_forward_optional_flags(tmp_path: Path):
     assert "--exclude-frozen-parameters" in convert_command
     assert "--raw-prompt" in demo_command
     assert "--no-add-generation-prompt" in demo_command
-    assert "--enable-thinking" in demo_command
+    assert "--force-thinking" in demo_command
+    assert "--enable-thinking" not in demo_command
     assert "--no-add-thinking" in demo_command
 
 

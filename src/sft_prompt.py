@@ -16,12 +16,14 @@ def render_user_prompt(
     current_location: str = "",
     add_generation_prompt: bool = True,
     enable_thinking: bool = False,
+    force_thinking: bool = False,
     no_add_thinking: bool = False,
 ) -> str:
     if raw_prompt:
         return prompt
+    enable_thinking = enable_thinking or force_thinking
     if enable_thinking and no_add_thinking:
-        raise ValueError("--enable-thinking and --no-add-thinking are mutually exclusive.")
+        raise ValueError("--enable-thinking/--force-thinking and --no-add-thinking are mutually exclusive.")
 
     template_path = Path(chat_template).expanduser().resolve()
     if not template_path.is_file():
@@ -59,5 +61,6 @@ def resolve_prompt_from_args(args: Any) -> str:
         current_location=getattr(args, "current_location", ""),
         add_generation_prompt=getattr(args, "add_generation_prompt", True),
         enable_thinking=getattr(args, "enable_thinking", False),
+        force_thinking=getattr(args, "force_thinking", False),
         no_add_thinking=getattr(args, "no_add_thinking", False),
     )

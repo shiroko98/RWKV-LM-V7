@@ -40,6 +40,17 @@ def test_render_user_prompt_rejects_thinking_conflict():
         )
 
 
+def test_render_user_prompt_force_thinking_opens_think_block():
+    prompt = render_user_prompt(
+        prompt="你好",
+        chat_template=str(TEMPLATE_PATH),
+        force_thinking=True,
+    )
+
+    assert prompt.endswith("<|im_start|>Assistant: <think>\n")
+    assert "</think>" not in prompt.rsplit("<|im_start|>Assistant:", 1)[1]
+
+
 def test_render_user_prompt_requires_template_file():
     with pytest.raises(FileNotFoundError, match="chat template file not found"):
         render_user_prompt(prompt="你好", chat_template=str(REPO_ROOT / "missing.jinja"))

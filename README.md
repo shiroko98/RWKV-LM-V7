@@ -962,7 +962,7 @@ python scripts/run_converted_rwkv_demo.py \
   --sample
 ```
 
-This demo validates that the converted checkpoint loads, runs forward, and generates through the SFT chat template. Add `--system-prompt`, `--current-date`, or `--current-location` when you need those system fields. Add `--raw-prompt` only when you want plain next-token continuation without chat-template rendering.
+This demo validates that the converted checkpoint loads, runs forward, and generates through the SFT chat template. Add `--system-prompt`, `--current-date`, or `--current-location` when you need those system fields. Add `--raw-prompt` only when you want plain next-token continuation without chat-template rendering. By default, the chat prompt adds an empty `<think>\n\n</think>\n\n`; add `--force-thinking` when you want the prompt to end with an open `<think>\n` and force the model to generate its thinking text first.
 
 To combine DeepSpeed shard conversion and the prompt smoke test in one command, use the wrapper below. If the output `.pth` already exists, it is reused so repeated prompt checks do not reconvert a 13B checkpoint; add `--force-convert` when you intentionally want to rebuild it:
 
@@ -981,6 +981,7 @@ python scripts/convert_and_run_rwkv_demo.py \
   --max-new-tokens 64 \
   --temperature 1.0 \
   --top-p 0.8 \
+  --force-thinking \
   --sample
 ```
 

@@ -750,7 +750,7 @@ python scripts/run_converted_rwkv_demo.py \
   --sample
 ```
 
-这个 demo 只是验证合并后的 checkpoint 能加载、能 forward、能按 SFT chat template 生成。需要指定系统消息时可以加 `--system-prompt`、`--current-date`、`--current-location`；如果只是想做普通 next-token continuation，不经过 chat template，可以加 `--raw-prompt`。
+这个 demo 只是验证合并后的 checkpoint 能加载、能 forward、能按 SFT chat template 生成。需要指定系统消息时可以加 `--system-prompt`、`--current-date`、`--current-location`；如果只是想做普通 next-token continuation，不经过 chat template，可以加 `--raw-prompt`。默认 chat prompt 会加入空的 `<think>\n\n</think>\n\n`；如果要强制模型先生成思考内容，加 `--force-thinking`，它会让 prompt 以打开的 `<think>\n` 结尾。
 
 如果想把“合并 DeepSpeed 分片”和“跑 prompt 推理 smoke”放在一条命令里，可以用整合脚本。默认输出文件已存在时会直接复用，避免每次测试 prompt 都重新合并 13B；需要强制重新合并时加 `--force-convert`：
 
@@ -769,6 +769,7 @@ python scripts/convert_and_run_rwkv_demo.py \
   --max-new-tokens 64 \
   --temperature 1.0 \
   --top-p 0.8 \
+  --force-thinking \
   --sample
 ```
 

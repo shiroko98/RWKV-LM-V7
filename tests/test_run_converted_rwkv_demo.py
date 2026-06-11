@@ -61,6 +61,7 @@ def test_resolve_prompt_renders_user_prompt_with_chat_template():
         current_location="Shanghai",
         add_generation_prompt=True,
         enable_thinking=False,
+        force_thinking=False,
         no_add_thinking=False,
     )
 
@@ -83,19 +84,21 @@ def test_parse_args_uses_plain_prompt_not_message_files(monkeypatch):
             "model.pth",
             "--prompt",
             "你好",
+            "--force-thinking",
         ],
     )
 
     args = demo_script.parse_args()
 
     assert args.prompt == "你好"
+    assert args.force_thinking is True
     assert args.raw_prompt is False
     assert not hasattr(args, "messages_file")
     assert not hasattr(args, "messages_json")
 
 
 def test_resolve_prompt_can_use_raw_prompt_and_rejects_thinking_conflict():
-    args = Namespace(raw_prompt=True, prompt="raw text", enable_thinking=True, no_add_thinking=True)
+    args = Namespace(raw_prompt=True, prompt="raw text", enable_thinking=True, force_thinking=False, no_add_thinking=True)
     assert demo_script.resolve_prompt(args) == "raw text"
 
     args.raw_prompt = False
@@ -104,6 +107,7 @@ def test_resolve_prompt_can_use_raw_prompt_and_rejects_thinking_conflict():
     args.current_date = ""
     args.current_location = ""
     args.add_generation_prompt = True
+    args.force_thinking = False
     with pytest.raises(ValueError, match="mutually exclusive"):
         demo_script.resolve_prompt(args)
 

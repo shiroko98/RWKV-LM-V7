@@ -435,10 +435,11 @@ def _assert_step_checkpoint_exists(proj_dir: Path) -> None:
     raise AssertionError(f"missing rwkv-step-*.pth checkpoint in {proj_dir}; entries={entries}")
 
 
-def _run_train_py(command: list[str], label: str) -> str:
+def _run_train_py(command: list[str], label: str, env: dict[str, str] | None = None) -> str:
     result = subprocess.run(
         command,
         cwd=ROOT,
+        env=env,
         text=True,
         capture_output=True,
         timeout=int(os.environ.get("RWKV_SFT_SMOKE_TIMEOUT", "1800")),
@@ -447,6 +448,34 @@ def _run_train_py(command: list[str], label: str) -> str:
     if result.returncode != 0:
         pytest.fail(f"{label} failed with code {result.returncode}\n{combined_output[-8000:]}")
     return combined_output
+
+
+def _fake_wandb_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
+    fake_dir = tmp_path / "fake_wandb_module"
+    fake_dir.mkdir()
+    fake_log = tmp_path / "fake_wandb.jsonl"
+    (fake_dir / "wandb.py").write_text(
+        "\n".join(
+            [
+                "import json, os",
+                "_log_path = os.environ.get('RWKV_FAKE_WANDB_LOG', '')",
+                "def _write(payload):",
+                "    if _log_path:",
+                "        with open(_log_path, 'a', encoding='utf-8') as f:",
+                "            f.write(json.dumps(payload, default=str, sort_keys=True) + '\\n')",
+                "def init(**kwargs):",
+                "    _write({'event': 'init', 'kwargs': kwargs})",
+                "    return None",
+                "def log(values, step=None):",
+                "    _write({'event': 'log', 'step': step, 'values': values})",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(fake_dir) + os.pathsep + env.get("PYTHONPATH", "")
+    env["RWKV_FAKE_WANDB_LOG"] = str(fake_log)
+    return env, fake_log
 
 
 def _run_checkpoint_merge_command(command: list[str], label: str) -> str:
@@ -1297,6 +1326,122 @@ def test_train_py_sft_deepspeed_tail_eval_overlap_smoke(tmp_path):
     assert "eval step 1" in log_text
     assert "mode overlap" in output
     _assert_step_checkpoint_exists(proj_dir)
+
+
+@pytest.mark.cuda
+@pytest.mark.slow
+def test_train_py_sft_eval_wandb_loss_matches_baseline(tmp_path):
+    model_path = _require_cuda_smoke("RWKV_RUN_TRAIN_PY_SFT_EVAL_WANDB_EQUIV_SMOKE")
+    pad_length = int(os.environ.get("RWKV_SFT_EVAL_WANDB_EQUIV_PAD_LENGTH", os.environ.get("RWKV_SFT_SMOKE_PAD_LENGTH", "257")))
+    ctx_len = pad_length - 1
+    assert ctx_len > 0 and ctx_len % 16 == 0, "ctx_len must be positive and divisible by the RWKV7 chunk length 16"
+
+    devices = int(os.environ.get("RWKV_SFT_SMOKE_DEVICES", "2"))
+    strategy = os.environ.get("RWKV_SFT_SMOKE_STRATEGY", "deepspeed_stage_3_offload")
+    if devices < 2:
+        pytest.skip("eval+wandb equivalence smoke requires RWKV_SFT_SMOKE_DEVICES >= 2")
+    if torch.cuda.device_count() < devices:
+        pytest.skip(f"only {torch.cuda.device_count()} CUDA device(s) visible, need {devices}")
+    if "deepspeed" not in strategy:
+        pytest.skip("eval+wandb equivalence smoke requires a DeepSpeed strategy")
+
+    state = _load_state_dict(model_path)
+    dims = _infer_rwkv7_dims(state)
+    epoch_steps = int(os.environ.get("RWKV_SFT_EVAL_WANDB_EQUIV_STEPS", "2"))
+    tol = float(os.environ.get("RWKV_SFT_EVAL_WANDB_EQUIV_LOSS_TOL", "5e-4"))
+    prefix = _build_synthetic_sft_binidx(
+        tmp_path,
+        pad_length,
+        docs=max(devices * (epoch_steps + 1), 8),
+        vocab_size=dims["vocab_size"],
+        name="eval_wandb_equiv_sft",
+    )
+
+    common_extra_args = [
+        "--epoch_save",
+        "0",
+        "--save_every_n_steps",
+        "0",
+        "--keep_last_n_checkpoints",
+        "0",
+    ]
+    baseline_proj_dir = tmp_path / "eval_wandb_baseline"
+    eval_wandb_proj_dir = tmp_path / "eval_wandb_enabled"
+
+    baseline_command = _train_py_command(
+        load_model=model_path,
+        prefix=prefix,
+        proj_dir=baseline_proj_dir,
+        dims=dims,
+        ctx_len=ctx_len,
+        epoch_steps=epoch_steps,
+        epoch_count=1,
+        devices=devices,
+        strategy=strategy,
+        extra_args=common_extra_args,
+    )
+    eval_wandb_command = _train_py_command(
+        load_model=model_path,
+        prefix=prefix,
+        proj_dir=eval_wandb_proj_dir,
+        dims=dims,
+        ctx_len=ctx_len,
+        epoch_steps=epoch_steps,
+        epoch_count=1,
+        devices=devices,
+        strategy=strategy,
+        extra_args=common_extra_args
+        + [
+            "--wandb",
+            "fake-sft-eval-wandb-equiv",
+            "--sft_eval_tail_docs",
+            "1",
+            "--sft_eval_include_in_train",
+            "1",
+            "--sft_eval_every_n_steps",
+            "1",
+            "--sft_eval_steps",
+            "1",
+        ],
+    )
+
+    fake_env, fake_wandb_log = _fake_wandb_env(tmp_path)
+    _run_train_py(baseline_command, "train.py SFT baseline loss equivalence")
+    eval_output = _run_train_py(eval_wandb_command, "train.py SFT eval+wandb loss equivalence", env=fake_env)
+
+    baseline_loss = _read_train_log_epoch_loss(baseline_proj_dir)
+    eval_wandb_loss = _read_train_log_epoch_loss(eval_wandb_proj_dir)
+    assert abs(baseline_loss - eval_wandb_loss) <= tol, {
+        "baseline_loss": baseline_loss,
+        "eval_wandb_loss": eval_wandb_loss,
+        "tol": tol,
+    }
+
+    wandb_events = [
+        json.loads(line)
+        for line in fake_wandb_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(event["event"] == "init" for event in wandb_events)
+    assert any("train/loss" in event.get("values", {}) for event in wandb_events if event["event"] == "log")
+    assert any("eval/loss" in event.get("values", {}) for event in wandb_events if event["event"] == "log")
+    assert "eval step 1" in (eval_wandb_proj_dir / "train_log.txt").read_text(encoding="utf-8")
+
+    summary = {
+        "pad_length": pad_length,
+        "ctx_len": ctx_len,
+        "devices": devices,
+        "strategy": strategy,
+        "epoch_steps": epoch_steps,
+        "baseline_loss": baseline_loss,
+        "eval_wandb_loss": eval_wandb_loss,
+        "loss_abs_diff": abs(baseline_loss - eval_wandb_loss),
+        "tol": tol,
+        "output_tail": eval_output[-4000:],
+    }
+    summary_file = os.environ.get("RWKV_SFT_EVAL_WANDB_EQUIV_SUMMARY_FILE", "")
+    if summary_file:
+        Path(summary_file).expanduser().write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
 
 @pytest.mark.cuda

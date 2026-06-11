@@ -607,6 +607,19 @@ Keep `--sft_masked_ce_chunk` at `0` for now. `0` disables the experimental Pytho
 
 The new `--sft_masked_fused_ce_chunk N` is a separate CUDA fused masked head CE path, not the Python chunk path above. When positive, SFT calls one fused CUDA op that internally uses an `N`-row temporary logits buffer to compute `hidden @ head.weight.T`, masked CE, `grad_hidden`, and `grad_weight`. Loss and gradients are normalized by `loss_mask.sum()`, L2Wrap is not applied, and the existing pretraining `(x, y)` fused CE path is unchanged. This path is currently CUDA/H800-oriented and defaults to `0`; run the server smokes below first, then try `SFT_MASKED_FUSED_CE_CHUNK=4096` or `8192` in the 13B launcher.
 
+CUDA operators split into two responsibility groups. Model-body operators are shared by pretraining and SFT; head / CE loss operators are where pretraining and SFT diverge:
+
+| Operator / Path | Used by pretraining | Used by SFT | Notes |
+| --- | --- | --- | --- |
+| `rwkv7_clampw_v3` | Yes | Yes | RWKV7 time-mix recurrent core. It is enabled by `KERNEL=@rwkv3` and does not care whether the loss is pretraining CE or SFT masked CE. |
+| `rwkv7_tmix_mix6_bf16_v5` | Yes | Yes | Time-mix preprocessing / mixing, part of the model body. |
+| `rwkv7_cmix_bf16_v5` | Yes | Yes | Channel-mix, part of the model body. |
+| `rwkv7_l2wrap_ce_bf16_v2` | Yes | No | Pretraining full-logits + targets L2Wrap CE path. |
+| `rwkv7_head_l2wrap_ce_bf16_v4.forward` | Yes | No | Pretraining head fused CE: `hidden @ head.weight.T` + CE + L2Wrap, without an SFT mask. |
+| `rwkv7_head_l2wrap_ce_bf16_v4.forward_masked` | No | Yes | SFT-only fused masked head CE: `hidden @ head.weight.T` + masked CE, no L2Wrap, normalized by `loss_mask.sum()`. |
+
+So `rwkv7_clampw_v3` is not pretraining-only; both pretraining and SFT run through it. The truly pretraining-only pieces are mainly the L2Wrap, unmasked head/CE paths, while the SFT-only piece is the new `forward_masked` path.
+
 The 0.4B checkpoint listed in the example is `L24-D1024` with `dim_ffn=4096`, `vocab_size=65536`, `head_size=64`, and RWKV7 G1 LoRA dimensions `64/64/32/128`. If you use another checkpoint, read its architecture text and keep these shape parameters aligned with the checkpoint.
 
 SFT masked-training implementation:

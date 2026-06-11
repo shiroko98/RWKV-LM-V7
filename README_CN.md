@@ -395,6 +395,19 @@ python train.py \
 
 新的 `--sft_masked_fused_ce_chunk N` 是独立的 CUDA fused masked head CE 路径，和上面的 Python chunk 不是一回事。设为正数时，SFT 会一次性调用 fused CUDA op，op 内部按 `N` 行临时 logits buffer 做 `hidden @ head.weight.T`、masked CE、`grad_hidden` 和 `grad_weight`，loss 和梯度都按 `loss_mask.sum()` 归一化，不带 L2Wrap，不改变预训练 `(x, y)` 的 fused CE 路径。这个路径目前只做 CUDA/H800 方向，默认仍为 `0`；建议先跑下面的服务器 smoke，再在 13B 脚本里尝试 `SFT_MASKED_FUSED_CE_CHUNK=4096` 或 `8192`。
 
+CUDA 算子按职责分成两类。模型主体算子会被预训练和 SFT 共用；head / CE loss 算子才区分预训练和 SFT：
+
+| 算子 / 路径 | pretrain 是否使用 | SFT 是否使用 | 说明 |
+| --- | --- | --- | --- |
+| `rwkv7_clampw_v3` | 是 | 是 | RWKV7 time-mix recurrent core，属于模型主体；`KERNEL=@rwkv3` 时启用，不关心 loss 是预训练 CE 还是 SFT masked CE。 |
+| `rwkv7_tmix_mix6_bf16_v5` | 是 | 是 | time-mix 前处理/混合相关，属于模型主体。 |
+| `rwkv7_cmix_bf16_v5` | 是 | 是 | channel-mix，属于模型主体。 |
+| `rwkv7_l2wrap_ce_bf16_v2` | 是 | 否 | 预训练完整 logits + targets 的 L2Wrap CE 路径。 |
+| `rwkv7_head_l2wrap_ce_bf16_v4.forward` | 是 | 否 | 预训练 head fused CE：`hidden @ head.weight.T` + CE + L2Wrap，无 SFT mask。 |
+| `rwkv7_head_l2wrap_ce_bf16_v4.forward_masked` | 否 | 是 | SFT 专用 fused masked head CE：`hidden @ head.weight.T` + masked CE，不加 L2Wrap，按 `loss_mask.sum()` 归一化。 |
+
+因此，`rwkv7_clampw_v3` 不是预训练专用；SFT 和预训练都会经过它。真正 pretrain-only 的主要是带 L2Wrap、无 mask 的 head/CE 路径；SFT-only 的主要是新增的 `forward_masked`。
+
 上面示例里的 0.4B checkpoint 是 `L24-D1024`，对应 `dim_ffn=4096`、`vocab_size=65536`、`head_size=64`，RWKV7 G1 LoRA 维度为 `64/64/32/128`。如果换用其他 checkpoint，需要先看对应架构文本，保证这些形状参数和 checkpoint 一致。
 
 SFT mask 训练的实现框架：

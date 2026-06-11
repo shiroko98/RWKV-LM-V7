@@ -36,6 +36,7 @@ Validation notes
 - Latest 13.3B nsys profiling showed approximate accumulated GPU-kernel shares: `wkv7/clampw` 38.7%, cuBLASLt GEMM 37.9%, NCCL 11.9%, RWKV pointwise 7.4%, LayerNorm 1.2%, SFT fused masked CE small kernels 0.1%.
 - New strict CUDA op-level fused masked CE smoke is available as `RWKV_RUN_CUDA_SFT_MASKED_FUSED_CE_OP_EQUIV_SMOKE=1`; run it on the server and record the summary JSON result.
 - Latest DeepSpeed A/B profile favors the lowmem stage3 settings with `DS_BUCKET_MB=64`; bucket-only `128` increased peak VRAM slightly and reduced throughput, while the faster fully tuned group was too close to the 80G VRAM limit for a long default.
+- README / README_CN now document which CUDA operators are shared model-body paths (`rwkv7_clampw_v3`, tmix, cmix) and which head/CE paths are pretraining-only or SFT-only.
 - Latest server feedback for positive `--sft_masked_ce_chunk`: `4096` and `8192` still timeout under 13B ZeRO-3 long-context SFT, so production scripts should keep it at `0` until the fused masked CUDA op exists.
 - `git diff -- data/SFT/sample/chat_template.jinja` is empty for the current SFT masked-head CE change.
 

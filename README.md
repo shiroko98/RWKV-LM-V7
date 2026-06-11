@@ -753,6 +753,30 @@ python scripts/calc_sft_onepass_steps.py /mnt/data/datasets/sft_train_ctx8192 \
 
 The script reads only `DATA_FILE.idx`, so it is fast even for large `.bin` files. It prints `total_documents`, `train_documents`, `eval_documents`, `epoch_steps`, `epoch_count`, `total_optimizer_steps`, the tail samples repeated by `ceil(...)`, and checkpoint interval estimates for several measured seconds/step values. `--eval-include-in-train 0` means held-out eval: tail eval documents are excluded from training. Set it to `1` when you want to train on all documents while still evaluating on the tail split as an overlapping monitor.
 
+Common eval variants:
+
+```bash
+# held-out: reserve the tail 0.5% for eval only
+python scripts/calc_sft_onepass_steps.py /mnt/data/datasets/sft_train_ctx8192 \
+  --num-nodes 1 --devices 8 --micro-bsz 1 --accumulate-grad-batches 1 \
+  --eval-tail-ratio 0.005 --eval-include-in-train 0 \
+  --n-pass 1 --ctx-len 8192
+
+# overlap: train on all documents, while using the tail 0.5% as a fixed eval monitor
+python scripts/calc_sft_onepass_steps.py /mnt/data/datasets/sft_train_ctx8192 \
+  --num-nodes 1 --devices 8 --micro-bsz 1 --accumulate-grad-batches 1 \
+  --eval-tail-ratio 0.005 --eval-include-in-train 1 \
+  --n-pass 1 --ctx-len 8192
+
+# fixed eval document count; --eval-tail-docs > 0 takes priority over --eval-tail-ratio
+python scripts/calc_sft_onepass_steps.py /mnt/data/datasets/sft_train_ctx8192 \
+  --num-nodes 1 --devices 8 --micro-bsz 1 --accumulate-grad-batches 1 \
+  --eval-tail-docs 2000 --eval-include-in-train 0 \
+  --n-pass 1 --ctx-len 8192
+```
+
+In the output, `total_documents` is the full dataset size, `eval_documents` is the tail eval split, and `train_documents` is the document count used for the training schedule. With `eval_include_in_train=0`, `train_documents = total_documents - eval_documents`, so train and eval do not overlap. With `eval_include_in_train=1`, `train_documents = total_documents`, so training uses all documents and eval is an overlapping monitor. `epoch_steps = ceil(train_documents / effective_bsz)`, so held-out eval produces slightly fewer training steps than overlap eval.
+
 ### 3. Launch 13.3B SFT
 
 Step 3: launch 13.3B SFT on 8 H800 GPUs:

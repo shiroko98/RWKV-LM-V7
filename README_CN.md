@@ -541,6 +541,30 @@ python scripts/calc_sft_onepass_steps.py /mnt/data/datasets/sft_train_ctx8192 \
 
 这个脚本只读取 `DATA_FILE.idx`，不会 mmap 大体积 `.bin`，所以在几十 GB 数据上也很快。输出会包含 `total_documents`、`train_documents`、`eval_documents`、`epoch_steps`、`epoch_count`、`total_optimizer_steps`、由 `ceil(...)` 带来的尾部重复样本数，以及按几个常见 seconds/step 估算的保存间隔。`--eval-include-in-train 0` 表示 held-out eval：尾部 eval documents 不参与训练；设为 `1` 表示 overlap 监控模式：训练仍使用所有 documents，同时固定用尾部 split 做 eval。
 
+eval 参数有三种常见写法：
+
+```bash
+# held-out：尾部 0.5% 只用于 eval，不参与训练
+python scripts/calc_sft_onepass_steps.py /mnt/data/datasets/sft_train_ctx8192 \
+  --num-nodes 1 --devices 8 --micro-bsz 1 --accumulate-grad-batches 1 \
+  --eval-tail-ratio 0.005 --eval-include-in-train 0 \
+  --n-pass 1 --ctx-len 8192
+
+# overlap：训练仍使用全量数据，尾部 0.5% 只作为固定 eval 监控集
+python scripts/calc_sft_onepass_steps.py /mnt/data/datasets/sft_train_ctx8192 \
+  --num-nodes 1 --devices 8 --micro-bsz 1 --accumulate-grad-batches 1 \
+  --eval-tail-ratio 0.005 --eval-include-in-train 1 \
+  --n-pass 1 --ctx-len 8192
+
+# 固定 eval 文档数；--eval-tail-docs > 0 时优先于 --eval-tail-ratio
+python scripts/calc_sft_onepass_steps.py /mnt/data/datasets/sft_train_ctx8192 \
+  --num-nodes 1 --devices 8 --micro-bsz 1 --accumulate-grad-batches 1 \
+  --eval-tail-docs 2000 --eval-include-in-train 0 \
+  --n-pass 1 --ctx-len 8192
+```
+
+输出里 `total_documents` 是总 documents；`eval_documents` 是尾部 eval documents；`train_documents` 是用于计算训练步数的 documents。`eval_include_in_train=0` 时，`train_documents = total_documents - eval_documents`，所以 eval 与训练不重合；`eval_include_in_train=1` 时，`train_documents = total_documents`，所以训练使用全量数据，eval 只作为重叠监控集。`epoch_steps = ceil(train_documents / effective_bsz)`，因此 held-out eval 会比 overlap eval 少一些训练 step。
+
 ### 3. 启动 13.3B SFT
 
 第三步：在 8 张 H800 上启动 13.3B SFT：

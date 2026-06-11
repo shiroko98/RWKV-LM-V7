@@ -41,6 +41,7 @@ Validation notes
 - Added `scripts/calc_sft_onepass_steps.py` so one-pass SFT `epoch_steps` can be computed directly from `DATA_FILE.idx` without starting a long training run.
 - Added SFT tail-split eval design: fixed-step eval can use held-out tail docs or overlap with full training docs, logs eval loss/ppl to wandb, and does not conflict with checkpoint saves at the same step.
 - CUDA SFT tail-eval smoke now covers both held-out mode with enough synthetic documents and overlap mode with a tiny one-document dataset.
+- SFT eval now calls a dedicated `sft_eval_step` that gathers ZeRO-3 sharded head weights before masked/head CE, while the training path keeps the original non-gathered behavior.
 - Latest server feedback for positive `--sft_masked_ce_chunk`: `4096` and `8192` still timeout under 13B ZeRO-3 long-context SFT, so production scripts should keep it at `0` until the fused masked CUDA op exists.
 - `git diff -- data/SFT/sample/chat_template.jinja` is empty for the current SFT masked-head CE change.
 

@@ -1131,6 +1131,63 @@ def test_train_callback_sft_eval_logs_mask_token_weighted_loss(tmp_path, monkeyp
     assert values["eval/docs"] == 2
 
 
+def test_train_callback_sft_eval_prefers_model_eval_step(tmp_path, monkeypatch):
+    batch = (
+        torch.zeros((1, 2), dtype=torch.long),
+        torch.zeros((1, 2), dtype=torch.long),
+        torch.tensor([[1.0, 1.0]]),
+    )
+    calls = []
+
+    class FakeEvalLoader:
+        dataset = SimpleNamespace()
+
+        def __iter__(self):
+            return iter([batch])
+
+    class FakeModule:
+        device = torch.device("cpu")
+        training = True
+
+        def eval(self):
+            self.training = False
+
+        def train(self):
+            self.training = True
+
+        def sft_eval_step(self, batch, batch_idx):
+            calls.append(("eval", batch_idx))
+            return torch.tensor(3.0)
+
+        def training_step(self, batch, batch_idx):
+            calls.append(("train", batch_idx))
+            return torch.tensor(9.0)
+
+    monkeypatch.setattr(trainer_mod, "strategy_barrier", lambda trainer: None)
+
+    args = SimpleNamespace(
+        data_type="sft_binidx",
+        proj_dir=str(tmp_path),
+        wandb="",
+        run_name="eval-step-test",
+        my_timestamp="2026-06-11-12-10-00",
+        sft_eval_steps=1,
+    )
+    callback = trainer_mod.train_callback(args, eval_loader=FakeEvalLoader())
+    trainer = SimpleNamespace(
+        global_rank=0,
+        world_size=1,
+        is_global_zero=True,
+        strategy=SimpleNamespace(barrier=lambda: None),
+        my_log=open(tmp_path / "train_log.txt", "a"),
+    )
+
+    callback._run_sft_eval(trainer, FakeModule(), real_step=12)
+    trainer.my_log.close()
+
+    assert calls == [("eval", 0)]
+
+
 def test_train_callback_resume_global_step_keeps_sft_wsd_decay_position(tmp_path):
     callback = trainer_mod.train_callback(
         SimpleNamespace(

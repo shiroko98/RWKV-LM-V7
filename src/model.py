@@ -3,6 +3,7 @@
 ########################################################################################################
 
 import os, sys, math, gc, importlib
+from contextlib import nullcontext
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -927,6 +928,56 @@ class RWKV(pl.LightningModule):
         x = self.ln_out(x)
         return x
 
+    def _head_weight_context(self, gather_head=False):
+        if not gather_head or "deepspeed" not in globals():
+            return nullcontext()
+        weight = self.head.weight
+        is_zero_param = any(hasattr(weight, attr) for attr in ("ds_id", "ds_status", "ds_shape"))
+        if not is_zero_param:
+            return nullcontext()
+        return deepspeed.zero.GatheredParameters([weight], modifier_rank=0)
+
+    def _sft_loss_from_hidden(self, hidden, targets, loss_mask, gather_head=False):
+        args = self.args
+        sft_masked_fused_ce_chunk = getattr(args, "sft_masked_fused_ce_chunk", 0)
+        if sft_masked_fused_ce_chunk > 0:
+            with self._head_weight_context(gather_head):
+                return head_masked_cross_entropy_cuda(
+                    hidden,
+                    self.head.weight,
+                    targets,
+                    loss_mask,
+                    sft_masked_fused_ce_chunk,
+                )
+        sft_masked_ce_chunk = getattr(args, "sft_masked_ce_chunk", 0)
+        if sft_masked_ce_chunk <= 0:
+            with self._head_weight_context(gather_head):
+                return masked_cross_entropy(self.head(hidden), targets, loss_mask)
+        with self._head_weight_context(gather_head):
+            return masked_head_cross_entropy(
+                hidden,
+                self.head,
+                targets,
+                loss_mask,
+                chunk_size=sft_masked_ce_chunk,
+            )
+
+    def sft_loss_step(self, batch, batch_idx, gather_head=False):
+        idx, targets, loss_mask = batch
+        if int(os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"]) > 0:
+            hidden = self(idx)
+            return self._sft_loss_from_hidden(hidden, targets, loss_mask, gather_head=gather_head)
+
+        sft_masked_fused_ce_chunk = getattr(self.args, "sft_masked_fused_ce_chunk", 0)
+        sft_masked_ce_chunk = getattr(self.args, "sft_masked_ce_chunk", 0)
+        if sft_masked_fused_ce_chunk > 0 or sft_masked_ce_chunk > 0:
+            hidden = self._forward_features(idx)
+            return self._sft_loss_from_hidden(hidden, targets, loss_mask, gather_head=gather_head)
+        return masked_cross_entropy(self(idx), targets, loss_mask)
+
+    def sft_eval_step(self, batch, batch_idx):
+        return self.sft_loss_step(batch, batch_idx, gather_head=True)
+
     if int(os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"]) > 0: # saves 70~80% VRAM
 
         def forward(self, idx):
@@ -934,27 +985,7 @@ class RWKV(pl.LightningModule):
 
         def training_step(self, batch, batch_idx):
             if len(batch) == 3:
-                idx, targets, loss_mask = batch
-                hidden = self(idx)
-                sft_masked_fused_ce_chunk = getattr(self.args, "sft_masked_fused_ce_chunk", 0)
-                if sft_masked_fused_ce_chunk > 0:
-                    return head_masked_cross_entropy_cuda(
-                        hidden,
-                        self.head.weight,
-                        targets,
-                        loss_mask,
-                        sft_masked_fused_ce_chunk,
-                    )
-                sft_masked_ce_chunk = getattr(self.args, "sft_masked_ce_chunk", 0)
-                if sft_masked_ce_chunk <= 0:
-                    return masked_cross_entropy(self.head(hidden), targets, loss_mask)
-                return masked_head_cross_entropy(
-                    hidden,
-                    self.head,
-                    targets,
-                    loss_mask,
-                    chunk_size=sft_masked_ce_chunk,
-                )
+                return self.sft_loss_step(batch, batch_idx)
             idx, targets = batch
             hidden = self(idx)
             return head_l2wrap_cross_entropy(hidden, self.head.weight, targets)
@@ -968,28 +999,7 @@ class RWKV(pl.LightningModule):
 
         def training_step(self, batch, batch_idx):
             if len(batch) == 3:
-                idx, targets, loss_mask = batch
-                sft_masked_fused_ce_chunk = getattr(self.args, "sft_masked_fused_ce_chunk", 0)
-                if sft_masked_fused_ce_chunk > 0:
-                    hidden = self._forward_features(idx)
-                    return head_masked_cross_entropy_cuda(
-                        hidden,
-                        self.head.weight,
-                        targets,
-                        loss_mask,
-                        sft_masked_fused_ce_chunk,
-                    )
-                sft_masked_ce_chunk = getattr(self.args, "sft_masked_ce_chunk", 0)
-                if sft_masked_ce_chunk <= 0:
-                    return masked_cross_entropy(self(idx), targets, loss_mask)
-                hidden = self._forward_features(idx)
-                return masked_head_cross_entropy(
-                    hidden,
-                    self.head,
-                    targets,
-                    loss_mask,
-                    chunk_size=sft_masked_ce_chunk,
-                )
+                return self.sft_loss_step(batch, batch_idx)
             idx, targets = batch
             logits = self(idx)
 

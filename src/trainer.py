@@ -262,7 +262,10 @@ class train_callback(pl.Callback):
                 batch = move_batch_to_device(batch, device)
                 if not isinstance(batch, (tuple, list)) or len(batch) != 3:
                     raise ValueError("SFT eval requires batches of (x, y, loss_mask).")
-                loss = pl_module.training_step(batch, batch_idx)
+                if hasattr(pl_module, "sft_eval_step"):
+                    loss = pl_module.sft_eval_step(batch, batch_idx)
+                else:
+                    loss = pl_module.training_step(batch, batch_idx)
                 mask_tokens = batch[2].float().sum()
                 local_stats[0] += loss.detach().float().to(dtype=torch.float64) * mask_tokens.to(dtype=torch.float64)
                 local_stats[1] += mask_tokens.to(dtype=torch.float64)

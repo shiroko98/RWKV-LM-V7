@@ -648,7 +648,8 @@ Validation coverage:
 - `RWKV_RUN_TRAIN_PY_SFT_RESUME_SMOKE=1` saves `rwkv-step-1.pth` and resumes from it, covering SFT checkpoint resume and DeepSpeed sharded checkpoint loading.
 - `RWKV_RUN_TRAIN_PY_SFT_WSD_RESUME_SMOKE=1` uses DeepSpeed to save a step checkpoint, resumes from it, and checks that `train_log.txt` records the LR at the expected WSD decay position.
 - `RWKV_RUN_CUDA_SFT_MASKED_CE_CHUNK_EQUIV_SMOKE=1` runs a single-GPU comparison between full-logits CE and the old `--sft_masked_ce_chunk` Python chunked CE. Keep this as an experimental numerical-comparison smoke only; do not enable positive Python chunks for 13B ZeRO-3 production runs.
-- `RWKV_RUN_CUDA_SFT_MASKED_FUSED_CE_SMOKE=1` runs a single-GPU comparison between full-logits CE and the new `--sft_masked_fused_ce_chunk` CUDA fused masked head CE, recording loss, gradient norms, sampled parameter differences, elapsed time, and CUDA peak memory.
+- `RWKV_RUN_CUDA_SFT_MASKED_FUSED_CE_OP_EQUIV_SMOKE=1` runs a direct CUDA-op precision check for `rwkv7_head_l2wrap_ce_bf16_v4.forward_masked`: full-logits PyTorch masked CE vs fused CUDA loss, `grad_hidden`, `grad_weight`, plus the all-zero-mask case. This is the fastest way to verify the new operator itself.
+- `RWKV_RUN_CUDA_SFT_MASKED_FUSED_CE_SMOKE=1` runs a single-GPU training-level comparison between full-logits CE and the new `--sft_masked_fused_ce_chunk` CUDA fused masked head CE, recording loss, gradient norms, sampled parameter differences, elapsed time, and CUDA peak memory.
 - `RWKV_RUN_TRAIN_PY_SFT_FUSED_CE_SMOKE=1` runs `train.py` with DeepSpeed/ZeRO and fused masked CE, checking that the multi-GPU strategy completes and writes a finite loss; this is closer to checking whether 13B still times out.
 
 Current validation results:
@@ -667,6 +668,18 @@ Current validation results:
 - Server feedback: the old Python `--sft_masked_ce_chunk 4096/8192` still timed out for 13B + ZeRO-3 long-context training. Production launchers keep `SFT_MASKED_CE_CHUNK=0`. The new CUDA fused path is enabled separately through `SFT_MASKED_FUSED_CE_CHUNK` and should be smoke-tested first.
 
 New fused masked CE server smoke commands:
+
+```bash
+RWKV_RUN_CUDA_SFT_MASKED_FUSED_CE_OP_EQUIV_SMOKE=1 \
+RWKV_SFT_FUSED_CE_OP_BATCH=2 \
+RWKV_SFT_FUSED_CE_OP_TIME=2049 \
+RWKV_SFT_FUSED_CE_OP_HIDDEN=4096 \
+RWKV_SFT_FUSED_CE_OP_CHUNKS=257,4096,8192 \
+RWKV_SFT_FUSED_CE_OP_EQUIV_SUMMARY_FILE=/tmp/rwkv_sft_fused_ce_op_equiv.json \
+python -m pytest -q tests/test_sft_cuda_smoke.py::test_cuda_sft_masked_fused_ce_op_matches_full_logits
+```
+
+The op-level smoke does not need a model checkpoint. It compiles the CUDA extension, compares loss and max absolute gradient differences against full-logits PyTorch masked CE, and writes the measured differences to the summary file. The strict server command above uses BF16, real `vocab_size=65536`, 4098 rows, 13.3B hidden size 4096, a non-divisible chunk (`257`), the production-style chunk (`4096`), a chunk larger than rows (`8192`), and four mask patterns: all-active, sparse, single-token-active, and all-zero. Tolerances can be overridden with `RWKV_SFT_FUSED_CE_OP_LOSS_ATOL`, `RWKV_SFT_FUSED_CE_OP_GRAD_ATOL`, and `RWKV_SFT_FUSED_CE_OP_ZERO_ATOL`.
 
 ```bash
 RWKV_SFT_SMOKE_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
@@ -977,6 +990,16 @@ One 13.3B / ctx86016 / 8xH800 / ZeRO-3-offload / `SFT_MASKED_FUSED_CE_CHUNK=4096
 | PyTorch elementwise/reduce/copy | 2.8% | Scattered tensor ops | Low priority |
 | PyTorch LayerNorm | 1.2% | LN is not a main bottleneck | Fused LN is unlikely to move the needle much right now |
 | SFT fused masked CE small kernels | 0.1% | mask/softmax small kernels are light | The fused CE path has met its OOM/timeout goal; further CE gains would mainly come from head GEMM / active-row compaction |
+
+Practical priority table:
+
+| Priority | Bottleneck Hypothesis | Evidence | Next Experiment | Success Signal | Main Risk |
+| ---: | --- | --- | --- | --- | --- |
+| 1 | ZeRO-3 offload / parameter movement is limiting utilization | NCCL kernels are about 11.9%, many small AllGathers, D2H/H2D memops are visible, sampled GPU util is only about 66% | Compare pure `deepspeed_stage_3` with tuned `deepspeed_stage_3_offload`; tune `DS_BUCKET_MB`, `DS_OFFLOAD_PIN_MEMORY`, `DS_STAGE3_*` | Step time drops and GPU util rises without OOM; NCCL / memcopy pressure becomes less dominant | Pure ZeRO-3 or larger buckets may exceed 80G VRAM |
+| 2 | Model trunk kernels are the real compute floor | `wkv7/clampw` plus cuBLASLt GEMM are about 76.6% of accumulated kernel time | Profile after ZeRO/offload tuning; only then consider `rwkv7_clampw_v3` / long-context kernel work | nsys still dominated by `wkv7/clampw` / GEMM while GPU util is high | CUDA work is more complex and may not improve communication waits |
+| 3 | SFT fused masked CE is needed for memory, not current speed | CE small kernels are about 0.1%, but full logits previously caused OOM/timeout risk at ctx86016 | Keep `SFT_MASKED_FUSED_CE_CHUNK=4096` or lower to `2048` if OOM; run the op-level and training-level precision smokes | No full-logits OOM, finite loss, op loss/grad diffs within tolerance | Larger fused chunks increase peak VRAM |
+| 4 | Python/data input is not the bottleneck during training | CPU and disk IO were not busy in the profile run | Do not optimize dataloader first; revisit only if `gpu_monitor.csv` shows idle GPUs with low NCCL/kernel time | Training remains GPU/communication-bound | Premature dataloader work will not move step time |
+| 5 | LayerNorm / small PyTorch ops are not first-order | LayerNorm is about 1.2%, PyTorch elementwise/reduce/copy about 2.8% | Defer fused LayerNorm / small-op cleanup | Only revisit if a later profile changes the ranking | Low expected payoff |
 
 The same run also showed roughly `66%` average sampled GPU utilization, peak VRAM around `80.1GiB / 81.6GiB`, and low CPU / disk IO pressure. GPU memops included substantial D2H/H2D time, so offload and ZeRO parameter movement are real costs. Compare pure ZeRO-3 against tuned ZeRO-3-offload next:
 

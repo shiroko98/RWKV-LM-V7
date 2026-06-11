@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch.nn import functional as F
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -60,6 +61,35 @@ def _require_cuda_smoke(env_name: str) -> Path:
     return path
 
 
+def _require_cuda_flag(env_name: str) -> None:
+    if os.environ.get(env_name) != "1":
+        pytest.skip(f"set {env_name}=1 to run this CUDA SFT smoke test")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+
+def _load_masked_head_ce_extension(chunk_rows: int):
+    from torch.utils.cpp_extension import load
+
+    return load(
+        name=f"rwkv7_head_l2wrap_ce_bf16_v4_op_equiv_{chunk_rows}",
+        sources=[
+            str(ROOT / "cuda" / "rwkv7_head_l2wrap_ce_bf16_v4.cpp"),
+            str(ROOT / "cuda" / "rwkv7_head_l2wrap_ce_bf16_v4.cu"),
+        ],
+        extra_cflags=["-O3", f"-DHEAD_CE_CHUNK={chunk_rows}"],
+        extra_cuda_cflags=[
+            "-res-usage",
+            "--use_fast_math",
+            "-O3",
+            "-Xptxas -O3",
+            "--extra-device-vectorization",
+            f"-DHEAD_CE_CHUNK={chunk_rows}",
+        ],
+        verbose=True,
+    )
+
+
 def _build_tiny_sft_binidx(tmp_path: Path, pad_length: int) -> Path:
     from src.sft_binidx import build_binidx_dataset
 
@@ -96,6 +126,142 @@ def _build_accum_equiv_sft_binidx(tmp_path: Path, pad_length: int, docs: int, vo
         )
     write_documents(str(prefix), encoded_docs)
     return prefix
+
+
+@pytest.mark.cuda
+@pytest.mark.slow
+def test_cuda_sft_masked_fused_ce_op_matches_full_logits(tmp_path):
+    _require_cuda_flag("RWKV_RUN_CUDA_SFT_MASKED_FUSED_CE_OP_EQUIV_SMOKE")
+    if torch.version.hip is not None:
+        pytest.skip("SFT masked fused CE op equivalence is CUDA-only")
+
+    batch = int(os.environ.get("RWKV_SFT_FUSED_CE_OP_BATCH", "2"))
+    time_len = int(os.environ.get("RWKV_SFT_FUSED_CE_OP_TIME", "2049"))
+    hidden_size = int(os.environ.get("RWKV_SFT_FUSED_CE_OP_HIDDEN", "4096"))
+    vocab_size = 65536
+    chunk_rows_values = [
+        int(value.strip())
+        for value in os.environ.get("RWKV_SFT_FUSED_CE_OP_CHUNKS", "257,4096,8192").split(",")
+        if value.strip()
+    ]
+    dtype_name = os.environ.get("RWKV_SFT_FUSED_CE_OP_DTYPE", "bf16").lower()
+    dtype = torch.float32 if dtype_name in {"fp32", "float32"} else torch.bfloat16
+    seed = int(os.environ.get("RWKV_SFT_FUSED_CE_OP_SEED", "1234"))
+    assert batch > 0 and time_len > 0 and hidden_size > 0 and chunk_rows_values
+    assert all(chunk_rows > 0 for chunk_rows in chunk_rows_values)
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    extension = _load_masked_head_ce_extension(max(chunk_rows_values))
+
+    base_hidden = (torch.randn(batch, time_len, hidden_size, device="cuda", dtype=torch.float32) * 0.05).to(dtype)
+    base_weight = (torch.randn(vocab_size, hidden_size, device="cuda", dtype=torch.float32) * 0.02).to(dtype)
+    targets = torch.randint(0, vocab_size, (batch, time_len), device="cuda", dtype=torch.long)
+    sparse_mask = ((torch.arange(batch * time_len, device="cuda") % 3) != 0).view(batch, time_len).float().contiguous()
+    sparse_mask[-1, -1] = 1.0
+    single_token_mask = torch.zeros_like(sparse_mask)
+    single_token_mask[batch // 2, time_len // 2] = 1.0
+    mask_cases = {
+        "all_active": torch.ones_like(sparse_mask),
+        "sparse_mod3": sparse_mask,
+        "single_active": single_token_mask,
+        "zero_active": torch.zeros_like(sparse_mask),
+    }
+
+    def run_reference(loss_mask: torch.Tensor):
+        hidden = base_hidden.detach().clone().requires_grad_(True)
+        weight = base_weight.detach().clone().requires_grad_(True)
+        logits = F.linear(hidden, weight).float()
+        per_token = F.cross_entropy(
+            logits.reshape(-1, vocab_size),
+            targets.reshape(-1),
+            reduction="none",
+        ).view_as(targets)
+        mask_sum = loss_mask.sum()
+        if float(mask_sum.detach().item()) > 0:
+            loss = (per_token * loss_mask).sum() / mask_sum
+        else:
+            loss = logits.sum() * 0
+        loss.backward()
+        return loss.detach(), hidden.grad.detach(), weight.grad.detach()
+
+    def run_fused(loss_mask: torch.Tensor, chunk_rows: int):
+        hidden = base_hidden.detach().clone().contiguous()
+        weight = base_weight.detach().clone().contiguous()
+        loss, grad_hidden, grad_weight = extension.forward_masked(
+            hidden,
+            weight,
+            targets.contiguous(),
+            loss_mask.contiguous(),
+            chunk_rows,
+        )
+        torch.cuda.synchronize()
+        return loss.detach(), grad_hidden.detach(), grad_weight.detach()
+
+    loss_atol = float(os.environ.get("RWKV_SFT_FUSED_CE_OP_LOSS_ATOL", "2e-2"))
+    grad_atol = float(os.environ.get("RWKV_SFT_FUSED_CE_OP_GRAD_ATOL", "2e-2"))
+    zero_atol = float(os.environ.get("RWKV_SFT_FUSED_CE_OP_ZERO_ATOL", "1e-7"))
+    cases = {}
+    max_loss_diff = 0.0
+    max_grad_hidden_diff = 0.0
+    max_grad_weight_diff = 0.0
+    max_zero_abs = 0.0
+    for mask_name, loss_mask in mask_cases.items():
+        ref_loss, ref_grad_hidden, ref_grad_weight = run_reference(loss_mask)
+        chunk_cases = {}
+        for chunk_rows in chunk_rows_values:
+            fused_loss, fused_grad_hidden, fused_grad_weight = run_fused(loss_mask, chunk_rows)
+            loss_diff = float((ref_loss.float() - fused_loss.float()).abs().item())
+            grad_hidden_diff = float((ref_grad_hidden.float() - fused_grad_hidden.float()).abs().max().item())
+            grad_weight_diff = float((ref_grad_weight.float() - fused_grad_weight.float()).abs().max().item())
+            grad_hidden_mean_diff = float((ref_grad_hidden.float() - fused_grad_hidden.float()).abs().mean().item())
+            grad_weight_mean_diff = float((ref_grad_weight.float() - fused_grad_weight.float()).abs().mean().item())
+            max_loss_diff = max(max_loss_diff, loss_diff)
+            max_grad_hidden_diff = max(max_grad_hidden_diff, grad_hidden_diff)
+            max_grad_weight_diff = max(max_grad_weight_diff, grad_weight_diff)
+            if mask_name == "zero_active":
+                max_zero_abs = max(max_zero_abs, float(fused_loss.float().abs().item()))
+                max_zero_abs = max(max_zero_abs, float(fused_grad_hidden.float().abs().max().item()))
+                max_zero_abs = max(max_zero_abs, float(fused_grad_weight.float().abs().max().item()))
+            chunk_cases[str(chunk_rows)] = {
+                "reference_loss": float(ref_loss.float().item()),
+                "fused_loss": float(fused_loss.float().item()),
+                "loss_diff": loss_diff,
+                "grad_hidden_max_abs_diff": grad_hidden_diff,
+                "grad_weight_max_abs_diff": grad_weight_diff,
+                "grad_hidden_mean_abs_diff": grad_hidden_mean_diff,
+                "grad_weight_mean_abs_diff": grad_weight_mean_diff,
+            }
+        cases[mask_name] = {
+            "mask_sum": float(loss_mask.sum().item()),
+            "chunks": chunk_cases,
+        }
+
+    summary = {
+        "batch": batch,
+        "time_len": time_len,
+        "hidden_size": hidden_size,
+        "vocab_size": vocab_size,
+        "chunk_rows_values": chunk_rows_values,
+        "dtype": str(dtype).removeprefix("torch."),
+        "seed": seed,
+        "cases": cases,
+        "max_loss_diff": max_loss_diff,
+        "loss_atol": loss_atol,
+        "max_grad_hidden_diff": max_grad_hidden_diff,
+        "max_grad_weight_diff": max_grad_weight_diff,
+        "grad_atol": grad_atol,
+        "max_zero_abs": max_zero_abs,
+        "zero_atol": zero_atol,
+    }
+    summary_file = os.environ.get("RWKV_SFT_FUSED_CE_OP_EQUIV_SUMMARY_FILE", "")
+    if summary_file:
+        Path(summary_file).expanduser().write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    assert max_loss_diff <= loss_atol, json.dumps(summary, indent=2)
+    assert max_grad_hidden_diff <= grad_atol, json.dumps(summary, indent=2)
+    assert max_grad_weight_diff <= grad_atol, json.dumps(summary, indent=2)
+    assert max_zero_abs <= zero_atol, json.dumps(summary, indent=2)
 
 
 def _base_sft_args(prefix: Path, dims: dict[str, int], ctx_len: int, **overrides) -> SimpleNamespace:

@@ -9,6 +9,7 @@ Current status
 - Added an optional server CUDA equivalence/perf smoke for chunked masked-head CE vs full-logits CE: `RWKV_RUN_CUDA_SFT_MASKED_CE_CHUNK_EQUIV_SMOKE=1`; keep it as a small-model / single-GPU comparison, not as the production 13B ZeRO-3 path.
 - Added `run_13b_sft_profile.sh` for short 13.3B SFT profiling runs. It records train logs, GPU/CPU sampling, optional NCCL logs, and optional Nsight Systems traces for diagnosing CUDA kernel time versus ZeRO/offload/communication waits.
 - Added DeepSpeed ZeRO-3 tuning switches for SFT profiling/13B runs: offload `pin_memory`, stage3 parameter persistence threshold, prefetch bucket size, and max live parameters.
+- Added a strict CUDA op-level precision smoke for `rwkv7_head_l2wrap_ce_bf16_v4.forward_masked`: BF16, vocab 65536, hidden 4096, multiple chunks, and all-active/sparse/single-token/zero masks.
 - The historical entries below are kept as an append-only implementation log. Some older `Next` or `TODO` items are already completed by later dated entries.
 
 Open tasks
@@ -33,6 +34,7 @@ Validation notes
 - Latest recorded server smoke results include CUDA SFT forward/backward, train.py SFT, resume, DP/ZeRO gradient accumulation equivalence, WSD LR resume, and DeepSpeed checkpoint conversion.
 - Latest recorded server fused masked CE smokes passed with the latest config: single-GPU full-logits-vs-fused equivalence and train.py + 8xH800 ZeRO-3-offload fused CE smoke.
 - Latest 13.3B nsys profiling showed approximate accumulated GPU-kernel shares: `wkv7/clampw` 38.7%, cuBLASLt GEMM 37.9%, NCCL 11.9%, RWKV pointwise 7.4%, LayerNorm 1.2%, SFT fused masked CE small kernels 0.1%.
+- New strict CUDA op-level fused masked CE smoke is available as `RWKV_RUN_CUDA_SFT_MASKED_FUSED_CE_OP_EQUIV_SMOKE=1`; run it on the server and record the summary JSON result.
 - Latest server feedback for positive `--sft_masked_ce_chunk`: `4096` and `8192` still timeout under 13B ZeRO-3 long-context SFT, so production scripts should keep it at `0` until the fused masked CUDA op exists.
 - `git diff -- data/SFT/sample/chat_template.jinja` is empty for the current SFT masked-head CE change.
 

@@ -436,8 +436,9 @@ WSD 衰减区间的计算方式：
 - CUDA smoke 第三档：`RWKV_RUN_TRAIN_PY_SFT_RESUME_SMOKE=1` 会保存 `rwkv-step-1.pth` 并从它恢复，覆盖 SFT 断点续训和 DeepSpeed 分片 checkpoint 加载。
 - CUDA smoke 第四档：`RWKV_RUN_TRAIN_PY_SFT_WSD_RESUME_SMOKE=1` 会用 DeepSpeed 先保存 step checkpoint，再恢复并检查恢复后的 `train_log.txt` 里 LR 已经处在 WSD 衰减后的正确位置。
 - CUDA smoke 第五档：`RWKV_RUN_CUDA_SFT_MASKED_CE_CHUNK_EQUIV_SMOKE=1` 会在单卡上对比完整 logits CE 和旧的 `--sft_masked_ce_chunk` Python 分块 CE。这个测试只保留为实验路径的数值对比；13B ZeRO-3 生产训练不要开启正数 Python chunk。
-- CUDA smoke 第六档：`RWKV_RUN_CUDA_SFT_MASKED_FUSED_CE_SMOKE=1` 会在单卡上对比完整 logits CE 和新的 `--sft_masked_fused_ce_chunk` CUDA fused masked head CE，记录 loss、梯度范数、参数采样差异、耗时和 CUDA peak memory。
-- CUDA smoke 第七档：`RWKV_RUN_TRAIN_PY_SFT_FUSED_CE_SMOKE=1` 会走 `train.py` + DeepSpeed/ZeRO，直接验证 fused masked CE 在多卡 strategy 下能跑完并写出 loss；这个更接近检查 13B 是否还会 timeout。
+- CUDA smoke 第六档：`RWKV_RUN_CUDA_SFT_MASKED_FUSED_CE_OP_EQUIV_SMOKE=1` 会直接校验 `rwkv7_head_l2wrap_ce_bf16_v4.forward_masked` 这个 CUDA op：完整 logits PyTorch masked CE vs fused CUDA 的 loss、`grad_hidden`、`grad_weight`，并额外覆盖全 0 mask。这是最快定位新算子本身精度问题的测试。
+- CUDA smoke 第七档：`RWKV_RUN_CUDA_SFT_MASKED_FUSED_CE_SMOKE=1` 会在单卡上做训练级对比：完整 logits CE 和新的 `--sft_masked_fused_ce_chunk` CUDA fused masked head CE，记录 loss、梯度范数、参数采样差异、耗时和 CUDA peak memory。
+- CUDA smoke 第八档：`RWKV_RUN_TRAIN_PY_SFT_FUSED_CE_SMOKE=1` 会走 `train.py` + DeepSpeed/ZeRO，直接验证 fused masked CE 在多卡 strategy 下能跑完并写出 loss；这个更接近检查 13B 是否还会 timeout。
 
 当前已验证结果：
 
@@ -455,6 +456,18 @@ WSD 衰减区间的计算方式：
 - 服务器反馈：旧的 Python `--sft_masked_ce_chunk 4096/8192` 在 13B + ZeRO-3 长上下文下仍会 timeout；生产脚本默认保持 `SFT_MASKED_CE_CHUNK=0`。新的 CUDA fused 路径通过 `SFT_MASKED_FUSED_CE_CHUNK` 单独开启，需要先跑下方 smoke。
 
 新增 fused masked CE 服务器测试命令：
+
+```bash
+RWKV_RUN_CUDA_SFT_MASKED_FUSED_CE_OP_EQUIV_SMOKE=1 \
+RWKV_SFT_FUSED_CE_OP_BATCH=2 \
+RWKV_SFT_FUSED_CE_OP_TIME=2049 \
+RWKV_SFT_FUSED_CE_OP_HIDDEN=4096 \
+RWKV_SFT_FUSED_CE_OP_CHUNKS=257,4096,8192 \
+RWKV_SFT_FUSED_CE_OP_EQUIV_SUMMARY_FILE=/tmp/rwkv_sft_fused_ce_op_equiv.json \
+python -m pytest -q tests/test_sft_cuda_smoke.py::test_cuda_sft_masked_fused_ce_op_matches_full_logits
+```
+
+这个 op 级测试不需要模型 checkpoint。它会编译 CUDA extension，和完整 logits PyTorch masked CE 对比 loss 和最大绝对梯度误差，并把结果写到 summary 文件。上面的严格服务器命令使用 BF16、真实 `vocab_size=65536`、4098 行、13.3B hidden size 4096，同时测非整除 chunk `257`、生产常用 chunk `4096`、大于总行数的 chunk `8192`，并覆盖四种 mask：全训练、稀疏训练、单 token 训练、全 0 mask。容差可以用 `RWKV_SFT_FUSED_CE_OP_LOSS_ATOL`、`RWKV_SFT_FUSED_CE_OP_GRAD_ATOL`、`RWKV_SFT_FUSED_CE_OP_ZERO_ATOL` 覆盖。
 
 ```bash
 RWKV_SFT_SMOKE_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1d-0.4b-20260210-ctx8192.pth \
@@ -765,6 +778,16 @@ bash run_13b_sft_profile.sh
 | PyTorch elementwise/reduce/copy | 2.8% | 零散 tensor 操作 | 低优先级 |
 | PyTorch LayerNorm | 1.2% | LN 不是主要瓶颈 | fused LN 收益有限，暂不优先 |
 | SFT fused masked CE 小 kernel | 0.1% | mask/softmax 小 kernel 很轻 | 已达到避免 full logits OOM/timeout 的目标，继续优化 CE 收益主要只剩 head GEMM/active-row compact |
+
+实际优化优先级表：
+
+| 优先级 | 瓶颈假设 | 证据 | 下一步实验 | 成功信号 | 主要风险 |
+| ---: | --- | --- | --- | --- | --- |
+| 1 | ZeRO-3 offload / 参数搬运限制了利用率 | NCCL kernels 约 11.9%，小 AllGather 多，D2H/H2D memops 明显，采样 GPU util 约 66% | 对比纯 `deepspeed_stage_3` 和调参后的 `deepspeed_stage_3_offload`；调 `DS_BUCKET_MB`、`DS_OFFLOAD_PIN_MEMORY`、`DS_STAGE3_*` | step time 下降、GPU util 上升且不 OOM；NCCL / memcopy 压力降低 | 纯 ZeRO-3 或更大 bucket 可能超过 80G 显存 |
+| 2 | 模型主干 kernel 是真实计算下限 | `wkv7/clampw` 加 cuBLASLt GEMM 约 76.6% 累计 kernel 时间 | ZeRO/offload 调完后再 profile；仍然如此再考虑 `rwkv7_clampw_v3` / 长上下文专门优化 | nsys 仍被 `wkv7/clampw` / GEMM 主导，同时 GPU util 已较高 | CUDA 改动复杂，且无法解决通信等待 |
+| 3 | SFT fused masked CE 主要解决显存，不是当前速度瓶颈 | CE 小 kernel 约 0.1%，但 full logits 在 ctx86016 曾有 OOM/timeout 风险 | 保持 `SFT_MASKED_FUSED_CE_CHUNK=4096`；若 OOM 降到 `2048`；跑 op 级和训练级精度 smoke | 不再 full-logits OOM，loss 有限，op loss/grad 误差在容差内 | fused chunk 越大显存峰值越高 |
+| 4 | Python / 数据输入不是训练瓶颈 | 这次 profile 里 CPU 和磁盘 IO 不忙 | 暂不优先优化 dataloader；只有当 `gpu_monitor.csv` 显示 GPU 空转且 NCCL/kernel 时间都低时再看 | 训练仍主要受 GPU/通信限制 | 过早优化 dataloader 不会改善 step time |
+| 5 | LayerNorm / 小 PyTorch op 不是一阶问题 | LayerNorm 约 1.2%，PyTorch elementwise/reduce/copy 约 2.8% | 暂缓 fused LayerNorm / 小 op 清理 | 后续 profile 排名发生变化时再重看 | 预期收益低 |
 
 这组结果还显示 GPU 采样约 `66%` 平均利用率、显存峰值约 `80.1GiB / 81.6GiB`，CPU 和磁盘 IO 基本不忙；GPU memops 中 D2H/H2D 拷贝很多，说明 offload 和 ZeRO 参数流动确实在消耗时间。下一步优先比较纯 ZeRO-3 和调参后的 ZeRO-3-offload：
 

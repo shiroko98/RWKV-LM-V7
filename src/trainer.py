@@ -245,7 +245,7 @@ class train_callback(pl.Callback):
 
         self._ensure_run_logging_state(trainer)
 
-    def on_before_optimizer_step(self, trainer, pl_module, optimizer):
+    def on_before_optimizer_step(self, trainer, pl_module, optimizer, optimizer_idx=None):
         grad_norm = get_global_grad_norm(trainer, pl_module)
         if grad_norm is not None:
             trainer.my_grad_norm = grad_norm

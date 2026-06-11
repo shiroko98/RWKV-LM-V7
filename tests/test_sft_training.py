@@ -1066,6 +1066,25 @@ def test_get_global_grad_norm_computes_local_non_deepspeed_norm():
     assert trainer_mod.get_global_grad_norm(trainer, module) == pytest.approx(2 ** 0.5)
 
 
+def test_train_callback_before_optimizer_step_accepts_optimizer_idx(tmp_path, monkeypatch):
+    callback = trainer_mod.train_callback(
+        SimpleNamespace(
+            data_type="sft_binidx",
+            strategy="",
+            proj_dir=str(tmp_path),
+            wandb="",
+            my_timestamp="2026-06-11-15-30-00",
+            run_name="grad-norm-hook-test",
+        )
+    )
+    monkeypatch.setattr(trainer_mod, "get_global_grad_norm", lambda trainer, pl_module: 4.25)
+    trainer = SimpleNamespace()
+
+    callback.on_before_optimizer_step(trainer, object(), object(), 0)
+
+    assert trainer.my_grad_norm == pytest.approx(4.25)
+
+
 def test_train_callback_runs_save_and_eval_on_same_step(tmp_path, monkeypatch):
     events = []
 

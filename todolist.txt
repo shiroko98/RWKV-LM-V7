@@ -20,6 +20,7 @@ Open tasks
 - Run a short 13.3B SFT smoke on a small real-data shard to confirm real-data loss, throughput, memory usage, checkpoint writing, and log output.
 - Run `run_13b_sft_profile.sh` on the server with the intended 13B config to collect step timing, GPU utilization, NCCL logs, and optional nsys trace before deciding the next CUDA/operator optimization.
 - Compare pure `deepspeed_stage_3` against tuned `deepspeed_stage_3_offload` with the new DeepSpeed knobs: `DS_BUCKET_MB`, `DS_OFFLOAD_PIN_MEMORY`, `DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD`, `DS_STAGE3_PREFETCH_BUCKET_SIZE`, and `DS_STAGE3_MAX_LIVE_PARAMETERS`.
+- Run the bucket-only `DS_BUCKET_MB=128` comparison with the lowmem stage3 settings, then append the result to the README / README_CN DeepSpeed A/B table.
 - Run a longer 13.3B dry run on 8xH800 with the intended DeepSpeed strategy to validate ZeRO/offload stability, activation checkpointing, checkpoint retention, resume, and WSD LR behavior under realistic settings.
 - Fill `SAVE_EVERY_N_STEPS` after measuring how many optimizer steps correspond to about half a day, and choose `LR_WSD_DECAY_ITERS` after confirming the one-pass step count.
 - After the first real 13.3B checkpoint, run DeepSpeed/ZeRO shard conversion to single `.pth`, converted-checkpoint equivalence, and chat-template inference smoke.

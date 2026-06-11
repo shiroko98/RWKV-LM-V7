@@ -791,6 +791,43 @@ bash run_13b_sft_profile.sh
 
 这组结果还显示 GPU 采样约 `66%` 平均利用率、显存峰值约 `80.1GiB / 81.6GiB`，CPU 和磁盘 IO 基本不忙；GPU memops 中 D2H/H2D 拷贝很多，说明 offload 和 ZeRO 参数流动确实在消耗时间。下一步优先比较纯 ZeRO-3 和调参后的 ZeRO-3-offload：
 
+DeepSpeed 参数 A/B 短测结果如下，所有组都使用 13.3B / ctx86016 / 8xH800 / `deepspeed_stage_3_offload` / `SFT_MASKED_FUSED_CE_CHUNK=4096` / `PROFILE_STEPS=20`。`tail avg` 统计 step 10 之后的 tqdm 指标；`active GPU util` 只统计训练活跃采样。这里的 `tuned bucket128` 不是 bucket-only 对照，它同时调大了 stage3 persistence/prefetch/live 参数，所以不能把它的高显存全部归因于 `DS_BUCKET_MB=128`。
+
+| 组名 | `DS_BUCKET_MB` | `pin_memory` | `param_persistence` | `prefetch_bucket` | `max_live` | tail avg s/it | tail avg Kt/s | active GPU util | peak VRAM | 结论 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `ds-baseline-default` | 64 | default/false | default | default | default | 38.170 | 18.700 | 90.5% | 80077 MiB | 慢且显存高，作为基准 |
+| `ds-offload-lowmem` | 32 | 1 | 0 | 5000000 | 200000000 | 35.682 | 19.655 | 96.4% | 78615 MiB | 稳、省显存，比基准快约 6.5% |
+| `ds-offload-lowmem-bucket64` | 64 | 1 | 0 | 5000000 | 200000000 | 35.541 | 19.809 | 96.8% | 78675 MiB | 当前推荐，较 bucket32 只多约 60 MiB 峰值显存 |
+| `ds-offload-tuned` | 128 | 1 | 100000 | 20000000 | 1000000000 | 35.343 | 20.045 | 95.6% | 80129 MiB | 略快但显存很紧，不适合直接长跑默认 |
+
+当前建议的长跑配置：
+
+```bash
+DS_BUCKET_MB=64
+DS_OFFLOAD_PIN_MEMORY=1
+DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD=0
+DS_STAGE3_PREFETCH_BUCKET_SIZE=5000000
+DS_STAGE3_MAX_LIVE_PARAMETERS=200000000
+SFT_MASKED_FUSED_CE_CHUNK=4096
+```
+
+如果要判断 `DS_BUCKET_MB=128` 是否值得用，应该只改 bucket，其他参数保持 lowmem 组不变：
+
+```bash
+LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b-20260415-ctx8192.pth \
+DATA_FILE=/mnt/data/Datasets/SFT_RWKV7_13B/results/SFT_RWKV7_13B \
+PROFILE_STEPS=20 \
+STRATEGY=deepspeed_stage_3_offload \
+SFT_MASKED_FUSED_CE_CHUNK=4096 \
+DS_BUCKET_MB=128 \
+DS_OFFLOAD_PIN_MEMORY=1 \
+DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD=0 \
+DS_STAGE3_PREFETCH_BUCKET_SIZE=5000000 \
+DS_STAGE3_MAX_LIVE_PARAMETERS=200000000 \
+RUN_TAG=ds-offload-lowmem-bucket128 \
+bash run_13b_sft_profile.sh
+```
+
 ```bash
 LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b-20260415-ctx8192.pth \
 DATA_FILE=/mnt/data/Datasets/SFT_RWKV7_13B/results/SFT_RWKV7_13B \

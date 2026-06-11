@@ -1003,6 +1003,43 @@ Practical priority table:
 
 The same run also showed roughly `66%` average sampled GPU utilization, peak VRAM around `80.1GiB / 81.6GiB`, and low CPU / disk IO pressure. GPU memops included substantial D2H/H2D time, so offload and ZeRO parameter movement are real costs. Compare pure ZeRO-3 against tuned ZeRO-3-offload next:
 
+The DeepSpeed A/B short-run results below all use 13.3B / ctx86016 / 8xH800 / `deepspeed_stage_3_offload` / `SFT_MASKED_FUSED_CE_CHUNK=4096` / `PROFILE_STEPS=20`. `tail avg` uses tqdm metrics after step 10; `active GPU util` only counts active training samples. The `tuned bucket128` row is not a bucket-only comparison because it also increases stage3 persistence / prefetch / live-parameter settings, so its higher VRAM should not be attributed solely to `DS_BUCKET_MB=128`.
+
+| Run | `DS_BUCKET_MB` | `pin_memory` | `param_persistence` | `prefetch_bucket` | `max_live` | tail avg s/it | tail avg Kt/s | active GPU util | peak VRAM | Takeaway |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `ds-baseline-default` | 64 | default/false | default | default | default | 38.170 | 18.700 | 90.5% | 80077 MiB | Slow and high VRAM; baseline only |
+| `ds-offload-lowmem` | 32 | 1 | 0 | 5000000 | 200000000 | 35.682 | 19.655 | 96.4% | 78615 MiB | Stable, lower VRAM, about 6.5% faster than baseline |
+| `ds-offload-lowmem-bucket64` | 64 | 1 | 0 | 5000000 | 200000000 | 35.541 | 19.809 | 96.8% | 78675 MiB | Current recommendation; only about 60 MiB more peak VRAM than bucket32 |
+| `ds-offload-tuned` | 128 | 1 | 100000 | 20000000 | 1000000000 | 35.343 | 20.045 | 95.6% | 80129 MiB | Slightly faster but too tight on VRAM for a long default |
+
+Current recommended long-run settings:
+
+```bash
+DS_BUCKET_MB=64
+DS_OFFLOAD_PIN_MEMORY=1
+DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD=0
+DS_STAGE3_PREFETCH_BUCKET_SIZE=5000000
+DS_STAGE3_MAX_LIVE_PARAMETERS=200000000
+SFT_MASKED_FUSED_CE_CHUNK=4096
+```
+
+To decide whether `DS_BUCKET_MB=128` is worth using, run a bucket-only comparison by keeping the other lowmem settings unchanged:
+
+```bash
+LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b-20260415-ctx8192.pth \
+DATA_FILE=/mnt/data/Datasets/SFT_RWKV7_13B/results/SFT_RWKV7_13B \
+PROFILE_STEPS=20 \
+STRATEGY=deepspeed_stage_3_offload \
+SFT_MASKED_FUSED_CE_CHUNK=4096 \
+DS_BUCKET_MB=128 \
+DS_OFFLOAD_PIN_MEMORY=1 \
+DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD=0 \
+DS_STAGE3_PREFETCH_BUCKET_SIZE=5000000 \
+DS_STAGE3_MAX_LIVE_PARAMETERS=200000000 \
+RUN_TAG=ds-offload-lowmem-bucket128 \
+bash run_13b_sft_profile.sh
+```
+
 ```bash
 LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b-20260415-ctx8192.pth \
 DATA_FILE=/mnt/data/Datasets/SFT_RWKV7_13B/results/SFT_RWKV7_13B \

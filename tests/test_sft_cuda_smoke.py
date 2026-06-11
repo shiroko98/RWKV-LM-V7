@@ -427,6 +427,14 @@ def _read_train_log_last_lr(proj_dir: Path) -> float:
     return float(parts[3])
 
 
+def _assert_step_checkpoint_exists(proj_dir: Path) -> None:
+    step_checkpoints = sorted(proj_dir.glob("rwkv-step-*.pth"))
+    if step_checkpoints:
+        return
+    entries = sorted(path.name for path in proj_dir.iterdir()) if proj_dir.exists() else []
+    raise AssertionError(f"missing rwkv-step-*.pth checkpoint in {proj_dir}; entries={entries}")
+
+
 def _run_train_py(command: list[str], label: str) -> str:
     result = subprocess.run(
         command,
@@ -1217,7 +1225,7 @@ def test_train_py_sft_deepspeed_tail_eval_heldout_smoke(tmp_path):
     log_text = (proj_dir / "train_log.txt").read_text(encoding="utf-8")
     assert "eval step 1" in log_text
     assert "mode heldout" in output
-    assert (proj_dir / "rwkv-step-1.pth").exists()
+    _assert_step_checkpoint_exists(proj_dir)
     assert torch.isfinite(torch.tensor(_read_train_log_epoch_loss(proj_dir))).item()
 
     summary = {
@@ -1288,7 +1296,7 @@ def test_train_py_sft_deepspeed_tail_eval_overlap_smoke(tmp_path):
     log_text = (proj_dir / "train_log.txt").read_text(encoding="utf-8")
     assert "eval step 1" in log_text
     assert "mode overlap" in output
-    assert (proj_dir / "rwkv-step-1.pth").exists()
+    _assert_step_checkpoint_exists(proj_dir)
 
 
 @pytest.mark.cuda

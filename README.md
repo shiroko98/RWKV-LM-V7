@@ -964,6 +964,26 @@ python scripts/run_converted_rwkv_demo.py \
 
 This demo validates that the converted checkpoint loads, runs forward, and generates through the SFT chat template. Add `--system-prompt`, `--current-date`, or `--current-location` when you need those system fields. Add `--raw-prompt` only when you want plain next-token continuation without chat-template rendering.
 
+To combine DeepSpeed shard conversion and the prompt smoke test in one command, use the wrapper below. If the output `.pth` already exists, it is reused so repeated prompt checks do not reconvert a 13B checkpoint; add `--force-convert` when you intentionally want to rebuild it:
+
+```bash
+python scripts/convert_and_run_rwkv_demo.py \
+  --checkpoint-dir /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.pth \
+  --output-file /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.bf16.pth \
+  --convert-dtype bf16 \
+  --summary-file /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.summary.txt \
+  --vocab-path rwkv_vocab_v20260603.txt \
+  --chat-template data/SFT/sample/chat_template.jinja \
+  --prompt "你好，请用一句话介绍 RWKV。" \
+  --device cuda \
+  --runtime-dtype auto \
+  --topk 10 \
+  --max-new-tokens 64 \
+  --temperature 1.0 \
+  --top-p 0.8 \
+  --sample
+```
+
 ### 9. 13.3B SFT Profiling / ZeRO Diagnosis
 
 [run_13b_sft_profile.sh](/D:/codes/RWKV-LM-V7-12B-train/run_13b_sft_profile.sh) is a short diagnostic launcher, not the production long-run script. It reuses the 13.3B / ctx86016 / SFT mask settings, defaults to `PROFILE_STEPS=8` optimizer steps, disables checkpoint saving and wandb, and writes artifacts under `PROJ_DIR`:

@@ -752,6 +752,26 @@ python scripts/run_converted_rwkv_demo.py \
 
 这个 demo 只是验证合并后的 checkpoint 能加载、能 forward、能按 SFT chat template 生成。需要指定系统消息时可以加 `--system-prompt`、`--current-date`、`--current-location`；如果只是想做普通 next-token continuation，不经过 chat template，可以加 `--raw-prompt`。
 
+如果想把“合并 DeepSpeed 分片”和“跑 prompt 推理 smoke”放在一条命令里，可以用整合脚本。默认输出文件已存在时会直接复用，避免每次测试 prompt 都重新合并 13B；需要强制重新合并时加 `--force-convert`：
+
+```bash
+python scripts/convert_and_run_rwkv_demo.py \
+  --checkpoint-dir /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.pth \
+  --output-file /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.bf16.pth \
+  --convert-dtype bf16 \
+  --summary-file /mnt/data/Codes/RWKV/RWKV-LM-V7-12B-train/outs/13b-sft-zero3-offload/rwkv-step-1000.summary.txt \
+  --vocab-path rwkv_vocab_v20260603.txt \
+  --chat-template data/SFT/sample/chat_template.jinja \
+  --prompt "你好，请用一句话介绍 RWKV。" \
+  --device cuda \
+  --runtime-dtype auto \
+  --topk 10 \
+  --max-new-tokens 64 \
+  --temperature 1.0 \
+  --top-p 0.8 \
+  --sample
+```
+
 ### 9. 13.3B SFT profiling / ZeRO 诊断
 
 [run_13b_sft_profile.sh](/D:/codes/RWKV-LM-V7-12B-train/run_13b_sft_profile.sh) 是短跑诊断脚本，不用于正式长训。它复用 13.3B / ctx86016 / SFT mask 参数，默认只跑 `PROFILE_STEPS=8` 个 optimizer step，不保存 checkpoint、不上 wandb，并把诊断文件写到 `PROJ_DIR`：

@@ -798,6 +798,7 @@ DeepSpeed 参数 A/B 短测结果如下，所有组都使用 13.3B / ctx86016 / 
 | `ds-baseline-default` | 64 | default/false | default | default | default | 38.170 | 18.700 | 90.5% | 80077 MiB | 慢且显存高，作为基准 |
 | `ds-offload-lowmem` | 32 | 1 | 0 | 5000000 | 200000000 | 35.682 | 19.655 | 96.4% | 78615 MiB | 稳、省显存，比基准快约 6.5% |
 | `ds-offload-lowmem-bucket64` | 64 | 1 | 0 | 5000000 | 200000000 | 35.541 | 19.809 | 96.8% | 78675 MiB | 当前推荐，较 bucket32 只多约 60 MiB 峰值显存 |
+| `ds-offload-lowmem-bucket128` | 128 | 1 | 0 | 5000000 | 200000000 | 36.196 | 19.409 | 96.3% | 78815 MiB | bucket-only 128 没有提速，反而比 64 慢 |
 | `ds-offload-tuned` | 128 | 1 | 100000 | 20000000 | 1000000000 | 35.343 | 20.045 | 95.6% | 80129 MiB | 略快但显存很紧，不适合直接长跑默认 |
 
 当前建议的长跑配置：
@@ -811,7 +812,9 @@ DS_STAGE3_MAX_LIVE_PARAMETERS=200000000
 SFT_MASKED_FUSED_CE_CHUNK=4096
 ```
 
-如果要判断 `DS_BUCKET_MB=128` 是否值得用，应该只改 bucket，其他参数保持 lowmem 组不变：
+这组 bucket-only 对照说明，`DS_BUCKET_MB=128` 本身只比 64 多约 `140 MiB` 峰值显存，但 tail avg s/it 从 `35.541` 变成 `36.196`，吞吐反而下降。`ds-offload-tuned` 的快主要来自更激进的 stage3 persistence / prefetch / live 参数组合，不是单纯来自 bucket=128；但它显存峰值已到 `80129 MiB`，不适合直接作为 20 天长跑默认。
+
+如果后续还想探索更激进配置，可以只在短测里试，不建议直接长跑：
 
 ```bash
 LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b-20260415-ctx8192.pth \
@@ -821,10 +824,10 @@ STRATEGY=deepspeed_stage_3_offload \
 SFT_MASKED_FUSED_CE_CHUNK=4096 \
 DS_BUCKET_MB=128 \
 DS_OFFLOAD_PIN_MEMORY=1 \
-DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD=0 \
-DS_STAGE3_PREFETCH_BUCKET_SIZE=5000000 \
-DS_STAGE3_MAX_LIVE_PARAMETERS=200000000 \
-RUN_TAG=ds-offload-lowmem-bucket128 \
+DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD=100000 \
+DS_STAGE3_PREFETCH_BUCKET_SIZE=10000000 \
+DS_STAGE3_MAX_LIVE_PARAMETERS=500000000 \
+RUN_TAG=ds-offload-mid-tuned \
 bash run_13b_sft_profile.sh
 ```
 

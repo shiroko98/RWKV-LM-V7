@@ -20,7 +20,6 @@ Open tasks
 - Run a short 13.3B SFT smoke on a small real-data shard to confirm real-data loss, throughput, memory usage, checkpoint writing, and log output.
 - Run `run_13b_sft_profile.sh` on the server with the intended 13B config to collect step timing, GPU utilization, NCCL logs, and optional nsys trace before deciding the next CUDA/operator optimization.
 - Compare pure `deepspeed_stage_3` against tuned `deepspeed_stage_3_offload` with the new DeepSpeed knobs: `DS_BUCKET_MB`, `DS_OFFLOAD_PIN_MEMORY`, `DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD`, `DS_STAGE3_PREFETCH_BUCKET_SIZE`, and `DS_STAGE3_MAX_LIVE_PARAMETERS`.
-- Run the bucket-only `DS_BUCKET_MB=128` comparison with the lowmem stage3 settings, then append the result to the README / README_CN DeepSpeed A/B table.
 - Run a longer 13.3B dry run on 8xH800 with the intended DeepSpeed strategy to validate ZeRO/offload stability, activation checkpointing, checkpoint retention, resume, and WSD LR behavior under realistic settings.
 - Fill `SAVE_EVERY_N_STEPS` after measuring how many optimizer steps correspond to about half a day, and choose `LR_WSD_DECAY_ITERS` after confirming the one-pass step count.
 - After the first real 13.3B checkpoint, run DeepSpeed/ZeRO shard conversion to single `.pth`, converted-checkpoint equivalence, and chat-template inference smoke.
@@ -36,6 +35,7 @@ Validation notes
 - Latest recorded server fused masked CE smokes passed with the latest config: single-GPU full-logits-vs-fused equivalence and train.py + 8xH800 ZeRO-3-offload fused CE smoke.
 - Latest 13.3B nsys profiling showed approximate accumulated GPU-kernel shares: `wkv7/clampw` 38.7%, cuBLASLt GEMM 37.9%, NCCL 11.9%, RWKV pointwise 7.4%, LayerNorm 1.2%, SFT fused masked CE small kernels 0.1%.
 - New strict CUDA op-level fused masked CE smoke is available as `RWKV_RUN_CUDA_SFT_MASKED_FUSED_CE_OP_EQUIV_SMOKE=1`; run it on the server and record the summary JSON result.
+- Latest DeepSpeed A/B profile favors the lowmem stage3 settings with `DS_BUCKET_MB=64`; bucket-only `128` increased peak VRAM slightly and reduced throughput, while the faster fully tuned group was too close to the 80G VRAM limit for a long default.
 - Latest server feedback for positive `--sft_masked_ce_chunk`: `4096` and `8192` still timeout under 13B ZeRO-3 long-context SFT, so production scripts should keep it at `0` until the fused masked CUDA op exists.
 - `git diff -- data/SFT/sample/chat_template.jinja` is empty for the current SFT masked-head CE change.
 

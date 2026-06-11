@@ -1010,6 +1010,7 @@ The DeepSpeed A/B short-run results below all use 13.3B / ctx86016 / 8xH800 / `d
 | `ds-baseline-default` | 64 | default/false | default | default | default | 38.170 | 18.700 | 90.5% | 80077 MiB | Slow and high VRAM; baseline only |
 | `ds-offload-lowmem` | 32 | 1 | 0 | 5000000 | 200000000 | 35.682 | 19.655 | 96.4% | 78615 MiB | Stable, lower VRAM, about 6.5% faster than baseline |
 | `ds-offload-lowmem-bucket64` | 64 | 1 | 0 | 5000000 | 200000000 | 35.541 | 19.809 | 96.8% | 78675 MiB | Current recommendation; only about 60 MiB more peak VRAM than bucket32 |
+| `ds-offload-lowmem-bucket128` | 128 | 1 | 0 | 5000000 | 200000000 | 36.196 | 19.409 | 96.3% | 78815 MiB | Bucket-only 128 did not improve speed; it was slower than 64 |
 | `ds-offload-tuned` | 128 | 1 | 100000 | 20000000 | 1000000000 | 35.343 | 20.045 | 95.6% | 80129 MiB | Slightly faster but too tight on VRAM for a long default |
 
 Current recommended long-run settings:
@@ -1023,7 +1024,9 @@ DS_STAGE3_MAX_LIVE_PARAMETERS=200000000
 SFT_MASKED_FUSED_CE_CHUNK=4096
 ```
 
-To decide whether `DS_BUCKET_MB=128` is worth using, run a bucket-only comparison by keeping the other lowmem settings unchanged:
+The bucket-only comparison shows that `DS_BUCKET_MB=128` itself only adds about `140 MiB` peak VRAM over bucket64, but tail avg s/it regressed from `35.541` to `36.196`. The speed of `ds-offload-tuned` comes from the more aggressive stage3 persistence / prefetch / live-parameter combination, not from bucket=128 alone; however, its peak VRAM reached `80129 MiB`, which is too tight for a 20-day default.
+
+If you still want to explore a more aggressive middle ground, keep it as a short-run experiment first:
 
 ```bash
 LOAD_MODEL=/mnt/data/Models/RWKV-7/rwkv7-g1f-13.3b-20260415-ctx8192.pth \
@@ -1033,10 +1036,10 @@ STRATEGY=deepspeed_stage_3_offload \
 SFT_MASKED_FUSED_CE_CHUNK=4096 \
 DS_BUCKET_MB=128 \
 DS_OFFLOAD_PIN_MEMORY=1 \
-DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD=0 \
-DS_STAGE3_PREFETCH_BUCKET_SIZE=5000000 \
-DS_STAGE3_MAX_LIVE_PARAMETERS=200000000 \
-RUN_TAG=ds-offload-lowmem-bucket128 \
+DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD=100000 \
+DS_STAGE3_PREFETCH_BUCKET_SIZE=10000000 \
+DS_STAGE3_MAX_LIVE_PARAMETERS=500000000 \
+RUN_TAG=ds-offload-mid-tuned \
 bash run_13b_sft_profile.sh
 ```
 

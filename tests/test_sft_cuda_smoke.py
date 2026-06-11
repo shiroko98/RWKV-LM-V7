@@ -128,6 +128,22 @@ def _build_accum_equiv_sft_binidx(tmp_path: Path, pad_length: int, docs: int, vo
     return prefix
 
 
+def _build_synthetic_sft_binidx(tmp_path: Path, pad_length: int, docs: int, vocab_size: int, name: str) -> Path:
+    from src.sft_binidx import EncodedDocument, write_documents
+
+    prefix = tmp_path / name
+    max_token_id = max(32, vocab_size - 16)
+    encoded_docs = []
+    for doc_id in range(docs):
+        input_ids = [16 + ((doc_id * 131 + pos * 7) % (max_token_id - 16)) for pos in range(pad_length)]
+        loss_mask = [0] + [1 if ((doc_id + pos) % 3 != 0) else 0 for pos in range(1, pad_length)]
+        if sum(loss_mask) == 0:
+            loss_mask[-1] = 1
+        encoded_docs.append(EncodedDocument(input_ids=input_ids, loss_mask=loss_mask))
+    write_documents(str(prefix), encoded_docs)
+    return prefix
+
+
 @pytest.mark.cuda
 @pytest.mark.slow
 def test_cuda_sft_masked_fused_ce_op_matches_full_logits(tmp_path):
@@ -1146,7 +1162,7 @@ def test_train_py_sft_deepspeed_masked_fused_ce_smoke(tmp_path):
 
 @pytest.mark.cuda
 @pytest.mark.slow
-def test_train_py_sft_deepspeed_tail_eval_smoke(tmp_path):
+def test_train_py_sft_deepspeed_tail_eval_heldout_smoke(tmp_path):
     model_path = _require_cuda_smoke("RWKV_RUN_TRAIN_PY_SFT_TAIL_EVAL_SMOKE")
     pad_length = int(os.environ.get("RWKV_SFT_TAIL_EVAL_PAD_LENGTH", os.environ.get("RWKV_SFT_SMOKE_PAD_LENGTH", "257")))
     ctx_len = pad_length - 1
@@ -1161,10 +1177,16 @@ def test_train_py_sft_deepspeed_tail_eval_smoke(tmp_path):
     if "deepspeed" not in strategy:
         pytest.skip("DeepSpeed tail eval smoke requires a DeepSpeed strategy")
 
-    prefix = _build_tiny_sft_binidx(tmp_path, pad_length)
     state = _load_state_dict(model_path)
     dims = _infer_rwkv7_dims(state)
-    proj_dir = tmp_path / "tail_eval_train_py"
+    prefix = _build_synthetic_sft_binidx(
+        tmp_path,
+        pad_length,
+        docs=max(devices * 2, 4),
+        vocab_size=dims["vocab_size"],
+        name="tail_eval_heldout_sft",
+    )
+    proj_dir = tmp_path / "tail_eval_heldout_train_py"
     fused_chunk = int(os.environ.get("RWKV_SFT_TAIL_EVAL_FUSED_CHUNK", os.environ.get("RWKV_SFT_FUSED_CE_TRAIN_PY_CHUNK", "512")))
 
     command = _train_py_command(
@@ -1194,6 +1216,7 @@ def test_train_py_sft_deepspeed_tail_eval_smoke(tmp_path):
     output = _run_train_py(command, "train.py SFT DeepSpeed tail eval")
     log_text = (proj_dir / "train_log.txt").read_text(encoding="utf-8")
     assert "eval step 1" in log_text
+    assert "mode heldout" in output
     assert (proj_dir / "rwkv-step-1.pth").exists()
     assert torch.isfinite(torch.tensor(_read_train_log_epoch_loss(proj_dir))).item()
 
@@ -1203,12 +1226,69 @@ def test_train_py_sft_deepspeed_tail_eval_smoke(tmp_path):
         "devices": devices,
         "strategy": strategy,
         "fused_chunk": fused_chunk,
+        "eval_mode": "heldout",
         "proj_dir": str(proj_dir),
         "output_tail": output[-4000:],
     }
     summary_file = os.environ.get("RWKV_SFT_TAIL_EVAL_SUMMARY_FILE", "")
     if summary_file:
         Path(summary_file).expanduser().write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+
+@pytest.mark.cuda
+@pytest.mark.slow
+def test_train_py_sft_deepspeed_tail_eval_overlap_smoke(tmp_path):
+    model_path = _require_cuda_smoke("RWKV_RUN_TRAIN_PY_SFT_TAIL_EVAL_OVERLAP_SMOKE")
+    pad_length = int(os.environ.get("RWKV_SFT_TAIL_EVAL_PAD_LENGTH", os.environ.get("RWKV_SFT_SMOKE_PAD_LENGTH", "257")))
+    ctx_len = pad_length - 1
+    assert ctx_len > 0 and ctx_len % 16 == 0, "ctx_len must be positive and divisible by the RWKV7 chunk length 16"
+
+    devices = int(os.environ.get("RWKV_SFT_SMOKE_DEVICES", "2"))
+    strategy = os.environ.get("RWKV_SFT_SMOKE_STRATEGY", "deepspeed_stage_3_offload")
+    if devices < 2:
+        pytest.skip("DeepSpeed tail eval overlap smoke requires RWKV_SFT_SMOKE_DEVICES >= 2")
+    if torch.cuda.device_count() < devices:
+        pytest.skip(f"only {torch.cuda.device_count()} CUDA device(s) visible, need {devices}")
+    if "deepspeed" not in strategy:
+        pytest.skip("DeepSpeed tail eval overlap smoke requires a DeepSpeed strategy")
+
+    prefix = _build_tiny_sft_binidx(tmp_path, pad_length)
+    state = _load_state_dict(model_path)
+    dims = _infer_rwkv7_dims(state)
+    proj_dir = tmp_path / "tail_eval_overlap_train_py"
+    fused_chunk = int(os.environ.get("RWKV_SFT_TAIL_EVAL_FUSED_CHUNK", os.environ.get("RWKV_SFT_FUSED_CE_TRAIN_PY_CHUNK", "512")))
+
+    command = _train_py_command(
+        load_model=model_path,
+        prefix=prefix,
+        proj_dir=proj_dir,
+        dims=dims,
+        ctx_len=ctx_len,
+        epoch_steps=2,
+        epoch_count=1,
+        devices=devices,
+        strategy=strategy,
+        sft_masked_fused_ce_chunk=fused_chunk,
+        extra_args=[
+            "--save_every_n_steps",
+            "1",
+            "--keep_last_n_checkpoints",
+            "1",
+            "--sft_eval_tail_docs",
+            "1",
+            "--sft_eval_include_in_train",
+            "1",
+            "--sft_eval_every_n_steps",
+            "1",
+            "--sft_eval_steps",
+            "1",
+        ],
+    )
+    output = _run_train_py(command, "train.py SFT DeepSpeed tail eval overlap")
+    log_text = (proj_dir / "train_log.txt").read_text(encoding="utf-8")
+    assert "eval step 1" in log_text
+    assert "mode overlap" in output
+    assert (proj_dir / "rwkv-step-1.pth").exists()
 
 
 @pytest.mark.cuda

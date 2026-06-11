@@ -8,7 +8,7 @@ from src.lr_schedule import compute_sft_wsd_lr, sft_wsd_decay_enabled
 NUMBERED_CKPT_PATTERN = re.compile(r"^rwkv(?:-step)?-(\d+)\.pth$")
 
 def is_deepspeed_strategy(strategy: str) -> bool:
-    return 'deepspeed' in str(strategy)
+    return 'deepspeed' in str(strategy).lower()
 
 def my_save(args, trainer, dd, ff):
     if is_deepspeed_strategy(args.strategy):
@@ -96,6 +96,71 @@ def strategy_barrier(trainer):
         pass
 
 
+def get_global_grad_norm(trainer, pl_module):
+    strategy = getattr(trainer, "strategy", None)
+    strategy_model = getattr(strategy, "model", None)
+    for owner in (strategy_model, getattr(pl_module, "model", None), pl_module):
+        if owner is None:
+            continue
+        for attr in ("get_global_grad_norm", "get_grad_norm", "gradient_norm"):
+            value = getattr(owner, attr, None)
+            if callable(value):
+                try:
+                    value = value()
+                except TypeError:
+                    continue
+            if value is not None and not callable(value):
+                try:
+                    if torch.is_tensor(value):
+                        return float(value.detach().float().item())
+                    return float(value)
+                except (TypeError, ValueError):
+                    pass
+
+    if is_deepspeed_strategy(getattr(trainer, "strategy", "")):
+        return None
+
+    parameters = getattr(pl_module, "parameters", None)
+    if not callable(parameters):
+        return None
+
+    grad_norm_sq = 0.0
+    has_grad = False
+    for parameter in parameters():
+        if parameter.grad is None:
+            continue
+        grad_norm = parameter.grad.detach().float().norm(2).item()
+        grad_norm_sq += grad_norm * grad_norm
+        has_grad = True
+    if not has_grad:
+        return None
+    return grad_norm_sq ** 0.5
+
+
+def build_wandb_train_metrics(args, trainer, real_step, token_per_optimizer_step, t_cost, kt_s, grad_norm):
+    effective_bsz = getattr(args, "effective_bsz", args.real_bsz)
+    cumulative_tokens = real_step * token_per_optimizer_step
+    metrics = {
+        "train/loss": trainer.my_loss,
+        "train/epoch_loss": trainer.my_epoch_loss,
+        "train/lr": trainer.my_lr,
+        "train/weight_decay": trainer.my_wd,
+        "train/samples": real_step * effective_bsz,
+        "train/tokens": cumulative_tokens,
+        "train/tokens_b": cumulative_tokens / 1e9,
+        "train/step": real_step,
+    }
+    if t_cost > 0:
+        metrics["perf/iteration_time_sec"] = t_cost
+        metrics["perf/optimizer_steps_per_sec"] = 1.0 / t_cost
+        metrics["perf/tokens_per_sec"] = token_per_optimizer_step / t_cost
+        metrics["perf/ktokens_per_sec"] = kt_s
+        metrics["perf/samples_per_sec"] = effective_bsz / t_cost
+    if grad_norm is not None:
+        metrics["train/grad_norm"] = grad_norm
+    return metrics
+
+
 class train_callback(pl.Callback):
     def __init__(self, args, eval_loader=None):
         super().__init__()
@@ -180,15 +245,22 @@ class train_callback(pl.Callback):
 
         self._ensure_run_logging_state(trainer)
 
+    def on_before_optimizer_step(self, trainer, pl_module, optimizer):
+        grad_norm = get_global_grad_norm(trainer, pl_module)
+        if grad_norm is not None:
+            trainer.my_grad_norm = grad_norm
+
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         args = self.args
         token_per_micro_batch = args.ctx_len * args.real_bsz
         token_per_optimizer_step = args.ctx_len * getattr(args, "effective_bsz", args.real_bsz)
         real_step = trainer.global_step + args.epoch_begin * args.epoch_steps
+        grad_norm = getattr(trainer, "my_grad_norm", None)
 
         if trainer.is_global_zero:  # logging
             t_now = time.time_ns()
             kt_s = 0
+            t_cost = 0
             try:
                 t_cost = (t_now - trainer.my_time_ns) / 1e9
                 kt_s = token_per_micro_batch / t_cost / 1000
@@ -205,9 +277,15 @@ class train_callback(pl.Callback):
             self.log("loss", trainer.my_epoch_loss, prog_bar=True, on_step=True)
 
             if len(args.wandb) > 0:
-                lll = {"loss": trainer.my_loss, "lr": trainer.my_lr, "wd": trainer.my_wd, "Gtokens": real_step * token_per_optimizer_step / 1e9}
-                if kt_s > 0:
-                    lll["kt/s"] = kt_s
+                lll = build_wandb_train_metrics(
+                    args,
+                    trainer,
+                    real_step,
+                    token_per_optimizer_step,
+                    t_cost,
+                    kt_s,
+                    grad_norm,
+                )
                 trainer.my_wandb.log(lll, step=int(real_step))
 
         if (trainer.is_global_zero) or is_deepspeed_strategy(args.strategy): # save pth

@@ -38,6 +38,7 @@ Validation notes
 - Latest DeepSpeed A/B profile favors the lowmem stage3 settings with `DS_BUCKET_MB=64`; bucket-only `128` increased peak VRAM slightly and reduced throughput, while the faster fully tuned group was too close to the 80G VRAM limit for a long default.
 - README / README_CN now document which CUDA operators are shared model-body paths (`rwkv7_clampw_v3`, tmix, cmix) and which head/CE paths are pretraining-only or SFT-only.
 - 13B launcher defaults now use the measured production recommendation: `SFT_MASKED_FUSED_CE_CHUNK=4096`, `DS_BUCKET_MB=64`, `DS_OFFLOAD_PIN_MEMORY=1`, `DS_STAGE3_PARAM_PERSISTENCE_THRESHOLD=0`, `DS_STAGE3_PREFETCH_BUCKET_SIZE=5000000`, and `DS_STAGE3_MAX_LIVE_PARAMETERS=200000000`.
+- Added `scripts/calc_sft_onepass_steps.py` so one-pass SFT `epoch_steps` can be computed directly from `DATA_FILE.idx` without starting a long training run.
 - Latest server feedback for positive `--sft_masked_ce_chunk`: `4096` and `8192` still timeout under 13B ZeRO-3 long-context SFT, so production scripts should keep it at `0` until the fused masked CUDA op exists.
 - `git diff -- data/SFT/sample/chat_template.jinja` is empty for the current SFT masked-head CE change.
 

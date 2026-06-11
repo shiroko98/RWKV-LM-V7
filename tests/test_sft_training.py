@@ -1,4 +1,5 @@
 import sys
+import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +17,13 @@ from src import lr_schedule
 from src import trainer as trainer_mod
 from src.sft_binidx import EncodedDocument, write_documents
 from src.sft_loss import masked_cross_entropy, masked_head_cross_entropy
+
+_CALC_SFT_ONEPASS_SPEC = importlib.util.spec_from_file_location(
+    "calc_sft_onepass_steps", ROOT / "scripts" / "calc_sft_onepass_steps.py"
+)
+calc_sft_onepass_steps = importlib.util.module_from_spec(_CALC_SFT_ONEPASS_SPEC)
+assert _CALC_SFT_ONEPASS_SPEC.loader is not None
+_CALC_SFT_ONEPASS_SPEC.loader.exec_module(calc_sft_onepass_steps)
 
 
 def make_sft_args(prefix: str, **overrides):
@@ -371,6 +379,30 @@ def test_count_binidx_documents_reads_index_only(tmp_path):
     )
 
     assert train.count_binidx_documents(prefix) == 3
+    assert calc_sft_onepass_steps.count_documents(prefix) == 3
+    assert calc_sft_onepass_steps.count_documents(prefix + ".idx") == 3
+    assert calc_sft_onepass_steps.count_documents(prefix + ".bin") == 3
+
+
+def test_calc_sft_onepass_schedule():
+    schedule = calc_sft_onepass_steps.compute_onepass_schedule(
+        65,
+        num_nodes=1,
+        devices=8,
+        micro_bsz=1,
+        accumulate_grad_batches=4,
+        n_pass=2,
+        ctx_len=5,
+    )
+
+    assert schedule["real_bsz"] == 8
+    assert schedule["effective_bsz"] == 32
+    assert schedule["epoch_steps"] == 3
+    assert schedule["epoch_count"] == 2
+    assert schedule["total_optimizer_steps"] == 6
+    assert schedule["samples_per_epoch"] == 96
+    assert schedule["extra_repeated_per_epoch"] == 31
+    assert schedule["tokens_per_epoch"] == 480
 
 
 def test_sft_one_pass_rejects_unsupported_or_empty_datasets(monkeypatch):

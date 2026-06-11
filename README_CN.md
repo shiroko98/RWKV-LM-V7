@@ -528,32 +528,16 @@ python data/make_sft_binidx.py /mnt/data/datasets/sft_jsonl \
 第二步：计算完整跑一遍 SFT documents 需要多少 `EPOCH_STEPS`：
 
 ```bash
-DATA_FILE=/mnt/data/datasets/sft_train_ctx8192 \
-NUM_NODES=1 \
-DEVICES=8 \
-MICRO_BSZ=1 \
-ACCUMULATE_GRAD_BATCHES=1 \
-N_PASS=1 \
-python - <<'PY'
-import math, os
-from src.binidx import MMapIndexedDataset
-
-docs = len(MMapIndexedDataset(os.environ["DATA_FILE"]))
-real_bsz = int(os.environ["NUM_NODES"]) * int(os.environ["DEVICES"]) * int(os.environ["MICRO_BSZ"])
-accumulate = int(os.environ["ACCUMULATE_GRAD_BATCHES"])
-effective_bsz = real_bsz * accumulate
-epoch_steps = math.ceil(docs / effective_bsz)
-
-print(f"documents={docs}")
-print(f"real_bsz={real_bsz}")
-print(f"accumulate_grad_batches={accumulate}")
-print(f"effective_bsz={effective_bsz}")
-print(f"EPOCH_STEPS={epoch_steps}")
-print(f"EPOCH_COUNT={int(os.environ['N_PASS'])}")
-print(f"samples_per_epoch={epoch_steps * effective_bsz}")
-print(f"extra_repeated_per_epoch={epoch_steps * effective_bsz - docs}")
-PY
+python scripts/calc_sft_onepass_steps.py /mnt/data/datasets/sft_train_ctx8192 \
+  --num-nodes 1 \
+  --devices 8 \
+  --micro-bsz 1 \
+  --accumulate-grad-batches 1 \
+  --n-pass 1 \
+  --ctx-len 8192
 ```
+
+这个脚本只读取 `DATA_FILE.idx`，不会 mmap 大体积 `.bin`，所以在几十 GB 数据上也很快。输出会包含 `epoch_steps`、`epoch_count`、`total_optimizer_steps`、由 `ceil(...)` 带来的尾部重复样本数，以及按几个常见 seconds/step 估算的保存间隔。
 
 ### 3. 启动 13.3B SFT
 

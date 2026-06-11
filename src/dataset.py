@@ -8,6 +8,7 @@ import torch
 from torch.utils.data import Dataset
 from pytorch_lightning.utilities import rank_zero_info
 from .binidx import MMapIndexedDataset
+from .sft_split import compute_sft_tail_eval_count
 
 def is_prime(n):
     if n <= 1:
@@ -24,8 +25,9 @@ def is_prime(n):
     return True
 
 class MyDataset(Dataset):
-    def __init__(self, args):
+    def __init__(self, args, *, sft_split="train"):
         self.args = args
+        self.sft_split = sft_split
 
         self.vocab_size = args.vocab_size
         rank_zero_info(f"Current vocab size = {self.vocab_size} (make sure it's correct)")
@@ -56,6 +58,8 @@ class MyDataset(Dataset):
         elif self.data_type == "sft_binidx":
             if len(self.data) == 0:
                 raise ValueError("SFT token dataset must contain at least one document.")
+            if self.sft_split not in {"train", "eval"}:
+                raise ValueError(f"Unsupported SFT split: {self.sft_split}")
             mask_file = getattr(args, "sft_mask_file", "") or f"{args.data_file}.mask"
             self.mask_data = MMapIndexedDataset(mask_file)
             if len(self.mask_data) != len(self.data):
@@ -68,12 +72,41 @@ class MyDataset(Dataset):
             if args.ctx_len <= 0:
                 raise ValueError("ctx_len must be positive for sft_binidx training.")
             self.sft_pad_token_id = int(getattr(args, "sft_pad_token_id", 65532))
-            rank_zero_info(f"SFT mask data = {mask_file}")
+            self.sft_eval_tail_count = compute_sft_tail_eval_count(
+                len(self.data),
+                float(getattr(args, "sft_eval_tail_ratio", 0.0) or 0.0),
+                int(getattr(args, "sft_eval_tail_docs", 0) or 0),
+                require_train_docs=not int(getattr(args, "sft_eval_include_in_train", 0) or 0),
+            )
+            self.sft_eval_include_in_train = int(getattr(args, "sft_eval_include_in_train", 0) or 0)
+            if self.sft_split == "eval":
+                if self.sft_eval_tail_count <= 0:
+                    raise ValueError("SFT eval split requires sft_eval_tail_ratio > 0 or sft_eval_tail_docs > 0.")
+                self.sft_doc_start = len(self.data) - self.sft_eval_tail_count
+                self.sft_doc_count = self.sft_eval_tail_count
+            else:
+                self.sft_doc_start = 0
+                if self.sft_eval_include_in_train:
+                    self.sft_doc_count = len(self.data)
+                else:
+                    self.sft_doc_count = len(self.data) - self.sft_eval_tail_count
+            if self.sft_doc_count <= 0:
+                raise ValueError(f"SFT {self.sft_split} split has no documents.")
+            rank_zero_info(
+                f"SFT mask data = {mask_file}; split={self.sft_split} "
+                f"docs={self.sft_doc_count}/{len(self.data)} eval_tail={self.sft_eval_tail_count} "
+                f"eval_include_in_train={self.sft_eval_include_in_train}"
+            )
         else:
             raise ValueError(f"Unsupported data_type: {self.data_type}")
 
     def __len__(self):
         if self.data_type == "sft_binidx":
+            if self.sft_split == "eval":
+                eval_steps = int(getattr(self.args, "sft_eval_steps", 0) or 0)
+                if eval_steps > 0:
+                    return eval_steps * self.args.micro_bsz
+                return self.sft_doc_count
             return self.args.epoch_steps * self.accumulate_grad_batches * self.args.micro_bsz
         return self.args.epoch_steps * self.args.micro_bsz
 
@@ -92,7 +125,7 @@ class MyDataset(Dataset):
 
         data_type = getattr(self, "data_type", getattr(args, "data_type", "binidx"))
         if data_type == "sft_binidx":
-            doc_index = sample_index % len(self.data)
+            doc_index = self.sft_doc_start + (sample_index % self.sft_doc_count)
             token_ids = self.data[doc_index].astype(int)
             loss_mask = self.mask_data[doc_index].astype(int)
             if not np.isin(loss_mask, [0, 1]).all():

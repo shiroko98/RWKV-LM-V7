@@ -1146,6 +1146,73 @@ def test_train_py_sft_deepspeed_masked_fused_ce_smoke(tmp_path):
 
 @pytest.mark.cuda
 @pytest.mark.slow
+def test_train_py_sft_deepspeed_tail_eval_smoke(tmp_path):
+    model_path = _require_cuda_smoke("RWKV_RUN_TRAIN_PY_SFT_TAIL_EVAL_SMOKE")
+    pad_length = int(os.environ.get("RWKV_SFT_TAIL_EVAL_PAD_LENGTH", os.environ.get("RWKV_SFT_SMOKE_PAD_LENGTH", "257")))
+    ctx_len = pad_length - 1
+    assert ctx_len > 0 and ctx_len % 16 == 0, "ctx_len must be positive and divisible by the RWKV7 chunk length 16"
+
+    devices = int(os.environ.get("RWKV_SFT_SMOKE_DEVICES", "2"))
+    strategy = os.environ.get("RWKV_SFT_SMOKE_STRATEGY", "deepspeed_stage_3_offload")
+    if devices < 2:
+        pytest.skip("DeepSpeed tail eval smoke requires RWKV_SFT_SMOKE_DEVICES >= 2")
+    if torch.cuda.device_count() < devices:
+        pytest.skip(f"only {torch.cuda.device_count()} CUDA device(s) visible, need {devices}")
+    if "deepspeed" not in strategy:
+        pytest.skip("DeepSpeed tail eval smoke requires a DeepSpeed strategy")
+
+    prefix = _build_tiny_sft_binidx(tmp_path, pad_length)
+    state = _load_state_dict(model_path)
+    dims = _infer_rwkv7_dims(state)
+    proj_dir = tmp_path / "tail_eval_train_py"
+    fused_chunk = int(os.environ.get("RWKV_SFT_TAIL_EVAL_FUSED_CHUNK", os.environ.get("RWKV_SFT_FUSED_CE_TRAIN_PY_CHUNK", "512")))
+
+    command = _train_py_command(
+        load_model=model_path,
+        prefix=prefix,
+        proj_dir=proj_dir,
+        dims=dims,
+        ctx_len=ctx_len,
+        epoch_steps=2,
+        epoch_count=1,
+        devices=devices,
+        strategy=strategy,
+        sft_masked_fused_ce_chunk=fused_chunk,
+        extra_args=[
+            "--save_every_n_steps",
+            "1",
+            "--keep_last_n_checkpoints",
+            "1",
+            "--sft_eval_tail_docs",
+            "1",
+            "--sft_eval_every_n_steps",
+            "1",
+            "--sft_eval_steps",
+            "1",
+        ],
+    )
+    output = _run_train_py(command, "train.py SFT DeepSpeed tail eval")
+    log_text = (proj_dir / "train_log.txt").read_text(encoding="utf-8")
+    assert "eval step 1" in log_text
+    assert (proj_dir / "rwkv-step-1.pth").exists()
+    assert torch.isfinite(torch.tensor(_read_train_log_epoch_loss(proj_dir))).item()
+
+    summary = {
+        "pad_length": pad_length,
+        "ctx_len": ctx_len,
+        "devices": devices,
+        "strategy": strategy,
+        "fused_chunk": fused_chunk,
+        "proj_dir": str(proj_dir),
+        "output_tail": output[-4000:],
+    }
+    summary_file = os.environ.get("RWKV_SFT_TAIL_EVAL_SUMMARY_FILE", "")
+    if summary_file:
+        Path(summary_file).expanduser().write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+
+@pytest.mark.cuda
+@pytest.mark.slow
 def test_train_py_sft_cuda_resume_from_step_checkpoint(tmp_path):
     model_path = _require_cuda_smoke("RWKV_RUN_TRAIN_PY_SFT_RESUME_SMOKE")
     pad_length = int(os.environ.get("RWKV_SFT_SMOKE_PAD_LENGTH", "257"))

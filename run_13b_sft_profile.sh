@@ -38,6 +38,11 @@ PROFILE_STEPS="${PROFILE_STEPS:-8}"
 PROFILE_MODE="${PROFILE_MODE:-none}" # none | nsys
 NSYS_TRACE="${NSYS_TRACE:-cuda,nvtx,osrt,cublas}"
 NSYS_STATS="${NSYS_STATS:-1}"
+SFT_EVAL_TAIL_RATIO="${SFT_EVAL_TAIL_RATIO:-0}"
+SFT_EVAL_TAIL_DOCS="${SFT_EVAL_TAIL_DOCS:-0}"
+SFT_EVAL_INCLUDE_IN_TRAIN="${SFT_EVAL_INCLUDE_IN_TRAIN:-0}"
+SFT_EVAL_EVERY_N_STEPS="${SFT_EVAL_EVERY_N_STEPS:-0}"
+SFT_EVAL_STEPS="${SFT_EVAL_STEPS:-0}"
 
 GPU_MONITOR="${GPU_MONITOR:-1}"
 GPU_MONITOR_INTERVAL="${GPU_MONITOR_INTERVAL:-2}"
@@ -142,6 +147,11 @@ TRAIN_ARGS=(
   --epoch_count 999999
   --epoch_begin 0
   --sft_one_pass 0
+  --sft_eval_tail_ratio "$SFT_EVAL_TAIL_RATIO"
+  --sft_eval_tail_docs "$SFT_EVAL_TAIL_DOCS"
+  --sft_eval_include_in_train "$SFT_EVAL_INCLUDE_IN_TRAIN"
+  --sft_eval_every_n_steps "$SFT_EVAL_EVERY_N_STEPS"
+  --sft_eval_steps "$SFT_EVAL_STEPS"
   --data_file "$DATA_FILE"
   --sft_masked_ce_chunk "$SFT_MASKED_CE_CHUNK"
   --sft_masked_fused_ce_chunk "$SFT_MASKED_FUSED_CE_CHUNK"

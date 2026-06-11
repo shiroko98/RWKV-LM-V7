@@ -533,11 +533,13 @@ python scripts/calc_sft_onepass_steps.py /mnt/data/datasets/sft_train_ctx8192 \
   --devices 8 \
   --micro-bsz 1 \
   --accumulate-grad-batches 1 \
+  --eval-tail-ratio 0.005 \
+  --eval-include-in-train 0 \
   --n-pass 1 \
   --ctx-len 8192
 ```
 
-这个脚本只读取 `DATA_FILE.idx`，不会 mmap 大体积 `.bin`，所以在几十 GB 数据上也很快。输出会包含 `epoch_steps`、`epoch_count`、`total_optimizer_steps`、由 `ceil(...)` 带来的尾部重复样本数，以及按几个常见 seconds/step 估算的保存间隔。
+这个脚本只读取 `DATA_FILE.idx`，不会 mmap 大体积 `.bin`，所以在几十 GB 数据上也很快。输出会包含 `total_documents`、`train_documents`、`eval_documents`、`epoch_steps`、`epoch_count`、`total_optimizer_steps`、由 `ceil(...)` 带来的尾部重复样本数，以及按几个常见 seconds/step 估算的保存间隔。`--eval-include-in-train 0` 表示 held-out eval：尾部 eval documents 不参与训练；设为 `1` 表示 overlap 监控模式：训练仍使用所有 documents，同时固定用尾部 split 做 eval。
 
 ### 3. 启动 13.3B SFT
 
@@ -620,6 +622,9 @@ bash run_13b_sft_zero3_offload.sh
 - `EPOCH_STEPS`：每个 SFT epoch 的 optimizer step 数。完整跑一遍建议用 `ceil(num_sft_documents / effective_bsz)`。
 - `EPOCH_COUNT`：跑几遍 SFT 数据。想跑 `N` 遍时，`EPOCH_STEPS` 按一遍数据计算，`EPOCH_COUNT=N`。
 - `SFT_ONE_PASS`：设为 `1` 时，脚本仍会传入 `EPOCH_STEPS/EPOCH_COUNT` 作为整数占位值，但 `train.py` 会自动读取 `DATA_FILE.idx` 的 document 数并覆盖为 `ceil(num_documents / effective_bsz)` 和 `epoch_count=1`，适合只想完整跑一遍数据的场景。直接调用 `train.py` 时可以省略 `--epoch_steps/--epoch_count`；通过这个脚本调用时不用管它们的默认值。
+- `SFT_EVAL_TAIL_RATIO` / `SFT_EVAL_TAIL_DOCS`：从同一份 SFT binidx 尾部切出 eval split。`SFT_EVAL_TAIL_DOCS` 为正数时优先，否则按 ratio 向上取整；不需要额外生成第二份 eval binidx。
+- `SFT_EVAL_INCLUDE_IN_TRAIN`：`0` 表示 held-out eval，尾部 eval documents 会从训练集中排除，one-pass step 也按 train documents 计算，此时 tail ratio 必须小于 `1`；`1` 表示 overlap 模式，训练仍使用全量 documents，eval 只作为固定尾部监控集，此时可以设 `SFT_EVAL_TAIL_RATIO=1` 让 eval 也覆盖全量数据。
+- `SFT_EVAL_EVERY_N_STEPS` / `SFT_EVAL_STEPS`：每隔 N 个 optimizer step 跑一次 SFT eval，每次每个 rank 跑指定数量的 eval micro-batch。如果同一个 step 同时命中保存和 eval，两者都会执行。eval 会写入 `train_log.txt` 和 wandb 的 `eval/loss`、`eval/ppl`、`eval/mask_tokens`、`eval/docs`。
 - `GRAD_CP`：激活检查点。`1` 表示对 block 开启 checkpointing，省显存但更慢；显存足够时可设 `0`。
 - `SFT_MASKED_CE_CHUNK`：SFT masked loss 的实验性 head/CE 分块大小。生产默认保持 `0`，使用完整 logits masked CE；`0` 本身没有额外分块效率损耗，但会物化完整 logits。正数会只对 mask=1 的 target token 分块计算 head 和 CE，目前在 13B ZeRO-3 长上下文下会 timeout，暂不推荐生产使用。
 - `SFT_MASKED_FUSED_CE_CHUNK`：新的 CUDA fused masked head CE 内部 chunk 行数。13B 脚本默认 `4096`，这是当前 ctx86016 SFT 的推荐生产路径；若长跑偶发 OOM，可先降到 `2048`。不要和 `SFT_MASKED_CE_CHUNK` 同时设为正数。

@@ -77,11 +77,32 @@ def save_train_checkpoint(args, trainer, pl_module, file_name):
         trainer.strategy.barrier()
 
 
+def move_batch_to_device(batch, device):
+    if torch.is_tensor(batch):
+        return batch.to(device, non_blocking=True)
+    if isinstance(batch, tuple):
+        return tuple(move_batch_to_device(item, device) for item in batch)
+    if isinstance(batch, list):
+        return [move_batch_to_device(item, device) for item in batch]
+    if isinstance(batch, dict):
+        return {key: move_batch_to_device(value, device) for key, value in batch.items()}
+    return batch
+
+
+def strategy_barrier(trainer):
+    try:
+        trainer.strategy.barrier()
+    except Exception:
+        pass
+
+
 class train_callback(pl.Callback):
-    def __init__(self, args):
+    def __init__(self, args, eval_loader=None):
         super().__init__()
         self.args = args
         self._saved_step_markers = set()
+        self.eval_loader = eval_loader
+        self._eval_step_markers = set()
 
     def _ensure_run_logging_state(self, trainer):
         args = self.args
@@ -205,7 +226,83 @@ class train_callback(pl.Callback):
                 if step_marker not in self._saved_step_markers:
                     save_train_checkpoint(args, trainer, pl_module, f"{args.proj_dir}/rwkv-step-{int(real_step)}.pth")
                     self._saved_step_markers.add(step_marker)
+
+        if self.eval_loader is not None and args.sft_eval_every_n_steps > 0 and real_step > 0:
+            if int(real_step) % int(args.sft_eval_every_n_steps) == 0:
+                eval_marker = int(real_step)
+                if eval_marker not in self._eval_step_markers:
+                    self._run_sft_eval(trainer, pl_module, eval_marker)
+                    self._eval_step_markers.add(eval_marker)
                 
+    def _run_sft_eval(self, trainer, pl_module, real_step):
+        args = self.args
+        eval_loader = self.eval_loader
+        if eval_loader is None:
+            return
+
+        self._ensure_run_logging_state(trainer)
+        strategy_barrier(trainer)
+
+        dataset = eval_loader.dataset
+        dataset.global_rank = trainer.global_rank
+        dataset.world_size = trainer.world_size
+        dataset.real_epoch = 0
+        dataset.step_offset = 0
+
+        device = pl_module.device
+        was_training = pl_module.training
+        pl_module.eval()
+
+        local_stats = torch.zeros(3, dtype=torch.float64, device=device)
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(eval_loader):
+                eval_steps = int(getattr(args, "sft_eval_steps", 0) or 0)
+                if eval_steps > 0 and batch_idx >= eval_steps:
+                    break
+                batch = move_batch_to_device(batch, device)
+                if not isinstance(batch, (tuple, list)) or len(batch) != 3:
+                    raise ValueError("SFT eval requires batches of (x, y, loss_mask).")
+                loss = pl_module.training_step(batch, batch_idx)
+                mask_tokens = batch[2].float().sum()
+                local_stats[0] += loss.detach().float().to(dtype=torch.float64) * mask_tokens.to(dtype=torch.float64)
+                local_stats[1] += mask_tokens.to(dtype=torch.float64)
+                local_stats[2] += batch[0].shape[0]
+
+        if was_training:
+            pl_module.train()
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(local_stats, op=torch.distributed.ReduceOp.SUM)
+        strategy_barrier(trainer)
+
+        if local_stats[1].item() <= 0:
+            val_loss = 0.0
+            val_ppl = 1.0
+        else:
+            val_loss = (local_stats[0] / local_stats[1]).item()
+            val_ppl = math.exp(min(val_loss, 20.0))
+
+        if trainer.is_global_zero:
+            eval_docs = int(local_stats[2].item())
+            eval_tokens = int(local_stats[1].item())
+            msg = (
+                f"eval step {int(real_step)} loss {val_loss:.6f} ppl {val_ppl:.4f} "
+                f"mask_tokens {eval_tokens} docs {eval_docs}"
+            )
+            rank_zero_info(f"########## SFT {msg} ##########")
+            if hasattr(trainer, "my_log") and not getattr(trainer.my_log, "closed", False):
+                trainer.my_log.write(msg + f" {datetime.datetime.now()}\n")
+                trainer.my_log.flush()
+            if len(args.wandb) > 0 and hasattr(trainer, "my_wandb"):
+                trainer.my_wandb.log(
+                    {
+                        "eval/loss": val_loss,
+                        "eval/ppl": val_ppl,
+                        "eval/mask_tokens": eval_tokens,
+                        "eval/docs": eval_docs,
+                    },
+                    step=int(real_step),
+                )
 
     def on_train_epoch_start(self, trainer, pl_module):
         args = self.args

@@ -919,7 +919,7 @@ class RWKV(pl.LightningModule):
 
         v_first = torch.empty_like(x)
         for block in self.blocks:
-            if args.grad_cp == 1:
+            if args.grad_cp == 1 and self.training:
                 x, v_first = deepspeed.checkpointing.checkpoint(block, x, v_first)
             else:
                 x, v_first = block(x, v_first)

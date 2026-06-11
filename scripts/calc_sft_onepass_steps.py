@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.binidx import MMapIndexedDataset, index_file_path  # noqa: E402
+from src.sft_split import compute_sft_tail_eval_count  # noqa: E402
 
 
 def _env_int(names: tuple[str, ...], default: int) -> int:
@@ -104,6 +105,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--n-pass", type=int, default=_env_int(("N_PASS",), 1))
     parser.add_argument("--ctx-len", type=int, default=None)
+    parser.add_argument("--eval-tail-ratio", type=float, default=float(os.environ.get("SFT_EVAL_TAIL_RATIO", "0") or 0))
+    parser.add_argument("--eval-tail-docs", type=int, default=_env_int(("SFT_EVAL_TAIL_DOCS",), 0))
+    parser.add_argument(
+        "--eval-include-in-train",
+        type=int,
+        default=_env_int(("SFT_EVAL_INCLUDE_IN_TRAIN",), 0),
+        choices=(0, 1),
+        help="Use all documents for training while still evaluating on the tail split.",
+    )
     parser.add_argument(
         "--save-hours",
         type=float,
@@ -122,7 +132,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    documents = count_documents(args.data_file)
+    total_documents = count_documents(args.data_file)
+    eval_documents = compute_sft_tail_eval_count(
+        total_documents,
+        args.eval_tail_ratio,
+        args.eval_tail_docs,
+        require_train_docs=not args.eval_include_in_train,
+    )
+    documents = total_documents if args.eval_include_in_train else total_documents - eval_documents
     schedule = compute_onepass_schedule(
         documents,
         num_nodes=args.num_nodes,
@@ -134,6 +151,10 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     print(f"DATA_FILE={_normalize_prefix(args.data_file)}")
+    print(f"total_documents={total_documents}")
+    print(f"train_documents={documents}")
+    print(f"eval_documents={eval_documents}")
+    print(f"eval_include_in_train={args.eval_include_in_train}")
     for key in (
         "documents",
         "num_nodes",

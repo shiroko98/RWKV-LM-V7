@@ -39,6 +39,11 @@ EPOCH_BEGIN="0"
 EPOCH_SAVE="1"
 SAVE_EVERY_N_STEPS="0"
 KEEP_LAST_N_CHECKPOINTS="6"
+SFT_EVAL_TAIL_RATIO="0"
+SFT_EVAL_TAIL_DOCS="0"
+SFT_EVAL_INCLUDE_IN_TRAIN="0"
+SFT_EVAL_EVERY_N_STEPS="0"
+SFT_EVAL_STEPS="0"
 
 N_NODE="1"
 GPU_PER_NODE="8"
@@ -109,6 +114,8 @@ fi
 python train.py --load_model "$LOAD_MODEL" --wandb "$WANDB_PROJECT" --proj_dir "$PROJ_DIR" --my_testing "$MODEL_TYPE" \
  --ctx_len "$CTX_LEN" --train_stage 0 --epoch_steps "$EPOCH_STEPS" --epoch_count "$EPOCH_COUNT" --epoch_begin "$EPOCH_BEGIN" \
  --sft_one_pass "$SFT_ONE_PASS" \
+ --sft_eval_tail_ratio "$SFT_EVAL_TAIL_RATIO" --sft_eval_tail_docs "$SFT_EVAL_TAIL_DOCS" --sft_eval_include_in_train "$SFT_EVAL_INCLUDE_IN_TRAIN" \
+ --sft_eval_every_n_steps "$SFT_EVAL_EVERY_N_STEPS" --sft_eval_steps "$SFT_EVAL_STEPS" \
  --data_file "$DATA_FILE" --sft_masked_ce_chunk "$SFT_MASKED_CE_CHUNK" --sft_masked_fused_ce_chunk "$SFT_MASKED_FUSED_CE_CHUNK" \
  --num_nodes "$N_NODE" --micro_bsz "$MICRO_BSZ" --accumulate_grad_batches "$ACCUMULATE_GRAD_BATCHES" --n_layer "$N_LAYER" --n_embd "$N_EMBD" --dim_ffn "$DIM_FFN" --kernel "$KERNEL" \
  --lr_init "$LR_INIT" --lr_final "$LR_FINAL" --lr_wsd_decay_iters "$LR_WSD_DECAY_ITERS" --lr_wsd_decay_style "$LR_WSD_DECAY_STYLE" --warmup_steps "$WARMUP_STEPS" --beta1 0.9 --beta2 0.99 --adam_eps 1e-18 \

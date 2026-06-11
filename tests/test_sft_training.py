@@ -15,6 +15,7 @@ import train
 from src import dataset as dataset_mod
 from src import lr_schedule
 from src import trainer as trainer_mod
+from src.sft_split import compute_sft_tail_eval_count, compute_sft_train_document_count
 from src.sft_binidx import EncodedDocument, write_documents
 from src.sft_loss import masked_cross_entropy, masked_head_cross_entropy
 
@@ -43,6 +44,10 @@ def make_sft_args(prefix: str, **overrides):
         resume_step_offset=0,
         micro_bsz=1,
         accumulate_grad_batches=1,
+        sft_eval_tail_ratio=0.0,
+        sft_eval_tail_docs=0,
+        sft_eval_every_n_steps=0,
+        sft_eval_steps=0,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -133,6 +138,95 @@ def test_sft_dataset_uses_gradient_accumulation_for_length_epoch_and_resume(tmp_
     assert torch.equal(x_resume, torch.tensor([30, 31, 65532], dtype=torch.long))
     assert torch.equal(y_resume, torch.tensor([31, 65532, 65532], dtype=torch.long))
     assert torch.equal(mask_resume, torch.tensor([1, 0, 0], dtype=torch.float32))
+
+
+def test_sft_tail_eval_split_excludes_eval_docs_from_train_and_reads_tail(tmp_path):
+    prefix = str(tmp_path / "sft_tail_eval")
+    write_documents(
+        prefix,
+        [
+            EncodedDocument(input_ids=[base, base + 1], loss_mask=[0, 1])
+            for base in [10, 20, 30, 40, 50]
+        ],
+    )
+    args = make_sft_args(prefix, ctx_len=3, epoch_steps=4, sft_eval_tail_docs=2, sft_eval_steps=3)
+
+    train_dataset = dataset_mod.MyDataset(args, sft_split="train")
+    assert train_dataset.sft_doc_start == 0
+    assert train_dataset.sft_doc_count == 3
+    assert train_dataset.sft_eval_tail_count == 2
+
+    x0, _, _ = train_dataset[0]
+    x2, _, _ = train_dataset[2]
+    x3, _, _ = train_dataset[3]
+    assert torch.equal(x0, torch.tensor([10, 11, 65532], dtype=torch.long))
+    assert torch.equal(x2, torch.tensor([30, 31, 65532], dtype=torch.long))
+    assert torch.equal(x3, torch.tensor([10, 11, 65532], dtype=torch.long))
+
+    eval_dataset = dataset_mod.MyDataset(args, sft_split="eval")
+    assert len(eval_dataset) == 3
+    assert eval_dataset.sft_doc_start == 3
+    assert eval_dataset.sft_doc_count == 2
+
+    eval_x0, _, _ = eval_dataset[0]
+    eval_x1, _, _ = eval_dataset[1]
+    eval_x2, _, _ = eval_dataset[2]
+    assert torch.equal(eval_x0, torch.tensor([40, 41, 65532], dtype=torch.long))
+    assert torch.equal(eval_x1, torch.tensor([50, 51, 65532], dtype=torch.long))
+    assert torch.equal(eval_x2, torch.tensor([40, 41, 65532], dtype=torch.long))
+
+
+def test_sft_tail_eval_can_overlap_with_full_train_docs(tmp_path):
+    prefix = str(tmp_path / "sft_tail_eval_overlap")
+    write_documents(
+        prefix,
+        [
+            EncodedDocument(input_ids=[base, base + 1], loss_mask=[0, 1])
+            for base in [10, 20, 30, 40, 50]
+        ],
+    )
+    args = make_sft_args(prefix, ctx_len=3, epoch_steps=6, sft_eval_tail_docs=2, sft_eval_include_in_train=1)
+
+    train_dataset = dataset_mod.MyDataset(args, sft_split="train")
+    assert train_dataset.sft_doc_start == 0
+    assert train_dataset.sft_doc_count == 5
+    assert train_dataset.sft_eval_tail_count == 2
+
+    x4, _, _ = train_dataset[4]
+    x5, _, _ = train_dataset[5]
+    assert torch.equal(x4, torch.tensor([50, 51, 65532], dtype=torch.long))
+    assert torch.equal(x5, torch.tensor([10, 11, 65532], dtype=torch.long))
+
+
+def test_sft_tail_eval_overlap_allows_full_eval_tail(tmp_path):
+    prefix = str(tmp_path / "sft_tail_eval_full_overlap")
+    write_documents(
+        prefix,
+        [
+            EncodedDocument(input_ids=[base, base + 1], loss_mask=[0, 1])
+            for base in [10, 20, 30]
+        ],
+    )
+    args = make_sft_args(
+        prefix,
+        ctx_len=3,
+        epoch_steps=3,
+        sft_eval_tail_docs=3,
+        sft_eval_include_in_train=1,
+    )
+
+    train_dataset = dataset_mod.MyDataset(args, sft_split="train")
+    eval_dataset = dataset_mod.MyDataset(args, sft_split="eval")
+
+    assert train_dataset.sft_doc_start == 0
+    assert train_dataset.sft_doc_count == 3
+    assert eval_dataset.sft_doc_start == 0
+    assert eval_dataset.sft_doc_count == 3
+
+    train_x0, _, _ = train_dataset[0]
+    eval_x0, _, _ = eval_dataset[0]
+    assert torch.equal(train_x0, torch.tensor([10, 11, 65532], dtype=torch.long))
+    assert torch.equal(eval_x0, torch.tensor([10, 11, 65532], dtype=torch.long))
 
 
 def test_sft_dataset_rejects_too_long_documents_and_bad_masks(tmp_path):
@@ -358,6 +452,85 @@ def test_sft_one_pass_overrides_steps_and_epoch_count(monkeypatch):
     assert args.sft_one_pass_documents == 65
 
 
+def test_sft_one_pass_uses_train_docs_after_tail_eval_split(monkeypatch):
+    args = SimpleNamespace(
+        data_type="sft_binidx",
+        data_file="dummy",
+        sft_one_pass=1,
+        epoch_steps=0,
+        epoch_count=0,
+        real_bsz=8,
+        effective_bsz=32,
+        accumulate_grad_batches=4,
+        sft_eval_tail_ratio=0.0,
+        sft_eval_tail_docs=1,
+    )
+
+    train.configure_epoch_schedule(args)
+    monkeypatch.setattr(train, "count_binidx_documents", lambda prefix: 65)
+    train.configure_sft_one_pass(args)
+    train.configure_samples_per_epoch(args)
+    train.configure_training_limits(args)
+
+    assert args.sft_one_pass_documents == 64
+    assert args.sft_eval_tail_documents == 1
+    assert args.epoch_steps == 2
+    assert args.epoch_count == 1
+    assert args.max_epochs == 1
+    assert args.samples_per_epoch == 64
+
+
+def test_sft_one_pass_can_include_eval_tail_in_train_docs(monkeypatch):
+    args = SimpleNamespace(
+        data_type="sft_binidx",
+        data_file="dummy",
+        sft_one_pass=1,
+        epoch_steps=0,
+        epoch_count=0,
+        real_bsz=8,
+        effective_bsz=32,
+        accumulate_grad_batches=4,
+        sft_eval_tail_ratio=0.0,
+        sft_eval_tail_docs=1,
+        sft_eval_include_in_train=1,
+    )
+
+    train.configure_epoch_schedule(args)
+    monkeypatch.setattr(train, "count_binidx_documents", lambda prefix: 65)
+    train.configure_sft_one_pass(args)
+    train.configure_samples_per_epoch(args)
+    train.configure_training_limits(args)
+
+    assert args.sft_one_pass_documents == 65
+    assert args.sft_eval_tail_documents == 1
+    assert args.epoch_steps == 3
+    assert args.samples_per_epoch == 96
+
+
+def test_sft_one_pass_can_eval_full_tail_when_train_uses_all_docs(monkeypatch):
+    args = SimpleNamespace(
+        data_type="sft_binidx",
+        data_file="dummy",
+        sft_one_pass=1,
+        epoch_steps=0,
+        epoch_count=0,
+        real_bsz=8,
+        effective_bsz=32,
+        accumulate_grad_batches=4,
+        sft_eval_tail_ratio=1.0,
+        sft_eval_tail_docs=0,
+        sft_eval_include_in_train=1,
+    )
+
+    train.configure_epoch_schedule(args)
+    monkeypatch.setattr(train, "count_binidx_documents", lambda prefix: 65)
+    train.configure_sft_one_pass(args)
+
+    assert args.sft_one_pass_documents == 65
+    assert args.sft_eval_tail_documents == 65
+    assert args.epoch_steps == 3
+
+
 def test_sft_one_pass_disabled_sets_default_metadata():
     args = SimpleNamespace(data_type="sft_binidx", sft_one_pass=0, epoch_steps=7, epoch_count=3)
     train.configure_sft_one_pass(args)
@@ -365,6 +538,22 @@ def test_sft_one_pass_disabled_sets_default_metadata():
     assert args.sft_one_pass_documents == 0
     assert args.epoch_steps == 7
     assert args.epoch_count == 3
+
+
+def test_sft_tail_eval_count_helper():
+    assert compute_sft_tail_eval_count(100, tail_ratio=0.0, tail_docs=0) == 0
+    assert compute_sft_tail_eval_count(100, tail_ratio=0.005, tail_docs=0) == 1
+    assert compute_sft_tail_eval_count(100, tail_ratio=0.2, tail_docs=0) == 20
+    assert compute_sft_tail_eval_count(100, tail_ratio=0.2, tail_docs=7) == 7
+    assert compute_sft_train_document_count(100, tail_ratio=0.2, tail_docs=0) == 80
+
+    with pytest.raises(ValueError, match="ratio"):
+        compute_sft_tail_eval_count(100, tail_ratio=1.1)
+    with pytest.raises(ValueError, match="tail_docs"):
+        compute_sft_tail_eval_count(100, tail_docs=-1)
+    with pytest.raises(ValueError, match="no training"):
+        compute_sft_tail_eval_count(1, tail_ratio=0.5)
+    assert compute_sft_tail_eval_count(1, tail_ratio=1.0, require_train_docs=False) == 1
 
 
 def test_count_binidx_documents_reads_index_only(tmp_path):
@@ -403,6 +592,47 @@ def test_calc_sft_onepass_schedule():
     assert schedule["samples_per_epoch"] == 96
     assert schedule["extra_repeated_per_epoch"] == 31
     assert schedule["tokens_per_epoch"] == 480
+
+
+def test_calc_sft_onepass_cli_reports_eval_split(tmp_path, capsys):
+    prefix = str(tmp_path / "calc_cli")
+    write_documents(
+        prefix,
+        [
+            EncodedDocument(input_ids=[base, base + 1], loss_mask=[0, 1])
+            for base in [10, 20, 30]
+        ],
+    )
+
+    rc = calc_sft_onepass_steps.main(
+        [
+            prefix,
+            "--num-nodes",
+            "1",
+            "--devices",
+            "8",
+            "--micro-bsz",
+            "1",
+            "--accumulate-grad-batches",
+            "1",
+            "--eval-tail-ratio",
+            "1",
+            "--eval-include-in-train",
+            "1",
+            "--n-pass",
+            "1",
+            "--ctx-len",
+            "4",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "total_documents=3" in out
+    assert "train_documents=3" in out
+    assert "eval_documents=3" in out
+    assert "eval_include_in_train=1" in out
+    assert "epoch_steps=1" in out
 
 
 def test_sft_one_pass_rejects_unsupported_or_empty_datasets(monkeypatch):
@@ -478,6 +708,74 @@ def test_validate_sft_loss_settings_accepts_one_backend_and_rejects_invalid_valu
         train.validate_sft_loss_settings(SimpleNamespace(sft_masked_ce_chunk=0, sft_masked_fused_ce_chunk=-1))
     with pytest.raises(ValueError, match="either"):
         train.validate_sft_loss_settings(SimpleNamespace(sft_masked_ce_chunk=128, sft_masked_fused_ce_chunk=4096))
+
+
+def test_validate_sft_eval_settings():
+    train.validate_sft_eval_settings(
+        SimpleNamespace(
+            data_type="sft_binidx",
+            sft_eval_every_n_steps=1200,
+            sft_eval_steps=16,
+            sft_eval_tail_ratio=0.005,
+            sft_eval_tail_docs=0,
+            sft_eval_include_in_train=0,
+        )
+    )
+    train.validate_sft_eval_settings(
+        SimpleNamespace(
+            data_type="sft_binidx",
+            sft_eval_every_n_steps=0,
+            sft_eval_steps=0,
+            sft_eval_tail_ratio=0.0,
+            sft_eval_tail_docs=0,
+            sft_eval_include_in_train=1,
+        )
+    )
+
+    with pytest.raises(ValueError, match="sft_binidx"):
+        train.validate_sft_eval_settings(
+            SimpleNamespace(
+                data_type="binidx",
+                sft_eval_every_n_steps=1,
+                sft_eval_steps=1,
+                sft_eval_tail_ratio=0.1,
+                sft_eval_tail_docs=0,
+                sft_eval_include_in_train=0,
+            )
+        )
+    with pytest.raises(ValueError, match="sft_eval_steps"):
+        train.validate_sft_eval_settings(
+            SimpleNamespace(
+                data_type="sft_binidx",
+                sft_eval_every_n_steps=1,
+                sft_eval_steps=0,
+                sft_eval_tail_ratio=0.1,
+                sft_eval_tail_docs=0,
+                sft_eval_include_in_train=0,
+            )
+        )
+    with pytest.raises(ValueError, match="tail"):
+        train.validate_sft_eval_settings(
+            SimpleNamespace(
+                data_type="sft_binidx",
+                sft_eval_every_n_steps=1,
+                sft_eval_steps=1,
+                sft_eval_tail_ratio=0.0,
+                sft_eval_tail_docs=0,
+                sft_eval_include_in_train=0,
+            )
+        )
+    with pytest.raises(ValueError, match="include"):
+        train.validate_sft_eval_settings(
+            SimpleNamespace(
+                data_type="sft_binidx",
+                sft_eval_every_n_steps=0,
+                sft_eval_steps=0,
+                sft_eval_tail_ratio=0.0,
+                sft_eval_tail_docs=0,
+                sft_eval_include_in_train=2,
+            )
+        )
 
 
 def test_configure_deepspeed_zero3_config_applies_sft_tuning_options():
@@ -711,6 +1009,126 @@ def test_train_callback_applies_sft_wsd_lr_with_group_scale_and_warmup(tmp_path)
     assert trainer.optimizers[0].param_groups[1]["lr"] == pytest.approx(expected_lr * 2)
     assert trainer.optimizers[0].param_groups[0]["weight_decay"] == pytest.approx(0.01)
     trainer.my_log.close()
+
+
+def test_train_callback_runs_save_and_eval_on_same_step(tmp_path, monkeypatch):
+    events = []
+
+    def fake_save(args, trainer, pl_module, file_name):
+        events.append(("save", Path(file_name).name))
+
+    def fake_eval(self, trainer, pl_module, real_step):
+        events.append(("eval", real_step))
+
+    monkeypatch.setattr(trainer_mod, "save_train_checkpoint", fake_save)
+    monkeypatch.setattr(trainer_mod.train_callback, "_run_sft_eval", fake_eval)
+
+    callback = trainer_mod.train_callback(
+        SimpleNamespace(
+            data_type="sft_binidx",
+            strategy="",
+            proj_dir=str(tmp_path),
+            magic_prime=0,
+            save_every_n_steps=10,
+            save_at_step=0,
+            sft_eval_every_n_steps=10,
+            ctx_len=16,
+            real_bsz=1,
+            effective_bsz=1,
+            epoch_begin=0,
+            epoch_steps=100,
+            wandb="",
+        ),
+        eval_loader=object(),
+    )
+
+    trainer = SimpleNamespace(
+        global_step=10,
+        is_global_zero=True,
+        my_time_ns=0,
+        my_loss_all=torch.tensor([1.0]),
+        my_loss_sum=0.0,
+        my_loss_count=0,
+        my_lr=1e-4,
+        my_wd=0.0,
+    )
+    callback.log = lambda *args, **kwargs: None
+
+    callback.on_train_batch_end(trainer, object(), None, None, 0)
+
+    assert events == [("save", "rwkv-step-10.pth"), ("eval", 10)]
+
+
+def test_train_callback_sft_eval_logs_mask_token_weighted_loss(tmp_path, monkeypatch):
+    batches = [
+        (
+            torch.zeros((1, 3), dtype=torch.long),
+            torch.zeros((1, 3), dtype=torch.long),
+            torch.tensor([[1.0, 0.0, 0.0]]),
+        ),
+        (
+            torch.zeros((1, 3), dtype=torch.long),
+            torch.zeros((1, 3), dtype=torch.long),
+            torch.tensor([[1.0, 1.0, 1.0]]),
+        ),
+    ]
+    losses = [torch.tensor(2.0), torch.tensor(4.0)]
+
+    class FakeModule:
+        device = torch.device("cpu")
+        training = True
+
+        def eval(self):
+            self.training = False
+
+        def train(self):
+            self.training = True
+
+        def training_step(self, batch, batch_idx):
+            return losses[batch_idx]
+
+    class FakeWandb:
+        def __init__(self):
+            self.records = []
+
+        def log(self, values, step):
+            self.records.append((values, step))
+
+    class FakeEvalLoader:
+        dataset = SimpleNamespace()
+
+        def __iter__(self):
+            return iter(batches)
+
+    monkeypatch.setattr(trainer_mod, "strategy_barrier", lambda trainer: None)
+
+    args = SimpleNamespace(
+        data_type="sft_binidx",
+        proj_dir=str(tmp_path),
+        wandb="enabled",
+        run_name="eval-test",
+        my_timestamp="2026-06-11-12-00-00",
+        sft_eval_steps=2,
+    )
+    callback = trainer_mod.train_callback(args, eval_loader=SimpleNamespace(dataset=SimpleNamespace()))
+    trainer = SimpleNamespace(
+        global_rank=0,
+        world_size=1,
+        is_global_zero=True,
+        strategy=SimpleNamespace(barrier=lambda: None),
+        my_log=open(tmp_path / "train_log.txt", "a"),
+        my_wandb=FakeWandb(),
+    )
+    callback.eval_loader = FakeEvalLoader()
+
+    callback._run_sft_eval(trainer, FakeModule(), real_step=10)
+    trainer.my_log.close()
+
+    values, step = trainer.my_wandb.records[0]
+    assert step == 10
+    assert values["eval/loss"] == pytest.approx((2.0 * 1 + 4.0 * 3) / 4)
+    assert values["eval/mask_tokens"] == 4
+    assert values["eval/docs"] == 2
 
 
 def test_train_callback_resume_global_step_keeps_sft_wsd_decay_position(tmp_path):

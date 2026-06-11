@@ -745,11 +745,13 @@ python scripts/calc_sft_onepass_steps.py /mnt/data/datasets/sft_train_ctx8192 \
   --devices 8 \
   --micro-bsz 1 \
   --accumulate-grad-batches 1 \
+  --eval-tail-ratio 0.005 \
+  --eval-include-in-train 0 \
   --n-pass 1 \
   --ctx-len 8192
 ```
 
-The script reads only `DATA_FILE.idx`, so it is fast even for large `.bin` files. It prints `epoch_steps`, `epoch_count`, `total_optimizer_steps`, the tail samples repeated by `ceil(...)`, and checkpoint interval estimates for several measured seconds/step values.
+The script reads only `DATA_FILE.idx`, so it is fast even for large `.bin` files. It prints `total_documents`, `train_documents`, `eval_documents`, `epoch_steps`, `epoch_count`, `total_optimizer_steps`, the tail samples repeated by `ceil(...)`, and checkpoint interval estimates for several measured seconds/step values. `--eval-include-in-train 0` means held-out eval: tail eval documents are excluded from training. Set it to `1` when you want to train on all documents while still evaluating on the tail split as an overlapping monitor.
 
 ### 3. Launch 13.3B SFT
 
@@ -832,6 +834,9 @@ Key parameters:
 - `EPOCH_STEPS`: optimizer steps per SFT epoch. For one full pass, use `ceil(num_sft_documents / effective_bsz)`.
 - `EPOCH_COUNT`: number of SFT passes. For `N` passes over the SFT data, keep `EPOCH_STEPS` from the one-pass formula and set `EPOCH_COUNT=N`.
 - `SFT_ONE_PASS`: set to `1` to let `train.py` read `DATA_FILE.idx` and override the schedule with `epoch_steps=ceil(num_documents / effective_bsz)` and `epoch_count=1`. This is the low-friction option when you want exactly one full pass. Direct `train.py` usage may omit `--epoch_steps/--epoch_count`; this launcher still passes integer placeholders, but you do not need to care about their defaults in one-pass mode.
+- `SFT_EVAL_TAIL_RATIO` / `SFT_EVAL_TAIL_DOCS`: reserve the tail of the same SFT binidx as an eval split. `SFT_EVAL_TAIL_DOCS` takes priority when positive; otherwise the ratio is rounded up. This does not require generating a second eval binidx.
+- `SFT_EVAL_INCLUDE_IN_TRAIN`: `0` means held-out eval, so tail eval documents are removed from training and one-pass scheduling uses only train documents; in this mode the tail ratio must be below `1`. `1` means overlap mode: training uses all documents, while eval still reads the tail split for monitoring; in this mode `SFT_EVAL_TAIL_RATIO=1` is allowed when you want full-data training plus full-data eval monitoring.
+- `SFT_EVAL_EVERY_N_STEPS` / `SFT_EVAL_STEPS`: run fixed-step SFT eval every N optimizer steps for the given number of eval micro-batches per rank. If the same step also saves a checkpoint, both actions run. Eval logs to `train_log.txt` and wandb keys `eval/loss`, `eval/ppl`, `eval/mask_tokens`, and `eval/docs`.
 - `GRAD_CP`: activation checkpointing. `1` enables block-level checkpointing to save VRAM; `0` disables it and is faster if memory allows.
 - `SFT_MASKED_CE_CHUNK`: experimental head/CE chunk size for SFT masked loss. Production defaults to `0`, which uses full-logits masked CE; `0` itself has no extra chunking overhead, but it materializes full logits. Positive values compute head and CE only for mask=1 target tokens in chunks, but currently timeout under 13B ZeRO-3 long-context training and are not recommended for production.
 - `SFT_MASKED_FUSED_CE_CHUNK`: internal row chunk size for the new CUDA fused masked head CE. The 13B launchers default to `4096`, which is the current recommended production path for ctx86016 SFT; if long runs hit occasional OOMs, try `2048` first. Do not set it positive together with `SFT_MASKED_CE_CHUNK`.

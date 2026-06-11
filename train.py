@@ -6,6 +6,8 @@ import logging
 import os
 import re
 
+from src.sft_split import compute_sft_tail_eval_count
+
 logging.basicConfig(level=logging.INFO)
 
 EPOCH_CKPT_PATTERN = re.compile(r"^rwkv-(init|\d+)\.pth$")
@@ -124,6 +126,7 @@ def configure_sft_one_pass(args):
     enabled = int(getattr(args, "sft_one_pass", 0) or 0)
     args.sft_one_pass = enabled
     args.sft_one_pass_documents = 0
+    args.sft_eval_tail_documents = 0
     if not enabled:
         return
     if args.data_type != "sft_binidx":
@@ -131,13 +134,51 @@ def configure_sft_one_pass(args):
     if args.effective_bsz <= 0:
         raise ValueError("effective_bsz must be positive for --sft_one_pass.")
 
-    document_count = count_binidx_documents(args.data_file)
-    if document_count <= 0:
+    total_document_count = count_binidx_documents(args.data_file)
+    if total_document_count <= 0:
         raise ValueError("SFT token dataset must contain at least one document for --sft_one_pass.")
+    eval_count = compute_sft_tail_eval_count(
+        total_document_count,
+        float(getattr(args, "sft_eval_tail_ratio", 0.0) or 0.0),
+        int(getattr(args, "sft_eval_tail_docs", 0) or 0),
+        require_train_docs=not int(getattr(args, "sft_eval_include_in_train", 0) or 0),
+    )
+    if int(getattr(args, "sft_eval_include_in_train", 0) or 0):
+        document_count = total_document_count
+    else:
+        document_count = total_document_count - eval_count
 
     args.sft_one_pass_documents = document_count
+    args.sft_eval_tail_documents = eval_count
     args.epoch_steps = (document_count + args.effective_bsz - 1) // args.effective_bsz
     args.epoch_count = 1
+
+
+def validate_sft_eval_settings(args):
+    eval_every = int(getattr(args, "sft_eval_every_n_steps", 0) or 0)
+    eval_steps = int(getattr(args, "sft_eval_steps", 0) or 0)
+    tail_ratio = float(getattr(args, "sft_eval_tail_ratio", 0.0) or 0.0)
+    tail_docs = int(getattr(args, "sft_eval_tail_docs", 0) or 0)
+    include_in_train = int(getattr(args, "sft_eval_include_in_train", 0) or 0)
+    if eval_every < 0:
+        raise ValueError("sft_eval_every_n_steps must be non-negative.")
+    if eval_steps < 0:
+        raise ValueError("sft_eval_steps must be non-negative.")
+    if tail_docs < 0:
+        raise ValueError("sft_eval_tail_docs must be non-negative.")
+    if tail_ratio < 0 or tail_ratio > 1:
+        raise ValueError("sft_eval_tail_ratio must be in [0, 1].")
+    if include_in_train not in (0, 1):
+        raise ValueError("sft_eval_include_in_train must be 0 or 1.")
+    if not include_in_train and tail_ratio >= 1:
+        raise ValueError("sft_eval_tail_ratio must be < 1 for held-out eval.")
+    if eval_every > 0:
+        if args.data_type != "sft_binidx":
+            raise ValueError("--sft_eval_every_n_steps only supports data_type=sft_binidx.")
+        if eval_steps <= 0:
+            raise ValueError("sft_eval_steps must be positive when SFT eval is enabled.")
+        if tail_ratio <= 0 and tail_docs <= 0:
+            raise ValueError("SFT eval requires sft_eval_tail_ratio > 0 or sft_eval_tail_docs > 0.")
 
 
 def validate_sft_loss_settings(args):
@@ -216,6 +257,11 @@ if __name__ == "__main__":  # pragma: no cover
     parser.add_argument("--data_type", default="utf-8", type=str)
     parser.add_argument("--sft_mask_file", default="", type=str)
     parser.add_argument("--sft_pad_token_id", default=65532, type=int)
+    parser.add_argument("--sft_eval_tail_ratio", default=0.0, type=float)  # SFT only: reserve tail ratio for held-out eval
+    parser.add_argument("--sft_eval_tail_docs", default=0, type=int)  # SFT only: reserve exact tail docs for held-out eval
+    parser.add_argument("--sft_eval_include_in_train", default=0, type=int)  # 1 means eval tail is also used by train
+    parser.add_argument("--sft_eval_every_n_steps", default=0, type=int)  # SFT only: run tail-split eval every N optimizer steps
+    parser.add_argument("--sft_eval_steps", default=0, type=int)  # SFT only: eval micro-batch steps per rank
     parser.add_argument("--vocab_size", default=0, type=int)  # vocab_size = 0 means auto (for char-level LM and .txt data)
 
     parser.add_argument("--ctx_len", default=1024, type=int)
@@ -333,6 +379,7 @@ if __name__ == "__main__":  # pragma: no cover
     args.max_epochs = -1  # pretrain continues forever unless my_exit_tokens stops it
     args.betas = (args.beta1, args.beta2)
     validate_sft_loss_settings(args)
+    validate_sft_eval_settings(args)
     args.real_bsz = int(args.num_nodes) * int(args.devices) * args.micro_bsz
     configure_batch_sizes(args)
     os.environ["DEEPSPEED_TIMEOUT"] = str(args.dist_timeout_sec)
@@ -409,6 +456,26 @@ if __name__ == "__main__":  # pragma: no cover
             f"# SFT one pass = {args.sft_one_pass_documents} documents, "
             f"ceil -> {args.epoch_steps} steps, repeated tail samples {repeated_samples}\n#\n"
         )
+    sft_eval_line = ""
+    if args.data_type == "sft_binidx" and (
+        float(getattr(args, "sft_eval_tail_ratio", 0.0) or 0.0) > 0
+        or int(getattr(args, "sft_eval_tail_docs", 0) or 0) > 0
+    ):
+        total_documents = count_binidx_documents(args.data_file)
+        eval_documents = compute_sft_tail_eval_count(
+            total_documents,
+            float(getattr(args, "sft_eval_tail_ratio", 0.0) or 0.0),
+            int(getattr(args, "sft_eval_tail_docs", 0) or 0),
+            require_train_docs=not int(getattr(args, "sft_eval_include_in_train", 0) or 0),
+        )
+        eval_mode = "overlap" if int(getattr(args, "sft_eval_include_in_train", 0) or 0) else "heldout"
+        train_documents = total_documents if eval_mode == "overlap" else total_documents - eval_documents
+        args.sft_eval_tail_documents = eval_documents
+        sft_eval_line = (
+            f"# SFT tail eval split = mode {eval_mode}, train {train_documents} documents, "
+            f"eval {eval_documents} documents, eval every {args.sft_eval_every_n_steps} steps "
+            f"for {args.sft_eval_steps} micro-batches/rank\n#\n"
+        )
     try:
         deepspeed_version = deepspeed.__version__
     except:
@@ -427,6 +494,7 @@ if __name__ == "__main__":  # pragma: no cover
 # Each "epoch" = {args.epoch_steps} steps, {samples_per_epoch} samples, {tokens_per_epoch} tokens
 #
 {sft_one_pass_line}\
+{sft_eval_line}\
 # Model = {args.n_layer} n_layer, {args.n_embd} n_embd, {args.ctx_len} ctx_len
 #
 # Adam = lr {args.lr_init} to {args.lr_final}, warmup {args.warmup_steps} steps, beta {args.betas}, eps {args.adam_eps}
@@ -491,7 +559,19 @@ if __name__ == "__main__":  # pragma: no cover
     from src.trainer import train_callback, generate_init_weight
     from src.dataset import MyDataset
 
-    train_data = MyDataset(args)
+    train_data = MyDataset(args, sft_split="train")
+    eval_loader = None
+    if args.data_type == "sft_binidx" and args.sft_eval_every_n_steps > 0:
+        eval_data = MyDataset(args, sft_split="eval")
+        eval_loader = DataLoader(
+            eval_data,
+            shuffle=False,
+            pin_memory=True,
+            batch_size=args.micro_bsz,
+            num_workers=1,
+            persistent_workers=False,
+            drop_last=True,
+        )
     args.vocab_size = train_data.vocab_size
 
     from src.model import RWKV
@@ -548,7 +628,7 @@ if __name__ == "__main__":  # pragma: no cover
 
     trainer = Trainer.from_argparse_args(
         args,
-        callbacks=[train_callback(args)],
+        callbacks=[train_callback(args, eval_loader=eval_loader)],
     )
 
     if trainer.global_rank == 0:

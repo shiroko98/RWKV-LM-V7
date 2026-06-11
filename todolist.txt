@@ -44,7 +44,7 @@ Validation notes
 - CUDA SFT tail-eval smoke now covers both held-out mode with enough synthetic documents and overlap mode with a tiny one-document dataset.
 - SFT eval now calls a dedicated `sft_eval_step` that gathers ZeRO-3 sharded head weights before masked/head CE, while the training path keeps the original non-gathered behavior.
 - Expanded wandb train metrics with clear `train/*` and `perf/*` names: loss, epoch loss, LR, weight decay, optional grad norm, cumulative samples/tokens, iteration time, and throughput.
-- Fixed wandb grad-norm callback compatibility with Lightning versions that pass `optimizer_idx` to `on_before_optimizer_step`.
+- Removed wandb grad-norm monitoring so training no longer registers an optimizer-step hook just for logging.
 - README / README_CN now document the updated `scripts/calc_sft_onepass_steps.py` eval usage, including held-out, overlap, fixed eval-doc count, and how to read `train_documents` / `eval_documents`.
 - `run_13b_sft_ctx86016_onepass.sh` has been updated to the current 13B ctx86016 long-run config: 20260415 checkpoint, manual 45000 steps, held-out 0.5% eval, save/eval every 20 steps, WSD decay over the final 15000 steps, and wandb project `RWKV7-13B-SFT`.
 - Latest server feedback for positive `--sft_masked_ce_chunk`: `4096` and `8192` still timeout under 13B ZeRO-3 long-context SFT, so production scripts should keep it at `0` until the fused masked CUDA op exists.

@@ -1022,7 +1022,6 @@ def test_build_wandb_train_metrics_uses_clear_names():
         token_per_optimizer_step=128,
         t_cost=2.0,
         kt_s=0.256,
-        grad_norm=7.5,
     )
 
     assert metrics["train/loss"] == pytest.approx(1.25)
@@ -1038,51 +1037,8 @@ def test_build_wandb_train_metrics_uses_clear_names():
     assert metrics["perf/tokens_per_sec"] == pytest.approx(64.0)
     assert metrics["perf/ktokens_per_sec"] == pytest.approx(0.256)
     assert metrics["perf/samples_per_sec"] == pytest.approx(4.0)
-    assert metrics["train/grad_norm"] == pytest.approx(7.5)
+    assert "train/grad_norm" not in metrics
     assert "Gtokens" not in metrics
-
-
-def test_get_global_grad_norm_prefers_strategy_value_and_skips_deepspeed_fallback():
-    trainer = SimpleNamespace(
-        strategy=SimpleNamespace(model=SimpleNamespace(get_global_grad_norm=lambda: torch.tensor(3.5)))
-    )
-    assert trainer_mod.get_global_grad_norm(trainer, object()) == pytest.approx(3.5)
-
-    trainer = SimpleNamespace(strategy="deepspeed_stage_3_offload")
-    module = torch.nn.Linear(2, 2)
-    loss = module(torch.ones(1, 2)).sum()
-    loss.backward()
-    assert trainer_mod.get_global_grad_norm(trainer, module) is None
-
-
-def test_get_global_grad_norm_computes_local_non_deepspeed_norm():
-    trainer = SimpleNamespace(strategy="")
-    module = torch.nn.Linear(2, 1, bias=False)
-    with torch.no_grad():
-        module.weight.fill_(1.0)
-    loss = module(torch.ones(1, 2)).sum()
-    loss.backward()
-
-    assert trainer_mod.get_global_grad_norm(trainer, module) == pytest.approx(2 ** 0.5)
-
-
-def test_train_callback_before_optimizer_step_accepts_optimizer_idx(tmp_path, monkeypatch):
-    callback = trainer_mod.train_callback(
-        SimpleNamespace(
-            data_type="sft_binidx",
-            strategy="",
-            proj_dir=str(tmp_path),
-            wandb="",
-            my_timestamp="2026-06-11-15-30-00",
-            run_name="grad-norm-hook-test",
-        )
-    )
-    monkeypatch.setattr(trainer_mod, "get_global_grad_norm", lambda trainer, pl_module: 4.25)
-    trainer = SimpleNamespace()
-
-    callback.on_before_optimizer_step(trainer, object(), object(), 0)
-
-    assert trainer.my_grad_norm == pytest.approx(4.25)
 
 
 def test_train_callback_runs_save_and_eval_on_same_step(tmp_path, monkeypatch):

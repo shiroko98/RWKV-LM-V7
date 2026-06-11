@@ -569,7 +569,7 @@ python scripts/calc_sft_onepass_steps.py /mnt/data/datasets/sft_train_ctx8192 \
 
 第三步：在 8 张 H800 上启动 13.3B SFT：
 
-针对 `ctx_len=86016`、160G 级 SFT 数据、完整跑一遍数据的长训，可以直接用这个自包含脚本。它在同一个文件里写明 13.3B 模型结构、SFT 数据、DeepSpeed、LR、checkpoint 和 loss 分块参数；默认 `SFT_ONE_PASS=1`，所以不需要 `MAGIC_PRIME`，也不需要手写 `EPOCH_STEPS/EPOCH_COUNT`；`train.py` 会从 `DATA_FILE.idx` 读取 document 数并自动计算一遍数据需要的 optimizer step。默认超参偏保守：`micro_bsz=1`、8 卡、无梯度累计、ZeRO-3-offload、开启 block 级激活检查点、`lr=5e-6`、`weight_decay=0.001`、warmup 200 step。半天保存一次仍用现有 `SAVE_EVERY_N_STEPS`，等你按真实吞吐找出半天对应多少 step 后填进去即可。
+针对 `ctx_len=86016`、160G 级 SFT 数据、约 20 天窗口的 13.3B 长训，可以直接用这个自包含脚本。它在同一个文件里写明 13.3B 模型结构、SFT 数据、DeepSpeed、LR、checkpoint、eval 和 loss 分块参数；当前默认是手动 schedule：`SFT_ONE_PASS=0`、`EPOCH_STEPS=45000`、`EPOCH_COUNT=1`，尾部 `0.5%` held-out eval，`SAVE_EVERY_N_STEPS=20` 且同频 eval，最后 `15000` step 做 cosine WSD 衰减。默认超参偏保守：`micro_bsz=1`、8 卡、无梯度累计、ZeRO-3-offload、开启 block 级激活检查点、`lr=5e-6`、`weight_decay=0.001`、warmup 200 step。若后续要完整一遍数据或改训练窗口，先用上面的 `scripts/calc_sft_onepass_steps.py` 重新计算，再改 `EPOCH_STEPS` / eval / 保存间隔。
 
 先编辑 `run_13b_sft_ctx86016_onepass.sh` 顶部的 `LOAD_MODEL`、`DATA_FILE`、`PROJ_DIR`、`SAVE_EVERY_N_STEPS`、`LR_WSD_DECAY_ITERS` 等配置，再直接运行：
 

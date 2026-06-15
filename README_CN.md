@@ -750,7 +750,13 @@ python scripts/run_converted_rwkv_demo.py \
   --sample
 ```
 
-这个 demo 只是验证合并后的 checkpoint 能加载、能 forward、能按 SFT chat template 生成。需要指定系统消息时可以加 `--system-prompt`、`--current-date`、`--current-location`；如果只是想做普通 next-token continuation，不经过 chat template，可以加 `--raw-prompt`。默认 chat prompt 会加入空的 `<think>\n\n</think>\n\n`；如果要强制模型先生成思考内容，加 `--force-thinking`，它会让 prompt 以打开的 `<think>\n` 结尾。
+这个 demo 只是验证合并后的 checkpoint 能加载、能 forward、能按 SFT chat template 生成。需要指定系统消息时可以加 `--system-prompt`、`--current-date`、`--current-location`；如果只是想做普通 next-token continuation，不经过 chat template，可以加 `--raw-prompt`。思考前缀有三种模式：
+
+- 默认不加额外参数：chat prompt 会加入空的 `<think>\n\n</think>\n\n`，模型从正式回答处开始续写。
+- 强制思考：加 `--force-thinking`，prompt 会以打开的 `<think>\n` 结尾，后面的思考内容和 `</think>` 都由模型生成。
+- 强制不思考：加 `--no-add-thinking`，prompt 只以 `<|im_start|>Assistant: ` 结尾，不插入 `<think>` 前缀。
+
+`--force-thinking` 和 `--no-add-thinking` 互斥，不能同时使用。
 
 如果想把“合并 DeepSpeed 分片”和“跑 prompt 推理 smoke”放在一条命令里，可以用整合脚本。默认输出文件已存在时会直接复用，避免每次测试 prompt 都重新合并 13B；需要强制重新合并时加 `--force-convert`：
 
@@ -772,6 +778,8 @@ python scripts/convert_and_run_rwkv_demo.py \
   --force-thinking \
   --sample
 ```
+
+如果要强制不思考，把上面的 `--force-thinking` 换成 `--no-add-thinking` 即可。
 
 ### 9. 13.3B SFT profiling / ZeRO 诊断
 

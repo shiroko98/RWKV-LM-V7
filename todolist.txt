@@ -1,6 +1,7 @@
 2026-06-10 Current SFT open tasks
 
 Current status
+- Added `scripts/probe_sft_binidx_steps.py`, a data-only SFT binidx sampling probe. It reproduces the SFT train dataset step-to-document mapping from `DATA_FILE.bin/.idx` and `.mask`, reports doc/window hashes, duplicate/overlap checks, mask density, trainable token counts, and optional trainable text excerpts. It does not load a model, so true model loss/PPL still requires a separate model-scoring pass.
 - SFT preprocessing core path is implemented: UTF-8 JSONL input, recursive directory input, multiprocessing render/tokenize, progress display, best-fit-decreasing packing, bounded shard groups, group cache/resume, error log, trailing tool-result trimming, and aligned token/mask binidx output.
 - SFT training core path is implemented: `data_type=sft_binidx`, automatic mask sidecar loading, shifted next-token loss mask, masked CE, explicit SFT epoch schedule, `--sft_one_pass`, gradient accumulation, WSD final LR decay, DeepSpeed resume, ZeRO checkpoint conversion, and chat-template-rendered converted-checkpoint demo.
 - README / README_CN document that SFT preprocessing worker processes run concurrently while progress is reported in input-order result-consumption order.

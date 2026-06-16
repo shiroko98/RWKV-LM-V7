@@ -1,9 +1,11 @@
 import sys
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import numpy as np
 import torch
 from torch.nn import functional as F
 
@@ -25,6 +27,14 @@ _CALC_SFT_ONEPASS_SPEC = importlib.util.spec_from_file_location(
 calc_sft_onepass_steps = importlib.util.module_from_spec(_CALC_SFT_ONEPASS_SPEC)
 assert _CALC_SFT_ONEPASS_SPEC.loader is not None
 _CALC_SFT_ONEPASS_SPEC.loader.exec_module(calc_sft_onepass_steps)
+
+_PROBE_SFT_STEPS_SPEC = importlib.util.spec_from_file_location(
+    "probe_sft_binidx_steps", ROOT / "scripts" / "probe_sft_binidx_steps.py"
+)
+probe_sft_binidx_steps = importlib.util.module_from_spec(_PROBE_SFT_STEPS_SPEC)
+assert _PROBE_SFT_STEPS_SPEC.loader is not None
+sys.modules[_PROBE_SFT_STEPS_SPEC.name] = probe_sft_binidx_steps
+_PROBE_SFT_STEPS_SPEC.loader.exec_module(probe_sft_binidx_steps)
 
 
 def make_sft_args(prefix: str, **overrides):
@@ -633,6 +643,281 @@ def test_calc_sft_onepass_cli_reports_eval_split(tmp_path, capsys):
     assert "eval_documents=3" in out
     assert "eval_include_in_train=1" in out
     assert "epoch_steps=1" in out
+
+
+def test_probe_sft_binidx_steps_matches_training_dataset_sampling(tmp_path):
+    prefix = str(tmp_path / "probe_sampling")
+    write_documents(
+        prefix,
+        [
+            EncodedDocument(input_ids=[base, base + 1], loss_mask=[0, 1])
+            for base in range(0, 160, 10)
+        ],
+    )
+    args = make_sft_args(
+        prefix,
+        ctx_len=3,
+        real_bsz=2,
+        epoch_steps=2,
+        accumulate_grad_batches=2,
+    )
+    dataset = dataset_mod.MyDataset(args)
+    dataset.world_size = 2
+
+    config = probe_sft_binidx_steps.BatchConfig(
+        num_nodes=1,
+        devices=2,
+        micro_bsz=1,
+        accumulate_grad_batches=2,
+        epoch_steps=2,
+    )
+    split = probe_sft_binidx_steps.SplitInfo(
+        total_documents=16,
+        train_documents=16,
+        eval_documents=0,
+        eval_include_in_train=0,
+    )
+
+    probed = probe_sft_binidx_steps.doc_indices_for_optimizer_index(1, config, split)
+
+    observed = []
+    for idx in (2, 3):
+        for rank in range(2):
+            dataset.global_rank = rank
+            x, _, _ = dataset[idx]
+            observed.append(int(x[0].item() // 10))
+
+    assert probed == observed
+
+
+def test_probe_sft_binidx_steps_cli_reports_windows_and_overlap(tmp_path, capsys):
+    prefix = str(tmp_path / "probe_cli")
+    write_documents(
+        prefix,
+        [
+            EncodedDocument(input_ids=[base, base + 1, base + 2], loss_mask=[0, 1, 1])
+            for base in range(0, 120, 10)
+        ],
+    )
+
+    rc = probe_sft_binidx_steps.main(
+        [
+            prefix,
+            "--ctx-len",
+            "4",
+            "--num-nodes",
+            "1",
+            "--devices",
+            "2",
+            "--micro-bsz",
+            "1",
+            "--accumulate-grad-batches",
+            "2",
+            "--epoch-steps",
+            "3",
+            "--probe-steps",
+            "1,4",
+            "--window-steps",
+            "1",
+            "--show-docs",
+            "1",
+        ]
+    )
+
+    assert rc == 0
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert records[0]["kind"] == "config"
+    windows = [record for record in records if record["kind"] == "window"]
+    assert [record["logged_step"] for record in windows] == [1, 4]
+    assert windows[0]["docs"] == 4
+    assert windows[0]["unique_docs"] == 4
+    comparisons = [record for record in records if record["kind"] == "comparison"]
+    assert comparisons[0]["left_step"] == 1
+    assert comparisons[0]["right_step"] == 4
+    assert comparisons[0]["common_docs"] == 4
+    assert comparisons[0]["ordered_equal"] is True
+
+
+def test_probe_sft_binidx_step_helpers_cover_ranges_and_errors(tmp_path):
+    prefix = str(tmp_path / "probe_count")
+    write_documents(prefix, [EncodedDocument(input_ids=[1, 2], loss_mask=[0, 1])])
+
+    assert probe_sft_binidx_steps.normalize_prefix(prefix + ".idx") == prefix
+    assert probe_sft_binidx_steps.normalize_prefix(prefix + ".bin") == prefix
+    assert probe_sft_binidx_steps.count_documents(prefix + ".idx") == 1
+    with pytest.raises(FileNotFoundError):
+        probe_sft_binidx_steps.count_documents(str(tmp_path / "missing"))
+
+    split = probe_sft_binidx_steps.compute_split_info(
+        10,
+        eval_tail_ratio=0.2,
+        eval_tail_docs=0,
+        eval_include_in_train=1,
+    )
+    assert split.train_documents == 10
+    assert split.eval_documents == 2
+    assert probe_sft_binidx_steps.auto_epoch_steps(9, 4) == 3
+    with pytest.raises(ValueError, match="train_documents"):
+        probe_sft_binidx_steps.auto_epoch_steps(0, 4)
+    with pytest.raises(ValueError, match="effective_bsz"):
+        probe_sft_binidx_steps.auto_epoch_steps(1, 0)
+
+    assert probe_sft_binidx_steps.parse_probe_steps("1, 3:7:2, 10-12, , -2") == [1, 3, 5, 7, 10, 11, 12, -2]
+    with pytest.raises(ValueError, match="Invalid probe"):
+        probe_sft_binidx_steps.parse_probe_steps("1:2:3:4")
+    with pytest.raises(ValueError, match="stride"):
+        probe_sft_binidx_steps.parse_probe_steps("1:2:0")
+    with pytest.raises(ValueError, match="At least one"):
+        probe_sft_binidx_steps.parse_probe_steps(",")
+
+    assert probe_sft_binidx_steps.logged_step_to_optimizer_index(0, "zero") == 0
+    with pytest.raises(ValueError, match="step_base"):
+        probe_sft_binidx_steps.logged_step_to_optimizer_index(1, "bad")
+    with pytest.raises(ValueError, match="negative"):
+        probe_sft_binidx_steps.logged_step_to_optimizer_index(0, "one")
+
+    config = probe_sft_binidx_steps.BatchConfig(1, 2, 1, 2, 3, epoch_begin=1)
+    assert probe_sft_binidx_steps.sample_indices_for_optimizer_index(3, config) == [24, 25, 26, 27]
+    with pytest.raises(ValueError, match="optimizer_index"):
+        probe_sft_binidx_steps.sample_indices_for_optimizer_index(-1, config)
+    with pytest.raises(ValueError, match="epoch_steps"):
+        probe_sft_binidx_steps.sample_indices_for_optimizer_index(
+            0,
+            probe_sft_binidx_steps.BatchConfig(1, 1, 1, 1, 0),
+        )
+    with pytest.raises(ValueError, match="no documents"):
+        probe_sft_binidx_steps.doc_indices_for_optimizer_index(
+            0,
+            config,
+            probe_sft_binidx_steps.SplitInfo(0, 0, 0, 0),
+        )
+    with pytest.raises(ValueError, match="window_steps"):
+        probe_sft_binidx_steps.window_doc_indices(
+            1,
+            window_steps=0,
+            step_base="one",
+            config=config,
+            split=probe_sft_binidx_steps.SplitInfo(4, 4, 0, 0),
+        )
+    with pytest.raises(ValueError, match="positive"):
+        probe_sft_binidx_steps.validate_positive("x", 0)
+
+
+def test_probe_sft_binidx_doc_stats_text_decode_and_validation(tmp_path):
+    prefix = str(tmp_path / "probe_stats")
+    write_documents(
+        prefix,
+        [
+            EncodedDocument(input_ids=[1, 2, 65532, 65532], loss_mask=[0, 1, 0, 0]),
+            EncodedDocument(input_ids=[3, 4, 5, 6, 7], loss_mask=[0, 1, 1, 1, 1]),
+        ],
+    )
+    vocab = ROOT / "data" / "tokenizer" / "rwkv_vocab_v20230424.txt"
+    probe = probe_sft_binidx_steps.SftBinidxProbe(
+        prefix,
+        ctx_len=3,
+        vocab_path=str(vocab),
+        show_text_chars=8,
+    )
+
+    first = probe.doc_stats(0)
+    assert first["train_tokens"] == 1
+    assert first["tail_padding"] == 2
+    assert first["mask_density"] == pytest.approx(1 / 3)
+    assert "trainable_excerpt" in first
+
+    second = probe.doc_stats(1)
+    assert second["too_long"] is True
+    assert second["target_tokens"] == 3
+
+    bad_mask_prefix = str(tmp_path / "probe_bad_mask")
+    write_documents(
+        bad_mask_prefix,
+        [
+            EncodedDocument(input_ids=[1, 2], loss_mask=[0, 1]),
+            EncodedDocument(input_ids=[3, 4], loss_mask=[0, 1]),
+            EncodedDocument(input_ids=[5, 6], loss_mask=[0, 1]),
+        ],
+    )
+    with pytest.raises(ValueError, match="counts differ"):
+        probe_sft_binidx_steps.SftBinidxProbe(prefix, ctx_len=3, mask_prefix=bad_mask_prefix)
+
+    empty = probe_sft_binidx_steps.summarize_window(1, [], [], step_base="one", window_steps=1)
+    assert empty["doc_min"] is None
+    assert empty["train_tokens_mean"] == 0.0
+    empty_cmp = probe_sft_binidx_steps.compare_windows(
+        {"logged_step": 1, "window_hash": "a"},
+        [],
+        {"logged_step": 2, "window_hash": "a"},
+        [],
+    )
+    assert empty_cmp["jaccard"] == 0.0
+    assert empty_cmp["window_hash_equal"] is True
+
+    class BadTokenizer:
+        def decode(self, tokens):
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad")
+
+        def decodeBytes(self, tokens):
+            return b"\xff"
+
+    assert probe_sft_binidx_steps.decode_trainable_excerpt(
+        BadTokenizer(),
+        np.array([1, 2], dtype=np.int64),
+        np.array([0, 1], dtype=np.int64),
+        4,
+    ) == "�"
+    assert probe_sft_binidx_steps.decode_trainable_excerpt(
+        BadTokenizer(),
+        np.array([1, 2], dtype=np.int64),
+        np.array([0, 0], dtype=np.int64),
+        4,
+    ) == ""
+
+
+def test_probe_sft_binidx_cli_writes_jsonl_and_auto_epoch_steps(tmp_path, capsys):
+    prefix = str(tmp_path / "probe_jsonl")
+    write_documents(
+        prefix,
+        [
+            EncodedDocument(input_ids=[base, base + 1], loss_mask=[0, 1])
+            for base in range(0, 80, 10)
+        ],
+    )
+    jsonl_out = tmp_path / "probe.jsonl"
+
+    rc = probe_sft_binidx_steps.main(
+        [
+            prefix + ".bin",
+            "--ctx-len",
+            "3",
+            "--num-nodes",
+            "1",
+            "--devices",
+            "2",
+            "--micro-bsz",
+            "1",
+            "--accumulate-grad-batches",
+            "2",
+            "--eval-tail-ratio",
+            "0.25",
+            "--probe-steps",
+            "0",
+            "--step-base",
+            "zero",
+            "--show-docs",
+            "0",
+            "--jsonl-out",
+            str(jsonl_out),
+        ]
+    )
+
+    assert rc == 0
+    stdout_records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    file_records = [json.loads(line) for line in jsonl_out.read_text(encoding="utf-8").splitlines()]
+    assert stdout_records == file_records
+    assert stdout_records[0]["epoch_steps"] == 2
+    assert stdout_records[0]["train_documents"] == 6
 
 
 def test_sft_one_pass_rejects_unsupported_or_empty_datasets(monkeypatch):

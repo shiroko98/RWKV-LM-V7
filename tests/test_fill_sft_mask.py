@@ -31,6 +31,21 @@ def test_resolve_mask_prefix_accepts_dataset_mask_or_bin_path():
     assert fill_sft_mask.resolve_mask_prefix("data/sft.mask.idx") == Path("data/sft.mask")
 
 
+def test_coerce_fill_value_does_not_depend_on_numpy_can_cast(monkeypatch):
+    def fail_can_cast(*args, **kwargs):
+        raise TypeError("numpy 2 can_cast Python scalar compatibility check")
+
+    monkeypatch.setattr(fill_sft_mask.np, "can_cast", fail_can_cast)
+
+    assert fill_sft_mask.coerce_fill_value(1, np.dtype(np.uint8)) == 1
+    assert fill_sft_mask.coerce_fill_value(0, np.dtype(np.uint8)) == 0
+    assert fill_sft_mask.coerce_fill_value(1, np.dtype(np.float64)) == 1.0
+    with pytest.raises(ValueError, match="safely stored"):
+        fill_sft_mask.coerce_fill_value(256, np.dtype(np.uint8))
+    with pytest.raises(ValueError, match="safely stored"):
+        fill_sft_mask.coerce_fill_value(-1, np.dtype(np.uint8))
+
+
 def test_fill_mask_bin_writes_new_sidecar_without_touching_tokens(tmp_path):
     prefix = str(tmp_path / "tiny_sft")
     write_documents(

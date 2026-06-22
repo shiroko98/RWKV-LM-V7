@@ -29,6 +29,19 @@ def resolve_mask_prefix(path: str | Path) -> Path:
     return Path(text + ".mask")
 
 
+def coerce_fill_value(value: int, dtype: np.dtype) -> object:
+    dtype = np.dtype(dtype)
+    if np.issubdtype(dtype, np.integer):
+        int_value = int(value)
+        info = np.iinfo(dtype)
+        if int_value < info.min or int_value > info.max:
+            raise ValueError(f"value {value!r} cannot be safely stored as {dtype}")
+        return dtype.type(int_value).item()
+    if np.issubdtype(dtype, np.floating):
+        return dtype.type(value).item()
+    raise ValueError(f"unsupported mask dtype {dtype}")
+
+
 def fill_mask_bin(
     mask_prefix: str | Path,
     *,
@@ -60,8 +73,7 @@ def fill_mask_bin(
             f"mask bin size mismatch: {input_bin} has {actual_bytes} bytes, "
             f"but idx expects {expected_bytes} bytes"
         )
-    if not np.can_cast(value, dtype, casting="safe"):
-        raise ValueError(f"value {value!r} cannot be safely stored as {dtype}")
+    fill_value = coerce_fill_value(value, dtype)
 
     output_prefix_path = mask_prefix if in_place else Path(output_prefix).expanduser() if output_prefix else mask_prefix.with_name(mask_prefix.name + ".all1")
     output_bin = Path(data_file_path(str(output_prefix_path)))
@@ -77,7 +89,6 @@ def fill_mask_bin(
         target = np.memmap(output_bin, dtype=dtype, mode="r+", shape=(element_count,))
 
     try:
-        fill_value = np.array(value, dtype=dtype).item()
         for start in range(0, element_count, chunk_elements):
             stop = min(start + chunk_elements, element_count)
             target[start:stop] = fill_value

@@ -284,6 +284,15 @@ python data/make_sft_binidx.py /mnt/data/Datas/SFT_RWKV7_13B/sharded_cleaned \
 9. 如果不传 `--pack`、`--pad`、`--pack-length` 或 `--pad-length`，每条重复后的源样本会写成一个变长 binidx document，并同步写入一个同长度的 mask document，不会自动 padding。每个独立 document 末尾仍然会有真实的 `EOD_TOKEN`，并且这个 EOD 参与训练。`--ctx-len`、`--pack-length` 和 `--pad-length` 都是 token 数，不是字符数。推荐用 `--ctx-len N --pack` 或 `--ctx-len N --pad`，实际写出长度会自动使用 `N + 1`，用于匹配训练端 next-token label。使用 `--pack` / `--pack-length` 时，样本默认按输入顺序做不可拆分 packing：多个完整样本可以合并到同一个固定长度 document，样本之间的分隔换行 mask 为 `0`；如果当前 document 放不下下一条完整样本，就先把当前 document 右侧 padding 后写出，再新开 document。`--pack-strategy best-fit-decreasing` 会先按样本 token 长度从大到小排序，再用 best-fit 近似装箱，仍然不拆样本，但会重排样本以减少 padding；这个策略按 JSONL shard group 独立处理。`--pack-shard-group-size 1` 表示每组一个 JSONL；更大的值允许在有界批次内跨文件 best-fit，提高 packing 利用率，同时避免把全量 tokenized 样本一次性放进内存。所有 group 处理完后仍写成同一组 `PREFIX` binidx + mask 输出。使用 `--pad` / `--pad-length` 时不做 packing：每条源样本独立 padding 到固定长度。过长样本会在 tokenize 后、packing/padding 前按目标 token 长度过滤丢弃，不会终止整个构建。
 10. 输出包含主 token 数据集和 mask sidecar：`PREFIX.bin`、`PREFIX.idx`、`PREFIX.mask.bin`、`PREFIX.mask.idx`。SFT 训练时主数据集提供 token，mask sidecar 提供哪些 token 参与 loss。
 
+如果想让已有 SFT binidx 数据的所有 token 都参与训练，可以把 mask sidecar 全部填成 `1`。`.mask.bin` 存实际 mask 数组，`.mask.idx` 存 document 长度、offset 和 dtype，所以只改 mask 数值时主 token 文件不需要动。默认脚本会写出一套新的 mask sidecar：
+
+```bash
+python scripts/fill_sft_mask.py /mnt/data/Datasets/SFT_RWKV7_13B/results/SFT_RWKV7_13B \
+  --output-prefix /mnt/data/Datasets/SFT_RWKV7_13B/results/SFT_RWKV7_13B.all_train.mask
+```
+
+之后可以把生成的 `*.all_train.mask.bin/.idx` 重命名或复制成 `DATA_FILE.mask.bin/.idx`，也可以保留原始 mask，并在 `train.py` 里传 `--sft_mask_file /mnt/data/Datasets/SFT_RWKV7_13B/results/SFT_RWKV7_13B.all_train.mask`。如果确认要原地覆盖原始 mask，加 `--in-place`；这只会改 `PREFIX.mask.bin`。
+
 参数含义：
 
 - `--chat-template`：SFT 渲染模板路径，默认 `data/SFT/sample/chat_template.jinja`。

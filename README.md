@@ -496,6 +496,15 @@ The high-level flow is:
 9. Without `--pack`, `--pad`, `--pack-length`, or `--pad-length`, each repeated source sample becomes one variable-length binidx document and one same-length mask document; no padding is added. Each independent document still ends with the real `EOD_TOKEN`, and that EOD is trainable. `--ctx-len`, `--pack-length`, and `--pad-length` are token counts, not character counts. The recommended form is `--ctx-len N --pack` or `--ctx-len N --pad`; the actual preprocessing length is `N + 1` to match next-token labels at training time. With `--pack` / `--pack-length`, samples are packed without splitting a sample. The default `ordered` strategy preserves input order: multiple complete samples may share one fixed-length document, the separator newline between samples is masked out, and if the next complete sample does not fit, the current document is right-padded and a new one starts. `--pack-strategy best-fit-decreasing` sorts samples by token length and uses a best-fit approximation to reduce padding; it still never splits a sample, but it does reorder samples. This strategy is applied independently inside each JSONL shard group. `--pack-shard-group-size 1` means one JSONL per group; larger values allow cross-file best-fit within a bounded batch, improving packing efficiency while avoiding all-data-in-memory behavior. All processed groups are appended into one final `PREFIX` binidx + mask output. With `--pad` / `--pad-length`, packing stays disabled and each source sample is padded independently. Overlong samples are filtered after tokenization and before packing/padding according to the target token length; they are dropped instead of stopping the whole build.
 10. The output is the token dataset plus a mask sidecar: `PREFIX.bin`, `PREFIX.idx`, `PREFIX.mask.bin`, and `PREFIX.mask.idx`. SFT training reads tokens from the main dataset and loss participation from the sidecar mask.
 
+To train on every token in an existing SFT binidx dataset, fill the mask sidecar with `1` values. The `.mask.bin` file stores the actual mask array, while `.mask.idx` stores document lengths, offsets, and dtype, so the token files do not need to change when only mask values change. By default the helper writes a new sidecar prefix:
+
+```bash
+python scripts/fill_sft_mask.py /mnt/data/Datasets/SFT_RWKV7_13B/results/SFT_RWKV7_13B \
+  --output-prefix /mnt/data/Datasets/SFT_RWKV7_13B/results/SFT_RWKV7_13B.all_train.mask
+```
+
+Then either rename or copy the generated `*.all_train.mask.bin/.idx` to `DATA_FILE.mask.bin/.idx`, or keep the original files and pass `--sft_mask_file /mnt/data/Datasets/SFT_RWKV7_13B/results/SFT_RWKV7_13B.all_train.mask` to `train.py`. To overwrite the original mask in place, add `--in-place`; this changes only `PREFIX.mask.bin`.
+
 Main parameters:
 
 - `--chat-template`: SFT render template path. Defaults to `data/SFT/sample/chat_template.jinja`.

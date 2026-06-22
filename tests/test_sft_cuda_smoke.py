@@ -11,6 +11,8 @@ import pytest
 import torch
 from torch.nn import functional as F
 
+from src.sft_split import compute_sft_shuffled_split_indices
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -1326,6 +1328,341 @@ def test_train_py_sft_deepspeed_tail_eval_overlap_smoke(tmp_path):
     assert "eval step 1" in log_text
     assert "mode overlap" in output
     _assert_step_checkpoint_exists(proj_dir)
+
+
+@pytest.mark.cuda
+@pytest.mark.slow
+def test_train_py_sft_deepspeed_shuffle_tail_eval_smoke(tmp_path):
+    model_path = _require_cuda_smoke("RWKV_RUN_TRAIN_PY_SFT_SHUFFLE_TAIL_EVAL_SMOKE")
+    pad_length = int(os.environ.get("RWKV_SFT_SHUFFLE_TAIL_EVAL_PAD_LENGTH", os.environ.get("RWKV_SFT_SMOKE_PAD_LENGTH", "257")))
+    ctx_len = pad_length - 1
+    assert ctx_len > 0 and ctx_len % 16 == 0, "ctx_len must be positive and divisible by the RWKV7 chunk length 16"
+
+    devices = int(os.environ.get("RWKV_SFT_SMOKE_DEVICES", "2"))
+    strategy = os.environ.get("RWKV_SFT_SMOKE_STRATEGY", "deepspeed_stage_3_offload")
+    if devices < 2:
+        pytest.skip("DeepSpeed shuffle tail eval smoke requires RWKV_SFT_SMOKE_DEVICES >= 2")
+    if torch.cuda.device_count() < devices:
+        pytest.skip(f"only {torch.cuda.device_count()} CUDA device(s) visible, need {devices}")
+    if "deepspeed" not in strategy:
+        pytest.skip("DeepSpeed shuffle tail eval smoke requires a DeepSpeed strategy")
+
+    state = _load_state_dict(model_path)
+    dims = _infer_rwkv7_dims(state)
+    docs = int(os.environ.get("RWKV_SFT_SHUFFLE_TAIL_EVAL_DOCS", str(max(devices * 4, 16))))
+    eval_docs = int(os.environ.get("RWKV_SFT_SHUFFLE_TAIL_EVAL_HELDOUT_DOCS", str(max(2, devices // 2))))
+    shuffle_seed = int(os.environ.get("RWKV_SFT_SHUFFLE_TAIL_EVAL_SEED", "31415"))
+    assert docs > eval_docs > 0
+
+    prefix = _build_synthetic_sft_binidx(
+        tmp_path,
+        pad_length,
+        docs=docs,
+        vocab_size=dims["vocab_size"],
+        name="shuffle_tail_eval_sft",
+    )
+    split_train, split_eval = compute_sft_shuffled_split_indices(docs, eval_docs, seed=shuffle_seed)
+    assert set(split_train.tolist()).isdisjoint(set(split_eval.tolist()))
+    assert split_eval.tolist() != list(range(docs - eval_docs, docs))
+
+    proj_dir = tmp_path / "shuffle_tail_eval_train_py"
+    fused_chunk = int(os.environ.get("RWKV_SFT_SHUFFLE_TAIL_EVAL_FUSED_CHUNK", os.environ.get("RWKV_SFT_FUSED_CE_TRAIN_PY_CHUNK", "512")))
+    epoch_steps = int(os.environ.get("RWKV_SFT_SHUFFLE_TAIL_EVAL_STEPS", "2"))
+
+    command = _train_py_command(
+        load_model=model_path,
+        prefix=prefix,
+        proj_dir=proj_dir,
+        dims=dims,
+        ctx_len=ctx_len,
+        epoch_steps=epoch_steps,
+        epoch_count=1,
+        devices=devices,
+        strategy=strategy,
+        sft_masked_fused_ce_chunk=fused_chunk,
+        extra_args=[
+            "--sft_train_shuffle",
+            "1",
+            "--sft_train_shuffle_seed",
+            str(shuffle_seed),
+            "--sft_eval_tail_docs",
+            str(eval_docs),
+            "--sft_eval_every_n_steps",
+            "1",
+            "--sft_eval_steps",
+            "1",
+            "--save_every_n_steps",
+            "1",
+            "--keep_last_n_checkpoints",
+            "2",
+        ],
+    )
+    output = _run_train_py(command, "train.py SFT DeepSpeed shuffle tail eval")
+    log_text = (proj_dir / "train_log.txt").read_text(encoding="utf-8")
+    assert "eval step 1" in log_text
+    assert "mode heldout" in output
+    assert "train_shuffle=1" in output
+    _assert_step_checkpoint_exists(proj_dir)
+    loss = _read_train_log_epoch_loss(proj_dir)
+    assert torch.isfinite(torch.tensor(loss)).item()
+
+    summary = {
+        "pad_length": pad_length,
+        "ctx_len": ctx_len,
+        "devices": devices,
+        "strategy": strategy,
+        "docs": docs,
+        "eval_docs": eval_docs,
+        "shuffle_seed": shuffle_seed,
+        "split_eval": split_eval.tolist(),
+        "raw_tail": list(range(docs - eval_docs, docs)),
+        "epoch_steps": epoch_steps,
+        "fused_chunk": fused_chunk,
+        "loss": loss,
+        "proj_dir": str(proj_dir),
+        "output_tail": output[-4000:],
+    }
+    summary_file = os.environ.get("RWKV_SFT_SHUFFLE_TAIL_EVAL_SUMMARY_FILE", "")
+    if summary_file:
+        Path(summary_file).expanduser().write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+
+@pytest.mark.cuda
+@pytest.mark.slow
+def test_train_py_sft_deepspeed_shuffle_resume_smoke(tmp_path):
+    model_path = _require_cuda_smoke("RWKV_RUN_TRAIN_PY_SFT_SHUFFLE_RESUME_SMOKE")
+    pad_length = int(os.environ.get("RWKV_SFT_SHUFFLE_RESUME_PAD_LENGTH", os.environ.get("RWKV_SFT_SMOKE_PAD_LENGTH", "257")))
+    ctx_len = pad_length - 1
+    assert ctx_len > 0 and ctx_len % 16 == 0, "ctx_len must be positive and divisible by the RWKV7 chunk length 16"
+
+    devices = int(os.environ.get("RWKV_SFT_SMOKE_DEVICES", "2"))
+    strategy = os.environ.get("RWKV_SFT_SMOKE_STRATEGY", "deepspeed_stage_3_offload")
+    if devices < 2:
+        pytest.skip("DeepSpeed shuffle resume smoke requires RWKV_SFT_SMOKE_DEVICES >= 2")
+    if torch.cuda.device_count() < devices:
+        pytest.skip(f"only {torch.cuda.device_count()} CUDA device(s) visible, need {devices}")
+    if "deepspeed" not in strategy:
+        pytest.skip("DeepSpeed shuffle resume smoke requires a DeepSpeed strategy")
+
+    state = _load_state_dict(model_path)
+    dims = _infer_rwkv7_dims(state)
+    docs = int(os.environ.get("RWKV_SFT_SHUFFLE_RESUME_DOCS", str(max(devices * 4, 16))))
+    eval_docs = int(os.environ.get("RWKV_SFT_SHUFFLE_RESUME_HELDOUT_DOCS", str(max(2, devices // 2))))
+    shuffle_seed = int(os.environ.get("RWKV_SFT_SHUFFLE_RESUME_SEED", "27182"))
+    epoch_steps = int(os.environ.get("RWKV_SFT_SHUFFLE_RESUME_EPOCH_STEPS", "4"))
+    save_step = int(os.environ.get("RWKV_SFT_SHUFFLE_RESUME_SAVE_STEP", "2"))
+    assert docs > eval_docs > 0
+    assert 0 < save_step < epoch_steps
+
+    prefix = _build_synthetic_sft_binidx(
+        tmp_path,
+        pad_length,
+        docs=docs,
+        vocab_size=dims["vocab_size"],
+        name="shuffle_resume_sft",
+    )
+    proj_dir = tmp_path / "shuffle_resume_train_py"
+    fused_chunk = int(os.environ.get("RWKV_SFT_SHUFFLE_RESUME_FUSED_CHUNK", os.environ.get("RWKV_SFT_FUSED_CE_TRAIN_PY_CHUNK", "512")))
+    common_extra_args = [
+        "--sft_train_shuffle",
+        "1",
+        "--sft_train_shuffle_seed",
+        str(shuffle_seed),
+        "--sft_eval_tail_docs",
+        str(eval_docs),
+        "--sft_eval_every_n_steps",
+        "1",
+        "--sft_eval_steps",
+        "1",
+        "--epoch_save",
+        "0",
+        "--keep_last_n_checkpoints",
+        "0",
+    ]
+
+    first_command = _train_py_command(
+        load_model=model_path,
+        prefix=prefix,
+        proj_dir=proj_dir,
+        dims=dims,
+        ctx_len=ctx_len,
+        epoch_steps=epoch_steps,
+        epoch_count=1,
+        devices=devices,
+        strategy=strategy,
+        sft_masked_fused_ce_chunk=fused_chunk,
+        extra_args=common_extra_args + ["--save_at_step", str(save_step)],
+    )
+    first_output = _run_train_py(first_command, "train.py SFT DeepSpeed shuffle resume source")
+    step_checkpoint = proj_dir / f"rwkv-step-{save_step}.pth"
+    assert step_checkpoint.is_dir(), f"expected DeepSpeed checkpoint directory: {step_checkpoint}"
+
+    resume_command = _train_py_command(
+        load_model=step_checkpoint,
+        prefix=prefix,
+        proj_dir=proj_dir,
+        dims=dims,
+        ctx_len=ctx_len,
+        epoch_steps=epoch_steps,
+        epoch_count=1,
+        devices=devices,
+        strategy=strategy,
+        sft_masked_fused_ce_chunk=fused_chunk,
+        extra_args=common_extra_args,
+    )
+    resume_output = _run_train_py(resume_command, "train.py SFT DeepSpeed shuffle resume")
+    assert "Preloading resume position" in resume_output
+    assert "Resuming trainer state" in resume_output
+    assert "Resuming dataloader at step offset" in resume_output
+    assert "train_shuffle=1" in first_output + resume_output
+
+    summary = {
+        "pad_length": pad_length,
+        "ctx_len": ctx_len,
+        "devices": devices,
+        "strategy": strategy,
+        "docs": docs,
+        "eval_docs": eval_docs,
+        "shuffle_seed": shuffle_seed,
+        "epoch_steps": epoch_steps,
+        "save_step": save_step,
+        "fused_chunk": fused_chunk,
+        "proj_dir": str(proj_dir),
+        "resume_output_tail": resume_output[-4000:],
+    }
+    summary_file = os.environ.get("RWKV_SFT_SHUFFLE_RESUME_SUMMARY_FILE", "")
+    if summary_file:
+        Path(summary_file).expanduser().write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+
+@pytest.mark.cuda
+@pytest.mark.slow
+def test_train_py_sft_shuffle_eval_wandb_loss_matches_baseline(tmp_path):
+    model_path = _require_cuda_smoke("RWKV_RUN_TRAIN_PY_SFT_SHUFFLE_EVAL_WANDB_EQUIV_SMOKE")
+    pad_length = int(os.environ.get("RWKV_SFT_SHUFFLE_EVAL_WANDB_EQUIV_PAD_LENGTH", os.environ.get("RWKV_SFT_SMOKE_PAD_LENGTH", "257")))
+    ctx_len = pad_length - 1
+    assert ctx_len > 0 and ctx_len % 16 == 0, "ctx_len must be positive and divisible by the RWKV7 chunk length 16"
+
+    devices = int(os.environ.get("RWKV_SFT_SMOKE_DEVICES", "2"))
+    strategy = os.environ.get("RWKV_SFT_SMOKE_STRATEGY", "deepspeed_stage_3_offload")
+    if devices < 2:
+        pytest.skip("shuffle eval+wandb equivalence smoke requires RWKV_SFT_SMOKE_DEVICES >= 2")
+    if torch.cuda.device_count() < devices:
+        pytest.skip(f"only {torch.cuda.device_count()} CUDA device(s) visible, need {devices}")
+    if "deepspeed" not in strategy:
+        pytest.skip("shuffle eval+wandb equivalence smoke requires a DeepSpeed strategy")
+
+    state = _load_state_dict(model_path)
+    dims = _infer_rwkv7_dims(state)
+    epoch_steps = int(os.environ.get("RWKV_SFT_SHUFFLE_EVAL_WANDB_EQUIV_STEPS", "2"))
+    tol = float(os.environ.get("RWKV_SFT_SHUFFLE_EVAL_WANDB_EQUIV_LOSS_TOL", "5e-4"))
+    shuffle_seed = int(os.environ.get("RWKV_SFT_SHUFFLE_EVAL_WANDB_EQUIV_SEED", "16180"))
+    docs = int(os.environ.get("RWKV_SFT_SHUFFLE_EVAL_WANDB_EQUIV_DOCS", str(max(devices * (epoch_steps + 2), 16))))
+    eval_docs = int(os.environ.get("RWKV_SFT_SHUFFLE_EVAL_WANDB_EQUIV_HELDOUT_DOCS", str(max(2, devices // 2))))
+    assert docs > eval_docs > 0
+    prefix = _build_synthetic_sft_binidx(
+        tmp_path,
+        pad_length,
+        docs=docs,
+        vocab_size=dims["vocab_size"],
+        name="shuffle_eval_wandb_equiv_sft",
+    )
+    _, split_eval = compute_sft_shuffled_split_indices(docs, eval_docs, seed=shuffle_seed)
+    assert split_eval.tolist() != list(range(docs - eval_docs, docs))
+
+    common_extra_args = [
+        "--sft_train_shuffle",
+        "1",
+        "--sft_train_shuffle_seed",
+        str(shuffle_seed),
+        "--sft_eval_tail_docs",
+        str(eval_docs),
+        "--sft_eval_include_in_train",
+        "1",
+        "--epoch_save",
+        "0",
+        "--save_every_n_steps",
+        "0",
+        "--keep_last_n_checkpoints",
+        "0",
+    ]
+    baseline_proj_dir = tmp_path / "shuffle_eval_wandb_baseline"
+    eval_wandb_proj_dir = tmp_path / "shuffle_eval_wandb_enabled"
+    baseline_command = _train_py_command(
+        load_model=model_path,
+        prefix=prefix,
+        proj_dir=baseline_proj_dir,
+        dims=dims,
+        ctx_len=ctx_len,
+        epoch_steps=epoch_steps,
+        epoch_count=1,
+        devices=devices,
+        strategy=strategy,
+        extra_args=common_extra_args,
+    )
+    eval_wandb_command = _train_py_command(
+        load_model=model_path,
+        prefix=prefix,
+        proj_dir=eval_wandb_proj_dir,
+        dims=dims,
+        ctx_len=ctx_len,
+        epoch_steps=epoch_steps,
+        epoch_count=1,
+        devices=devices,
+        strategy=strategy,
+        extra_args=common_extra_args
+        + [
+            "--wandb",
+            "fake-sft-shuffle-eval-wandb-equiv",
+            "--sft_eval_every_n_steps",
+            "1",
+            "--sft_eval_steps",
+            "1",
+        ],
+    )
+
+    fake_env, fake_wandb_log = _fake_wandb_env(tmp_path)
+    _run_train_py(baseline_command, "train.py SFT shuffle baseline loss equivalence")
+    eval_output = _run_train_py(eval_wandb_command, "train.py SFT shuffle eval+wandb loss equivalence", env=fake_env)
+
+    baseline_loss = _read_train_log_epoch_loss(baseline_proj_dir)
+    eval_wandb_loss = _read_train_log_epoch_loss(eval_wandb_proj_dir)
+    assert abs(baseline_loss - eval_wandb_loss) <= tol, {
+        "baseline_loss": baseline_loss,
+        "eval_wandb_loss": eval_wandb_loss,
+        "tol": tol,
+    }
+
+    wandb_events = [
+        json.loads(line)
+        for line in fake_wandb_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any("train/loss" in event.get("values", {}) for event in wandb_events if event["event"] == "log")
+    assert any("eval/loss" in event.get("values", {}) for event in wandb_events if event["event"] == "log")
+    assert "eval step 1" in (eval_wandb_proj_dir / "train_log.txt").read_text(encoding="utf-8")
+    assert "train_shuffle=1" in eval_output
+
+    summary = {
+        "pad_length": pad_length,
+        "ctx_len": ctx_len,
+        "devices": devices,
+        "strategy": strategy,
+        "docs": docs,
+        "eval_docs": eval_docs,
+        "shuffle_seed": shuffle_seed,
+        "split_eval": split_eval.tolist(),
+        "raw_tail": list(range(docs - eval_docs, docs)),
+        "epoch_steps": epoch_steps,
+        "baseline_loss": baseline_loss,
+        "eval_wandb_loss": eval_wandb_loss,
+        "loss_abs_diff": abs(baseline_loss - eval_wandb_loss),
+        "tol": tol,
+        "output_tail": eval_output[-4000:],
+    }
+    summary_file = os.environ.get("RWKV_SFT_SHUFFLE_EVAL_WANDB_EQUIV_SUMMARY_FILE", "")
+    if summary_file:
+        Path(summary_file).expanduser().write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
 
 @pytest.mark.cuda

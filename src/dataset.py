@@ -48,6 +48,8 @@ class MyDataset(Dataset):
         self.world_size = int(os.environ.get("WORLD_SIZE", 1))
         self.real_epoch = getattr(args, "resume_epoch", args.epoch_begin)
         self.step_offset = getattr(args, "resume_step_offset", 0)
+        self._sft_shuffle_epoch = None
+        self._sft_shuffle_permutation = None
 
         if self.data_type == "binidx":
             assert self.samples_per_epoch == 40320
@@ -72,6 +74,15 @@ class MyDataset(Dataset):
             if args.ctx_len <= 0:
                 raise ValueError("ctx_len must be positive for sft_binidx training.")
             self.sft_pad_token_id = int(getattr(args, "sft_pad_token_id", 65532))
+            self.sft_train_shuffle = int(getattr(args, "sft_train_shuffle", 0) or 0)
+            if self.sft_train_shuffle not in (0, 1):
+                raise ValueError("sft_train_shuffle must be 0 or 1.")
+            shuffle_seed = getattr(args, "sft_train_shuffle_seed", 1234)
+            if shuffle_seed is None:
+                shuffle_seed = 1234
+            self.sft_train_shuffle_seed = int(shuffle_seed)
+            if self.sft_train_shuffle_seed < 0:
+                raise ValueError("sft_train_shuffle_seed must be non-negative.")
             self.sft_eval_tail_count = compute_sft_tail_eval_count(
                 len(self.data),
                 float(getattr(args, "sft_eval_tail_ratio", 0.0) or 0.0),
@@ -95,10 +106,30 @@ class MyDataset(Dataset):
             rank_zero_info(
                 f"SFT mask data = {mask_file}; split={self.sft_split} "
                 f"docs={self.sft_doc_count}/{len(self.data)} eval_tail={self.sft_eval_tail_count} "
-                f"eval_include_in_train={self.sft_eval_include_in_train}"
+                f"eval_include_in_train={self.sft_eval_include_in_train} "
+                f"train_shuffle={self.sft_train_shuffle} shuffle_seed={self.sft_train_shuffle_seed}"
             )
         else:
             raise ValueError(f"Unsupported data_type: {self.data_type}")
+
+    def _sft_epoch_permutation(self, epoch: int):
+        epoch = int(epoch)
+        if self._sft_shuffle_epoch != epoch or self._sft_shuffle_permutation is None:
+            rng = np.random.default_rng(self.sft_train_shuffle_seed + epoch)
+            self._sft_shuffle_permutation = rng.permutation(self.sft_doc_count)
+            self._sft_shuffle_epoch = epoch
+        return self._sft_shuffle_permutation
+
+    def _sft_doc_index_from_sample(self, sample_index: int, epoch: int, epoch_sample_index: int | None = None) -> int:
+        if self.sft_split == "train" and self.sft_train_shuffle:
+            if epoch_sample_index is None:
+                epoch_sample_index = sample_index - int(epoch) * self.samples_per_epoch
+            offset = int(epoch_sample_index % self.sft_doc_count)
+            offset = int(self._sft_epoch_permutation(epoch)[offset])
+            return self.sft_doc_start + offset
+
+        offset = int(sample_index % self.sft_doc_count)
+        return self.sft_doc_start + offset
 
     def __len__(self):
         if self.data_type == "sft_binidx":
@@ -121,11 +152,12 @@ class MyDataset(Dataset):
         if getattr(self, "data_type", getattr(args, "data_type", "binidx")) == "sft_binidx":
             step_offset *= self.accumulate_grad_batches
         logical_idx = idx + step_offset * args.micro_bsz
-        sample_index = epoch * self.samples_per_epoch + (logical_idx * world_size) + rank
+        epoch_sample_index = (logical_idx * world_size) + rank
+        sample_index = epoch * self.samples_per_epoch + epoch_sample_index
 
         data_type = getattr(self, "data_type", getattr(args, "data_type", "binidx"))
         if data_type == "sft_binidx":
-            doc_index = self.sft_doc_start + (sample_index % self.sft_doc_count)
+            doc_index = self._sft_doc_index_from_sample(sample_index, epoch, epoch_sample_index)
             token_ids = self.data[doc_index].astype(int)
             loss_mask = self.mask_data[doc_index].astype(int)
             if not np.isin(loss_mask, [0, 1]).all():

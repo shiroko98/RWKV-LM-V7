@@ -181,6 +181,23 @@ def validate_sft_eval_settings(args):
             raise ValueError("SFT eval requires sft_eval_tail_ratio > 0 or sft_eval_tail_docs > 0.")
 
 
+def validate_sft_train_shuffle_settings(args):
+    enabled = int(getattr(args, "sft_train_shuffle", 0) or 0)
+    if enabled not in (0, 1):
+        raise ValueError("sft_train_shuffle must be 0 or 1.")
+    seed = getattr(args, "sft_train_shuffle_seed", 1234)
+    if seed is None:
+        seed = 1234
+    try:
+        seed = int(seed)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("sft_train_shuffle_seed must be a non-negative integer.") from exc
+    if seed < 0:
+        raise ValueError("sft_train_shuffle_seed must be a non-negative integer.")
+    args.sft_train_shuffle = enabled
+    args.sft_train_shuffle_seed = seed
+
+
 def validate_sft_loss_settings(args):
     if getattr(args, "sft_masked_ce_chunk", 0) < 0:
         raise ValueError("sft_masked_ce_chunk must be a non-negative integer.")
@@ -262,6 +279,8 @@ if __name__ == "__main__":  # pragma: no cover
     parser.add_argument("--sft_eval_include_in_train", default=0, type=int)  # 1 means eval tail is also used by train
     parser.add_argument("--sft_eval_every_n_steps", default=0, type=int)  # SFT only: run tail-split eval every N optimizer steps
     parser.add_argument("--sft_eval_steps", default=0, type=int)  # SFT only: eval micro-batch steps per rank
+    parser.add_argument("--sft_train_shuffle", default=0, type=int)  # SFT only: 1 shuffles train docs with an epoch-stable permutation
+    parser.add_argument("--sft_train_shuffle_seed", default=1234, type=int)  # SFT only: seed for train doc permutation
     parser.add_argument("--vocab_size", default=0, type=int)  # vocab_size = 0 means auto (for char-level LM and .txt data)
 
     parser.add_argument("--ctx_len", default=1024, type=int)
@@ -380,6 +399,7 @@ if __name__ == "__main__":  # pragma: no cover
     args.betas = (args.beta1, args.beta2)
     validate_sft_loss_settings(args)
     validate_sft_eval_settings(args)
+    validate_sft_train_shuffle_settings(args)
     args.real_bsz = int(args.num_nodes) * int(args.devices) * args.micro_bsz
     configure_batch_sizes(args)
     os.environ["DEEPSPEED_TIMEOUT"] = str(args.dist_timeout_sec)

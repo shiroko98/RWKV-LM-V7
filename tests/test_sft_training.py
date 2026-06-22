@@ -58,6 +58,8 @@ def make_sft_args(prefix: str, **overrides):
         sft_eval_tail_docs=0,
         sft_eval_every_n_steps=0,
         sft_eval_steps=0,
+        sft_train_shuffle=0,
+        sft_train_shuffle_seed=1234,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -150,6 +152,46 @@ def test_sft_dataset_uses_gradient_accumulation_for_length_epoch_and_resume(tmp_
     assert torch.equal(mask_resume, torch.tensor([1, 0, 0], dtype=torch.float32))
 
 
+def test_sft_dataset_can_shuffle_train_documents_by_epoch_seed(tmp_path):
+    prefix = str(tmp_path / "sft_shuffle")
+    write_documents(
+        prefix,
+        [
+            EncodedDocument(input_ids=[base, base + 1], loss_mask=[0, 1])
+            for base in range(0, 70, 10)
+        ],
+    )
+    args = make_sft_args(
+        prefix,
+        ctx_len=3,
+        epoch_steps=4,
+        sft_eval_tail_docs=2,
+        sft_eval_steps=2,
+        sft_train_shuffle=1,
+        sft_train_shuffle_seed=7,
+    )
+    train_dataset = dataset_mod.MyDataset(args, sft_split="train")
+    eval_dataset = dataset_mod.MyDataset(args, sft_split="eval")
+
+    epoch0 = np.random.default_rng(7).permutation(5).tolist()
+    epoch1 = np.random.default_rng(8).permutation(5).tolist()
+
+    train_x0, _, _ = train_dataset[0]
+    train_x1, _, _ = train_dataset[1]
+    assert int(train_x0[0].item() // 10) == epoch0[0]
+    assert int(train_x1[0].item() // 10) == epoch0[1]
+
+    train_dataset.real_epoch = 1
+    epoch_x0, _, _ = train_dataset[0]
+    assert int(epoch_x0[0].item() // 10) == epoch1[0]
+    assert train_dataset._sft_doc_index_from_sample(5, 1) == epoch1[1]
+
+    eval_x0, _, _ = eval_dataset[0]
+    eval_x1, _, _ = eval_dataset[1]
+    assert torch.equal(eval_x0, torch.tensor([50, 51, 65532], dtype=torch.long))
+    assert torch.equal(eval_x1, torch.tensor([60, 61, 65532], dtype=torch.long))
+
+
 def test_sft_tail_eval_split_excludes_eval_docs_from_train_and_reads_tail(tmp_path):
     prefix = str(tmp_path / "sft_tail_eval")
     write_documents(
@@ -232,6 +274,7 @@ def test_sft_tail_eval_overlap_allows_full_eval_tail(tmp_path):
     assert train_dataset.sft_doc_count == 3
     assert eval_dataset.sft_doc_start == 0
     assert eval_dataset.sft_doc_count == 3
+    assert len(eval_dataset) == 3
 
     train_x0, _, _ = train_dataset[0]
     eval_x0, _, _ = eval_dataset[0]
@@ -308,6 +351,68 @@ def test_sft_dataset_initialization_validation_branches(monkeypatch):
     monkeypatch.setattr(dataset_mod, "MMapIndexedDataset", lambda path: DummyMMap([3]))
     with pytest.raises(ValueError, match="Unsupported"):
         dataset_mod.MyDataset(args(data_type="utf-8"))
+
+    monkeypatch.setattr(dataset_mod, "MMapIndexedDataset", lambda path: DummyMMap([3]))
+    with pytest.raises(ValueError, match="Unsupported SFT split"):
+        dataset_mod.MyDataset(args(), sft_split="bad")
+
+    monkeypatch.setattr(dataset_mod, "MMapIndexedDataset", lambda path: DummyMMap([3]))
+    with pytest.raises(ValueError, match="sft_train_shuffle"):
+        dataset_mod.MyDataset(args(sft_train_shuffle=2))
+
+    monkeypatch.setattr(dataset_mod, "MMapIndexedDataset", lambda path: DummyMMap([3]))
+    with pytest.raises(ValueError, match="sft_train_shuffle_seed"):
+        dataset_mod.MyDataset(args(sft_train_shuffle_seed=-1))
+
+    monkeypatch.setattr(dataset_mod, "MMapIndexedDataset", lambda path: DummyMMap([3]))
+    dataset = dataset_mod.MyDataset(args(sft_train_shuffle_seed=None))
+    assert dataset.sft_train_shuffle_seed == 1234
+
+    monkeypatch.setattr(dataset_mod, "MMapIndexedDataset", lambda path: DummyMMap([3]))
+    with pytest.raises(ValueError, match="eval split"):
+        dataset_mod.MyDataset(args(), sft_split="eval")
+
+    monkeypatch.setattr(dataset_mod, "MMapIndexedDataset", lambda path: DummyMMap([3]))
+    monkeypatch.setattr(dataset_mod, "compute_sft_tail_eval_count", lambda *_, **__: 1)
+    with pytest.raises(ValueError, match="train split has no documents"):
+        dataset_mod.MyDataset(args())
+
+
+def test_pretrain_binidx_dataset_path_reads_magic_prime_schedule(monkeypatch):
+    class DummyIndex:
+        _dtype_size = 2
+
+    class DummyPretrainMMap:
+        _index = DummyIndex()
+
+        def __init__(self, path):
+            self._bin_buffer = bytes(10 * self._index._dtype_size)
+
+        def get(self, idx, offset, length):
+            return np.arange(offset, offset + length, dtype=np.int64)
+
+    monkeypatch.setattr(dataset_mod, "MMapIndexedDataset", DummyPretrainMMap)
+    args = SimpleNamespace(
+        vocab_size=65536,
+        data_file="dummy",
+        data_type="binidx",
+        epoch_steps=40320,
+        real_bsz=1,
+        train_stage=0,
+        ctx_len=2,
+        magic_prime=5,
+        epoch_begin=0,
+        resume_epoch=0,
+        resume_step_offset=0,
+        micro_bsz=1,
+        accumulate_grad_batches=4,
+    )
+
+    dataset = dataset_mod.MyDataset(args)
+    assert len(dataset) == 40320
+    x, y = dataset[0]
+    assert torch.equal(x, torch.tensor([6, 7], dtype=torch.long))
+    assert torch.equal(y, torch.tensor([7, 8], dtype=torch.long))
 
 
 def test_masked_cross_entropy_matches_manual_selected_token_average():
@@ -435,6 +540,22 @@ def test_configure_epoch_schedule_preserves_sft_steps_and_keeps_pretrain_schedul
         train.configure_epoch_schedule(SimpleNamespace(data_type="sft_binidx", epoch_steps=1, epoch_count=0))
     with pytest.raises(ValueError, match="Unsupported"):
         train.configure_epoch_schedule(SimpleNamespace(data_type="utf-8"))
+
+
+def test_checkpoint_name_and_resume_helpers_cover_deepspeed_branches(tmp_path):
+    assert train.parse_epoch_checkpoint_name("rwkv-init.pth") == -1
+    assert train.parse_epoch_checkpoint_name("rwkv-12.pth") == 12
+    assert train.parse_epoch_checkpoint_name("rwkv-step-12.pth") is None
+    assert train.parse_step_checkpoint_name("rwkv-step-34.pth") == 34
+    assert train.parse_step_checkpoint_name("rwkv-34.pth") is None
+
+    ds_dir = tmp_path / "rwkv-step-1.pth"
+    ds_dir.mkdir()
+    (ds_dir / "latest").write_text("global_step1", encoding="utf-8")
+    assert train.is_deepspeed_checkpoint_dir(str(ds_dir)) is True
+    assert train.resolve_resume_checkpoint_path(str(ds_dir), "deepspeed_stage_3_offload") == str(ds_dir)
+    with pytest.raises(ValueError, match="DeepSpeed sharded"):
+        train.resolve_resume_checkpoint_path(str(ds_dir), "auto")
 
 
 def test_sft_one_pass_overrides_steps_and_epoch_count(monkeypatch):
@@ -670,6 +791,57 @@ def test_probe_sft_binidx_steps_matches_training_dataset_sampling(tmp_path):
         micro_bsz=1,
         accumulate_grad_batches=2,
         epoch_steps=2,
+    )
+    split = probe_sft_binidx_steps.SplitInfo(
+        total_documents=16,
+        train_documents=16,
+        eval_documents=0,
+        eval_include_in_train=0,
+    )
+
+    probed = probe_sft_binidx_steps.doc_indices_for_optimizer_index(1, config, split)
+
+    observed = []
+    for idx in (2, 3):
+        for rank in range(2):
+            dataset.global_rank = rank
+            x, _, _ = dataset[idx]
+            observed.append(int(x[0].item() // 10))
+
+    assert probed == observed
+
+
+def test_probe_sft_binidx_steps_matches_training_dataset_shuffle_sampling(tmp_path):
+    prefix = str(tmp_path / "probe_shuffle_sampling")
+    write_documents(
+        prefix,
+        [
+            EncodedDocument(input_ids=[base, base + 1], loss_mask=[0, 1])
+            for base in range(0, 160, 10)
+        ],
+    )
+    args = make_sft_args(
+        prefix,
+        ctx_len=3,
+        real_bsz=2,
+        epoch_steps=2,
+        accumulate_grad_batches=2,
+        sft_train_shuffle=1,
+        sft_train_shuffle_seed=19,
+    )
+    dataset = dataset_mod.MyDataset(args)
+    dataset.world_size = 2
+    dataset.real_epoch = 1
+
+    config = probe_sft_binidx_steps.BatchConfig(
+        num_nodes=1,
+        devices=2,
+        micro_bsz=1,
+        accumulate_grad_batches=2,
+        epoch_steps=2,
+        epoch_begin=1,
+        sft_train_shuffle=1,
+        sft_train_shuffle_seed=19,
     )
     split = probe_sft_binidx_steps.SplitInfo(
         total_documents=16,
@@ -995,6 +1167,25 @@ def test_validate_sft_loss_settings_accepts_one_backend_and_rejects_invalid_valu
         train.validate_sft_loss_settings(SimpleNamespace(sft_masked_ce_chunk=128, sft_masked_fused_ce_chunk=4096))
 
 
+def test_validate_sft_train_shuffle_settings_normalizes_and_rejects_invalid_values():
+    args = SimpleNamespace(sft_train_shuffle="1", sft_train_shuffle_seed="42")
+    train.validate_sft_train_shuffle_settings(args)
+    assert args.sft_train_shuffle == 1
+    assert args.sft_train_shuffle_seed == 42
+
+    args = SimpleNamespace(sft_train_shuffle=0, sft_train_shuffle_seed=None)
+    train.validate_sft_train_shuffle_settings(args)
+    assert args.sft_train_shuffle == 0
+    assert args.sft_train_shuffle_seed == 1234
+
+    with pytest.raises(ValueError, match="sft_train_shuffle"):
+        train.validate_sft_train_shuffle_settings(SimpleNamespace(sft_train_shuffle=2, sft_train_shuffle_seed=0))
+    with pytest.raises(ValueError, match="sft_train_shuffle_seed"):
+        train.validate_sft_train_shuffle_settings(SimpleNamespace(sft_train_shuffle=1, sft_train_shuffle_seed=-1))
+    with pytest.raises(ValueError, match="sft_train_shuffle_seed"):
+        train.validate_sft_train_shuffle_settings(SimpleNamespace(sft_train_shuffle=1, sft_train_shuffle_seed="bad"))
+
+
 def test_validate_sft_eval_settings():
     train.validate_sft_eval_settings(
         SimpleNamespace(
@@ -1061,6 +1252,50 @@ def test_validate_sft_eval_settings():
                 sft_eval_include_in_train=2,
             )
         )
+    with pytest.raises(ValueError, match="sft_eval_every_n_steps"):
+        train.validate_sft_eval_settings(
+            SimpleNamespace(
+                data_type="sft_binidx",
+                sft_eval_every_n_steps=-1,
+                sft_eval_steps=0,
+                sft_eval_tail_ratio=0.0,
+                sft_eval_tail_docs=0,
+                sft_eval_include_in_train=0,
+            )
+        )
+    with pytest.raises(ValueError, match="sft_eval_steps"):
+        train.validate_sft_eval_settings(
+            SimpleNamespace(
+                data_type="sft_binidx",
+                sft_eval_every_n_steps=0,
+                sft_eval_steps=-1,
+                sft_eval_tail_ratio=0.0,
+                sft_eval_tail_docs=0,
+                sft_eval_include_in_train=0,
+            )
+        )
+    with pytest.raises(ValueError, match="sft_eval_tail_docs"):
+        train.validate_sft_eval_settings(
+            SimpleNamespace(
+                data_type="sft_binidx",
+                sft_eval_every_n_steps=0,
+                sft_eval_steps=0,
+                sft_eval_tail_ratio=0.0,
+                sft_eval_tail_docs=-1,
+                sft_eval_include_in_train=0,
+            )
+        )
+    with pytest.raises(ValueError, match="sft_eval_tail_ratio"):
+        train.validate_sft_eval_settings(
+            SimpleNamespace(
+                data_type="sft_binidx",
+                sft_eval_every_n_steps=0,
+                sft_eval_steps=0,
+                sft_eval_tail_ratio=1.0,
+                sft_eval_tail_docs=0,
+                sft_eval_include_in_train=0,
+            )
+        )
 
 
 def test_configure_deepspeed_zero3_config_applies_sft_tuning_options():
@@ -1099,11 +1334,11 @@ def test_configure_deepspeed_zero3_config_keeps_disabled_options_unchanged():
 
     args = SimpleNamespace(
         strategy="deepspeed_stage_3_offload",
-        ds_bucket_mb=0,
-        ds_offload_pin_memory=-1,
-        ds_stage3_param_persistence_threshold=-1,
-        ds_stage3_prefetch_bucket_size=-1,
-        ds_stage3_max_live_parameters=-1,
+        ds_bucket_mb=None,
+        ds_offload_pin_memory=None,
+        ds_stage3_param_persistence_threshold=None,
+        ds_stage3_prefetch_bucket_size=None,
+        ds_stage3_max_live_parameters=None,
     )
     config = {
         "zero_optimization": {
@@ -1123,6 +1358,7 @@ def test_configure_deepspeed_zero3_config_keeps_disabled_options_unchanged():
     "overrides,match",
     [
         ({"ds_bucket_mb": -1}, "ds_bucket_mb"),
+        ({"ds_bucket_mb": "bad"}, "ds_bucket_mb"),
         ({"ds_offload_pin_memory": 2}, "ds_offload_pin_memory"),
         ({"ds_stage3_param_persistence_threshold": -2}, "ds_stage3_param_persistence_threshold"),
         ({"ds_stage3_prefetch_bucket_size": -2}, "ds_stage3_prefetch_bucket_size"),

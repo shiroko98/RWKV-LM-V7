@@ -31,6 +31,8 @@ class BatchConfig:
     accumulate_grad_batches: int
     epoch_steps: int
     epoch_begin: int = 0
+    sft_train_shuffle: int = 0
+    sft_train_shuffle_seed: int = 1234
 
     @property
     def world_size(self) -> int:
@@ -150,10 +152,35 @@ def sample_indices_for_optimizer_index(optimizer_index: int, config: BatchConfig
     return [base + offset for offset in range(config.effective_bsz)]
 
 
+def epoch_sample_offsets_for_optimizer_index(optimizer_index: int, config: BatchConfig) -> list[int]:
+    if optimizer_index < 0:
+        raise ValueError("optimizer_index must be non-negative.")
+    if config.epoch_steps <= 0:
+        raise ValueError("epoch_steps must be positive.")
+    local_step = optimizer_index % config.epoch_steps
+    base = local_step * config.effective_bsz
+    return [base + offset for offset in range(config.effective_bsz)]
+
+
+@lru_cache(maxsize=16)
+def epoch_permutation(train_documents: int, seed: int, epoch: int) -> tuple[int, ...]:
+    if train_documents <= 0:
+        raise ValueError("train_documents must be positive.")
+    rng = np.random.default_rng(seed + epoch)
+    return tuple(int(index) for index in rng.permutation(train_documents))
+
+
 def doc_indices_for_optimizer_index(optimizer_index: int, config: BatchConfig, split: SplitInfo) -> list[int]:
     if split.train_documents <= 0:
         raise ValueError("train split has no documents.")
-    return [sample % split.train_documents for sample in sample_indices_for_optimizer_index(optimizer_index, config)]
+    if not config.sft_train_shuffle:
+        samples = sample_indices_for_optimizer_index(optimizer_index, config)
+        offsets = [sample % split.train_documents for sample in samples]
+        return offsets
+    epoch = config.epoch_begin + optimizer_index // config.epoch_steps
+    offsets = [sample % split.train_documents for sample in epoch_sample_offsets_for_optimizer_index(optimizer_index, config)]
+    permutation = epoch_permutation(split.train_documents, config.sft_train_shuffle_seed, epoch)
+    return [permutation[offset] for offset in offsets]
 
 
 def window_doc_indices(
@@ -336,6 +363,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-tail-ratio", type=float, default=0.0)
     parser.add_argument("--eval-tail-docs", type=int, default=0)
     parser.add_argument("--eval-include-in-train", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--sft-train-shuffle", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--sft-train-shuffle-seed", type=int, default=1234)
     parser.add_argument(
         "--probe-steps",
         required=True,
@@ -373,6 +402,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     for name in ("ctx_len", "num_nodes", "devices", "micro_bsz", "accumulate_grad_batches", "window_steps"):
         validate_positive(name.replace("_", "-"), int(getattr(args, name)))
+    if args.sft_train_shuffle_seed < 0:
+        raise ValueError("sft-train-shuffle-seed must be non-negative.")
 
     prefix = normalize_prefix(args.data_file)
     total_documents = count_documents(prefix)
@@ -389,6 +420,8 @@ def main(argv: list[str] | None = None) -> int:
         accumulate_grad_batches=args.accumulate_grad_batches,
         epoch_steps=1,
         epoch_begin=args.epoch_begin,
+        sft_train_shuffle=args.sft_train_shuffle,
+        sft_train_shuffle_seed=args.sft_train_shuffle_seed,
     )
     epoch_steps = args.epoch_steps or auto_epoch_steps(split.train_documents, provisional.effective_bsz)
     config = BatchConfig(
@@ -398,6 +431,8 @@ def main(argv: list[str] | None = None) -> int:
         accumulate_grad_batches=args.accumulate_grad_batches,
         epoch_steps=epoch_steps,
         epoch_begin=args.epoch_begin,
+        sft_train_shuffle=args.sft_train_shuffle,
+        sft_train_shuffle_seed=args.sft_train_shuffle_seed,
     )
     steps = parse_probe_steps(args.probe_steps)
 
@@ -430,6 +465,8 @@ def main(argv: list[str] | None = None) -> int:
                 "effective_bsz": config.effective_bsz,
                 "epoch_steps": config.epoch_steps,
                 "samples_per_epoch": config.samples_per_epoch,
+                "sft_train_shuffle": config.sft_train_shuffle,
+                "sft_train_shuffle_seed": config.sft_train_shuffle_seed,
                 "ctx_len": args.ctx_len,
                 "step_base": args.step_base,
                 "note": "No model is loaded; true loss/ppl cannot be computed from binidx alone.",

@@ -63,6 +63,8 @@ SFT_EVAL_TAIL_DOCS="${SFT_EVAL_TAIL_DOCS:-0}"
 SFT_EVAL_INCLUDE_IN_TRAIN="${SFT_EVAL_INCLUDE_IN_TRAIN:-0}"
 SFT_EVAL_EVERY_N_STEPS="${SFT_EVAL_EVERY_N_STEPS:-0}"
 SFT_EVAL_STEPS="${SFT_EVAL_STEPS:-0}"
+SFT_TRAIN_SHUFFLE="${SFT_TRAIN_SHUFFLE:-0}"
+SFT_TRAIN_SHUFFLE_SEED="${SFT_TRAIN_SHUFFLE_SEED:-1234}"
 
 MICRO_BSZ="${MICRO_BSZ:-1}"
 ACCUMULATE_GRAD_BATCHES="${ACCUMULATE_GRAD_BATCHES:-1}"
@@ -124,6 +126,7 @@ python train.py --load_model "$LOAD_MODEL" --wandb "${WANDB_PROJECT:-}" --proj_d
  --sft_one_pass "$SFT_ONE_PASS" \
  --sft_eval_tail_ratio "$SFT_EVAL_TAIL_RATIO" --sft_eval_tail_docs "$SFT_EVAL_TAIL_DOCS" --sft_eval_include_in_train "$SFT_EVAL_INCLUDE_IN_TRAIN" \
  --sft_eval_every_n_steps "$SFT_EVAL_EVERY_N_STEPS" --sft_eval_steps "$SFT_EVAL_STEPS" \
+ --sft_train_shuffle "$SFT_TRAIN_SHUFFLE" --sft_train_shuffle_seed "$SFT_TRAIN_SHUFFLE_SEED" \
  --data_file "$DATA_FILE" --sft_masked_ce_chunk "$SFT_MASKED_CE_CHUNK" --sft_masked_fused_ce_chunk "$SFT_MASKED_FUSED_CE_CHUNK" \
  --num_nodes "$N_NODE" --micro_bsz "$MICRO_BSZ" --accumulate_grad_batches "$ACCUMULATE_GRAD_BATCHES" --n_layer "$N_LAYER" --n_embd "$N_EMBD" --dim_ffn "$DIM_FFN" --kernel "$KERNEL" \
  --lr_init "$LR_INIT" --lr_final "$LR_FINAL" --lr_wsd_decay_iters "$LR_WSD_DECAY_ITERS" --lr_wsd_decay_style "$LR_WSD_DECAY_STYLE" --warmup_steps "$WARMUP_STEPS" --beta1 0.9 --beta2 0.99 --adam_eps 1e-18 \

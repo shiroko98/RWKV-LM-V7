@@ -389,6 +389,8 @@ python train.py \
 
 这个通用示例里，`--accelerator gpu` 表示用 CUDA GPU 训练，`--devices 1` 表示当前节点使用 1 张 GPU。如果要在单节点做多卡 DeepSpeed，把 `--devices` 改成 GPU 数量，比如 `--devices 8`；当 `strategy` 包含 `deepspeed`、`num_nodes=1` 且 `devices > 1` 时，`train.py` 会自动用 `torchrun` 重启多卡进程。SFT 调度里，`real_bsz = num_nodes * devices * micro_bsz` 表示每次 forward 的全局样本数，`effective_bsz = real_bsz * accumulate_grad_batches` 表示每个 optimizer step 消耗的样本数。这里故意不写 `--my_exit_tokens`，因为 SFT 由 `--epoch_count` 或 `--sft_one_pass` 控制停止；`my_exit_tokens` 是预训练 token-limit 调度的一部分。`--lr_wsd_decay_iters 0` 表示关闭 SFT 专用末段衰减，warmup 后保持 `lr_init`；如果设为正数，例如 `--lr_wsd_decay_iters 1000 --lr_wsd_decay_style cosine`，训练最后 1000 个 optimizer step 会按 cosine 从 `lr_init` 衰减到 `lr_final`。`lr_wsd_decay_style` 支持 `none`、`linear`、`cosine`。
 
+训练阶段的 SFT document shuffle 默认关闭。需要打乱时设置 `--sft_train_shuffle 1 --sft_train_shuffle_seed 1234`，它会在 `MyDataset` 内部对每个 epoch 的 train sample offset 应用该 epoch 固定的确定性 permutation；这样仍保留原来的多 rank / 梯度累计采样流和断点续训 offset。尾部 eval split 不会被打乱。如果用 `scripts/probe_sft_binidx_steps.py` 检查已开启 shuffle 的训练 step，也要传相同的 `--sft-train-shuffle 1 --sft-train-shuffle-seed 1234`，否则 probe 报出的 doc index 会按未打乱顺序解释。
+
 训练端使用 next-token label，所以每个 SFT document 需要提供 `ctx_len + 1` 个 token。document 比这个短时，dataloader 会在内存里用 `--sft_pad_token_id` padding，并把 padding mask 设为 `0`；document 更长时会直接报错。为了让训练长度稳定，建议预处理时使用 `--ctx-len CTX_LEN --pack` 或 `--ctx-len CTX_LEN --pad`，预处理会自动写出 `CTX_LEN + 1` 个 token，训练时再设置 `--ctx_len CTX_LEN`。RWKV7 x070 的 `ctx_len` 需要能被 16 整除。
 
 `--sft_masked_ce_chunk` 目前先保持 `0`。`0` 表示关闭实验性的 Python 分块 masked-head CE，SFT 默认走旧的完整 logits masked CE；这个设置本身不会引入额外分块、checkpoint 重算或 ZeRO-3 反复 all-gather 的效率损耗。注意它仍会物化完整 `[batch, ctx_len, vocab]` logits，所以长上下文显存压力仍然很大。正数 Python chunk 路径虽然能降低 Python loss 侧的 logits 峰值，但服务器反馈 `4096/8192` 在 13B + ZeRO-3 长上下文下仍会 timeout，因此生产训练不要开启。
@@ -415,7 +417,7 @@ SFT mask 训练的实现框架：
 1. 离线数据处理阶段只负责生成两套完全对齐的 binidx：主数据 `PREFIX.bin/.idx` 存 token id，sidecar `PREFIX.mask.bin/.idx` 存同长度的 `0/1` loss mask。
 2. `train.py` 通过 `--data_type sft_binidx` 进入 SFT 分支。这个分支不使用预训练的 magic-prime 调度，而是保留用户传入的 `--epoch_steps` 和 `--epoch_count`，并把 Lightning `max_epochs` 设为 `epoch_count`，所以 SFT 会按指定 epoch 数正常结束。启用 `--accumulate_grad_batches G` 时，`epoch_steps` 仍然表示 optimizer step 数；dataloader 会为每个 epoch 提供 `epoch_steps * G` 个 micro-batch。
    如果启用 `--sft_one_pass 1`，这个分支会覆盖手写的 `epoch_steps/epoch_count`，自动设置为“完整跑一遍数据”的步数和 `epoch_count=1`。
-3. `src/dataset.py` 的 `MyDataset` 会加载 `--data_file` 指向的 token binidx，同时默认加载 `--data_file.mask`。如果你传了 `--sft_mask_file`，就用显式 mask 前缀。初始化时会检查 token 和 mask 的 document 数量、每个 document 长度必须完全一致。
+3. `src/dataset.py` 的 `MyDataset` 会加载 `--data_file` 指向的 token binidx，同时默认加载 `--data_file.mask`。如果你传了 `--sft_mask_file`，就用显式 mask 前缀。初始化时会检查 token 和 mask 的 document 数量、每个 document 长度必须完全一致。`--sft_train_shuffle 1` 会用 `--sft_train_shuffle_seed` 对每个 epoch 内的训练 sample offset 做确定性 epoch permutation；eval split 保持顺序读取。
 4. 每个 SFT document 最长允许 `ctx_len + 1` 个 token。短 document 会在内存中用 `--sft_pad_token_id` padding 到 `ctx_len + 1`，padding mask 始终为 `0`；长 document 直接报错，避免静默截断破坏 mask。
 5. dataloader 返回三元组 `(x, y, loss_mask)`：`x = token_ids[:-1]`，`y = token_ids[1:]`，`loss_mask = raw_mask[1:]`。mask 右移是为了和 next-token label 对齐，也就是 mask 标记的是“这个 target token 是否参与 loss”。
 6. `src/model.py` 的 `training_step` 根据 batch 长度分流：普通预训练 `(x, y)` 继续走原来的 fused CE 快路径；SFT `(x, y, loss_mask)` 默认走 `src/sft_loss.py::masked_cross_entropy`。这样 SFT 不影响预训练性能路径。
@@ -649,6 +651,7 @@ bash run_13b_sft_zero3_offload.sh
 - `SFT_EVAL_TAIL_RATIO` / `SFT_EVAL_TAIL_DOCS`：从同一份 SFT binidx 尾部切出 eval split。`SFT_EVAL_TAIL_DOCS` 为正数时优先，否则按 ratio 向上取整；不需要额外生成第二份 eval binidx。
 - `SFT_EVAL_INCLUDE_IN_TRAIN`：`0` 表示 held-out eval，尾部 eval documents 会从训练集中排除，one-pass step 也按 train documents 计算，此时 tail ratio 必须小于 `1`；`1` 表示 overlap 模式，训练仍使用全量 documents，eval 只作为固定尾部监控集，此时可以设 `SFT_EVAL_TAIL_RATIO=1` 让 eval 也覆盖全量数据。
 - `SFT_EVAL_EVERY_N_STEPS` / `SFT_EVAL_STEPS`：每隔 N 个 optimizer step 跑一次 SFT eval，每次每个 rank 跑指定数量的 eval micro-batch。如果同一个 step 同时命中保存和 eval，两者都会执行。eval 会写入 `train_log.txt` 和 wandb 的 `eval/loss`、`eval/ppl`、`eval/mask_tokens`、`eval/docs`。
+- `SFT_TRAIN_SHUFFLE` / `SFT_TRAIN_SHUFFLE_SEED`：训练阶段 SFT document shuffle。默认 `0` 和 `1234`；设为 `SFT_TRAIN_SHUFFLE=1` 后，会在不改变 DataLoader 多卡分片方式的前提下，对训练 document 做按 epoch 固定的确定性 permutation。eval tail 保持顺序读取。
 - `GRAD_CP`：激活检查点。`1` 表示对 block 开启 checkpointing，省显存但更慢；显存足够时可设 `0`。
 - `SFT_MASKED_CE_CHUNK`：SFT masked loss 的实验性 head/CE 分块大小。生产默认保持 `0`，使用完整 logits masked CE；`0` 本身没有额外分块效率损耗，但会物化完整 logits。正数会只对 mask=1 的 target token 分块计算 head 和 CE，目前在 13B ZeRO-3 长上下文下会 timeout，暂不推荐生产使用。
 - `SFT_MASKED_FUSED_CE_CHUNK`：新的 CUDA fused masked head CE 内部 chunk 行数。13B 脚本默认 `4096`，这是当前 ctx86016 SFT 的推荐生产路径；若长跑偶发 OOM，可先降到 `2048`。不要和 `SFT_MASKED_CE_CHUNK` 同时设为正数。

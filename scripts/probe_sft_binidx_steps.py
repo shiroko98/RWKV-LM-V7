@@ -20,7 +20,7 @@ if str(ROOT) not in sys.path:  # pragma: no cover - depends on invocation cwd.
     sys.path.insert(0, str(ROOT))
 
 from src.binidx import MMapIndexedDataset, index_file_path  # noqa: E402
-from src.sft_split import compute_sft_tail_eval_count  # noqa: E402
+from src.sft_split import compute_sft_shuffled_split_indices, compute_sft_tail_eval_count  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -57,6 +57,13 @@ class SplitInfo:
     train_documents: int
     eval_documents: int
     eval_include_in_train: int
+    train_doc_indices: tuple[int, ...] | None = None
+    eval_doc_indices: tuple[int, ...] | None = None
+
+    def train_doc_index(self, offset: int) -> int:
+        if self.train_doc_indices is not None:
+            return self.train_doc_indices[int(offset)]
+        return int(offset)
 
 
 def normalize_prefix(path: str) -> str:
@@ -79,6 +86,8 @@ def compute_split_info(
     eval_tail_ratio: float,
     eval_tail_docs: int,
     eval_include_in_train: int,
+    sft_train_shuffle: int = 0,
+    sft_train_shuffle_seed: int = 1234,
 ) -> SplitInfo:
     eval_documents = compute_sft_tail_eval_count(
         total_documents,
@@ -87,11 +96,25 @@ def compute_split_info(
         require_train_docs=not bool(eval_include_in_train),
     )
     train_documents = total_documents if eval_include_in_train else total_documents - eval_documents
+    train_doc_indices = None
+    eval_doc_indices = None
+    if sft_train_shuffle and eval_documents > 0:
+        train_indices, eval_indices = compute_sft_shuffled_split_indices(
+            total_documents,
+            eval_documents,
+            eval_include_in_train=bool(eval_include_in_train),
+            seed=sft_train_shuffle_seed,
+        )
+        eval_doc_indices = tuple(int(index) for index in eval_indices.tolist())
+        if not eval_include_in_train:
+            train_doc_indices = tuple(int(index) for index in train_indices.tolist())
     return SplitInfo(
         total_documents=total_documents,
         train_documents=train_documents,
         eval_documents=eval_documents,
         eval_include_in_train=eval_include_in_train,
+        train_doc_indices=train_doc_indices,
+        eval_doc_indices=eval_doc_indices,
     )
 
 
@@ -176,11 +199,11 @@ def doc_indices_for_optimizer_index(optimizer_index: int, config: BatchConfig, s
     if not config.sft_train_shuffle:
         samples = sample_indices_for_optimizer_index(optimizer_index, config)
         offsets = [sample % split.train_documents for sample in samples]
-        return offsets
+        return [split.train_doc_index(offset) for offset in offsets]
     epoch = config.epoch_begin + optimizer_index // config.epoch_steps
     offsets = [sample % split.train_documents for sample in epoch_sample_offsets_for_optimizer_index(optimizer_index, config)]
     permutation = epoch_permutation(split.train_documents, config.sft_train_shuffle_seed, epoch)
-    return [permutation[offset] for offset in offsets]
+    return [split.train_doc_index(permutation[offset]) for offset in offsets]
 
 
 def window_doc_indices(
@@ -412,6 +435,8 @@ def main(argv: list[str] | None = None) -> int:
         eval_tail_ratio=args.eval_tail_ratio,
         eval_tail_docs=args.eval_tail_docs,
         eval_include_in_train=args.eval_include_in_train,
+        sft_train_shuffle=args.sft_train_shuffle,
+        sft_train_shuffle_seed=args.sft_train_shuffle_seed,
     )
     provisional = BatchConfig(
         num_nodes=args.num_nodes,
@@ -467,6 +492,8 @@ def main(argv: list[str] | None = None) -> int:
                 "samples_per_epoch": config.samples_per_epoch,
                 "sft_train_shuffle": config.sft_train_shuffle,
                 "sft_train_shuffle_seed": config.sft_train_shuffle_seed,
+                "train_doc_indices_shuffled": split.train_doc_indices is not None,
+                "eval_doc_indices_shuffled": split.eval_doc_indices is not None,
                 "ctx_len": args.ctx_len,
                 "step_base": args.step_base,
                 "note": "No model is loaded; true loss/ppl cannot be computed from binidx alone.",

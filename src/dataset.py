@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import Dataset
 from pytorch_lightning.utilities import rank_zero_info
 from .binidx import MMapIndexedDataset
-from .sft_split import compute_sft_tail_eval_count
+from .sft_split import compute_sft_shuffled_split_indices, compute_sft_tail_eval_count
 
 def is_prime(n):
     if n <= 1:
@@ -50,6 +50,7 @@ class MyDataset(Dataset):
         self.step_offset = getattr(args, "resume_step_offset", 0)
         self._sft_shuffle_epoch = None
         self._sft_shuffle_permutation = None
+        self.sft_doc_indices = None
 
         if self.data_type == "binidx":
             assert self.samples_per_epoch == 40320
@@ -90,15 +91,32 @@ class MyDataset(Dataset):
                 require_train_docs=not int(getattr(args, "sft_eval_include_in_train", 0) or 0),
             )
             self.sft_eval_include_in_train = int(getattr(args, "sft_eval_include_in_train", 0) or 0)
+            split_train_indices = None
+            split_eval_indices = None
+            if self.sft_train_shuffle and self.sft_eval_tail_count > 0:
+                split_train_indices, split_eval_indices = compute_sft_shuffled_split_indices(
+                    len(self.data),
+                    self.sft_eval_tail_count,
+                    eval_include_in_train=bool(self.sft_eval_include_in_train),
+                    seed=self.sft_train_shuffle_seed,
+                )
             if self.sft_split == "eval":
                 if self.sft_eval_tail_count <= 0:
                     raise ValueError("SFT eval split requires sft_eval_tail_ratio > 0 or sft_eval_tail_docs > 0.")
-                self.sft_doc_start = len(self.data) - self.sft_eval_tail_count
-                self.sft_doc_count = self.sft_eval_tail_count
+                if split_eval_indices is not None:
+                    self.sft_doc_start = 0
+                    self.sft_doc_indices = split_eval_indices
+                    self.sft_doc_count = len(split_eval_indices)
+                else:
+                    self.sft_doc_start = len(self.data) - self.sft_eval_tail_count
+                    self.sft_doc_count = self.sft_eval_tail_count
             else:
                 self.sft_doc_start = 0
                 if self.sft_eval_include_in_train:
                     self.sft_doc_count = len(self.data)
+                elif split_train_indices is not None:
+                    self.sft_doc_indices = split_train_indices
+                    self.sft_doc_count = len(split_train_indices)
                 else:
                     self.sft_doc_count = len(self.data) - self.sft_eval_tail_count
             if self.sft_doc_count <= 0:
@@ -126,9 +144,14 @@ class MyDataset(Dataset):
                 epoch_sample_index = sample_index - int(epoch) * self.samples_per_epoch
             offset = int(epoch_sample_index % self.sft_doc_count)
             offset = int(self._sft_epoch_permutation(epoch)[offset])
-            return self.sft_doc_start + offset
+            return self._sft_doc_index_from_offset(offset)
 
         offset = int(sample_index % self.sft_doc_count)
+        return self._sft_doc_index_from_offset(offset)
+
+    def _sft_doc_index_from_offset(self, offset: int) -> int:
+        if self.sft_doc_indices is not None:
+            return int(self.sft_doc_indices[int(offset)])
         return self.sft_doc_start + offset
 
     def __len__(self):

@@ -17,7 +17,11 @@ import train
 from src import dataset as dataset_mod
 from src import lr_schedule
 from src import trainer as trainer_mod
-from src.sft_split import compute_sft_tail_eval_count, compute_sft_train_document_count
+from src.sft_split import (
+    compute_sft_shuffled_split_indices,
+    compute_sft_tail_eval_count,
+    compute_sft_train_document_count,
+)
 from src.sft_binidx import EncodedDocument, write_documents
 from src.sft_loss import masked_cross_entropy, masked_head_cross_entropy
 
@@ -173,23 +177,34 @@ def test_sft_dataset_can_shuffle_train_documents_by_epoch_seed(tmp_path):
     train_dataset = dataset_mod.MyDataset(args, sft_split="train")
     eval_dataset = dataset_mod.MyDataset(args, sft_split="eval")
 
-    epoch0 = np.random.default_rng(7).permutation(5).tolist()
-    epoch1 = np.random.default_rng(8).permutation(5).tolist()
+    split_train, split_eval = compute_sft_shuffled_split_indices(7, 2, seed=7)
+    epoch0 = np.random.default_rng(7).permutation(len(split_train)).tolist()
+    epoch1 = np.random.default_rng(8).permutation(len(split_train)).tolist()
 
     train_x0, _, _ = train_dataset[0]
     train_x1, _, _ = train_dataset[1]
-    assert int(train_x0[0].item() // 10) == epoch0[0]
-    assert int(train_x1[0].item() // 10) == epoch0[1]
+    assert int(train_x0[0].item() // 10) == int(split_train[epoch0[0]])
+    assert int(train_x1[0].item() // 10) == int(split_train[epoch0[1]])
 
     train_dataset.real_epoch = 1
     epoch_x0, _, _ = train_dataset[0]
-    assert int(epoch_x0[0].item() // 10) == epoch1[0]
-    assert train_dataset._sft_doc_index_from_sample(5, 1) == epoch1[1]
+    assert int(epoch_x0[0].item() // 10) == int(split_train[epoch1[0]])
+    assert train_dataset._sft_doc_index_from_sample(5, 1) == int(split_train[epoch1[1]])
+    assert set(train_dataset.sft_doc_indices.tolist()).isdisjoint(set(eval_dataset.sft_doc_indices.tolist()))
 
     eval_x0, _, _ = eval_dataset[0]
     eval_x1, _, _ = eval_dataset[1]
-    assert torch.equal(eval_x0, torch.tensor([50, 51, 65532], dtype=torch.long))
-    assert torch.equal(eval_x1, torch.tensor([60, 61, 65532], dtype=torch.long))
+    expected_eval_x0 = torch.tensor(
+        [int(split_eval[0]) * 10, int(split_eval[0]) * 10 + 1, 65532],
+        dtype=torch.long,
+    )
+    expected_eval_x1 = torch.tensor(
+        [int(split_eval[1]) * 10, int(split_eval[1]) * 10 + 1, 65532],
+        dtype=torch.long,
+    )
+    assert torch.equal(eval_x0, expected_eval_x0)
+    assert torch.equal(eval_x1, expected_eval_x1)
+    assert [int(split_eval[0]), int(split_eval[1])] != [5, 6]
 
 
 def test_sft_tail_eval_split_excludes_eval_docs_from_train_and_reads_tail(tmp_path):
@@ -678,13 +693,47 @@ def test_sft_tail_eval_count_helper():
     assert compute_sft_tail_eval_count(100, tail_ratio=0.2, tail_docs=7) == 7
     assert compute_sft_train_document_count(100, tail_ratio=0.2, tail_docs=0) == 80
 
+    with pytest.raises(ValueError, match="document_count"):
+        compute_sft_tail_eval_count(0)
     with pytest.raises(ValueError, match="ratio"):
         compute_sft_tail_eval_count(100, tail_ratio=1.1)
     with pytest.raises(ValueError, match="tail_docs"):
         compute_sft_tail_eval_count(100, tail_docs=-1)
     with pytest.raises(ValueError, match="no training"):
         compute_sft_tail_eval_count(1, tail_ratio=0.5)
+    with pytest.raises(ValueError, match="exceed"):
+        compute_sft_tail_eval_count(10, tail_docs=11, require_train_docs=False)
     assert compute_sft_tail_eval_count(1, tail_ratio=1.0, require_train_docs=False) == 1
+
+    train_indices, eval_indices = compute_sft_shuffled_split_indices(10, 2, seed=5)
+    assert len(train_indices) == 8
+    assert len(eval_indices) == 2
+    assert set(train_indices.tolist()).isdisjoint(set(eval_indices.tolist()))
+    assert eval_indices.tolist() != [8, 9]
+
+    overlap_train, overlap_eval = compute_sft_shuffled_split_indices(
+        10,
+        10,
+        eval_include_in_train=True,
+        seed=5,
+    )
+    assert sorted(overlap_train.tolist()) == list(range(10))
+    assert sorted(overlap_eval.tolist()) == list(range(10))
+
+    full_train, empty_eval = compute_sft_shuffled_split_indices(10, 0, seed=5)
+    assert sorted(full_train.tolist()) == list(range(10))
+    assert empty_eval.tolist() == []
+
+    with pytest.raises(ValueError, match="document_count"):
+        compute_sft_shuffled_split_indices(0, 0, seed=5)
+    with pytest.raises(ValueError, match="eval_count"):
+        compute_sft_shuffled_split_indices(10, -1, seed=5)
+    with pytest.raises(ValueError, match="eval_count"):
+        compute_sft_shuffled_split_indices(10, 11, seed=5)
+    with pytest.raises(ValueError, match="no training"):
+        compute_sft_shuffled_split_indices(10, 10, seed=5)
+    with pytest.raises(ValueError, match="seed"):
+        compute_sft_shuffled_split_indices(10, 1, seed=-1)
 
 
 def test_count_binidx_documents_reads_index_only(tmp_path):
@@ -857,6 +906,68 @@ def test_probe_sft_binidx_steps_matches_training_dataset_shuffle_sampling(tmp_pa
         for rank in range(2):
             dataset.global_rank = rank
             x, _, _ = dataset[idx]
+            observed.append(int(x[0].item() // 10))
+
+    assert probed == observed
+
+
+def test_shuffled_sft_split_resume_and_multirank_sampling_matches_probe(tmp_path):
+    prefix = str(tmp_path / "probe_shuffle_split_resume")
+    write_documents(
+        prefix,
+        [
+            EncodedDocument(input_ids=[base, base + 1], loss_mask=[0, 1])
+            for base in range(0, 120, 10)
+        ],
+    )
+    args = make_sft_args(
+        prefix,
+        ctx_len=3,
+        real_bsz=2,
+        epoch_steps=3,
+        accumulate_grad_batches=2,
+        sft_eval_tail_docs=3,
+        sft_eval_steps=3,
+        sft_train_shuffle=1,
+        sft_train_shuffle_seed=23,
+    )
+    train_dataset = dataset_mod.MyDataset(args, sft_split="train")
+    eval_dataset = dataset_mod.MyDataset(args, sft_split="eval")
+    train_dataset.world_size = 2
+    train_dataset.real_epoch = 2
+    train_dataset.step_offset = 1
+
+    split_train, split_eval = compute_sft_shuffled_split_indices(12, 3, seed=23)
+    assert train_dataset.sft_doc_indices.tolist() == split_train.tolist()
+    assert eval_dataset.sft_doc_indices.tolist() == split_eval.tolist()
+    assert set(split_train.tolist()).isdisjoint(set(split_eval.tolist()))
+    assert split_eval.tolist() != [9, 10, 11]
+
+    config = probe_sft_binidx_steps.BatchConfig(
+        num_nodes=1,
+        devices=2,
+        micro_bsz=1,
+        accumulate_grad_batches=2,
+        epoch_steps=3,
+        epoch_begin=2,
+        sft_train_shuffle=1,
+        sft_train_shuffle_seed=23,
+    )
+    split = probe_sft_binidx_steps.compute_split_info(
+        12,
+        eval_tail_ratio=0.0,
+        eval_tail_docs=3,
+        eval_include_in_train=0,
+        sft_train_shuffle=1,
+        sft_train_shuffle_seed=23,
+    )
+
+    probed = probe_sft_binidx_steps.doc_indices_for_optimizer_index(1, config, split)
+    observed = []
+    for idx in (0, 1):
+        for rank in range(2):
+            train_dataset.global_rank = rank
+            x, _, _ = train_dataset[idx]
             observed.append(int(x[0].item() // 10))
 
     assert probed == observed

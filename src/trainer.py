@@ -169,7 +169,6 @@ class train_callback(pl.Callback):
         self.eval_loader = eval_loader
         self._eval_step_markers = set()
         self._last_completed_real_step = None
-        self._active_loss_step = None
         self._pending_loss_sum = 0.0
         self._pending_loss_count = 0
 
@@ -211,8 +210,6 @@ class train_callback(pl.Callback):
         real_step = trainer.global_step + args.epoch_begin * args.epoch_steps
         if self._last_completed_real_step is None:
             self._last_completed_real_step = int(real_step)
-        if self._active_loss_step is None:
-            self._active_loss_step = int(real_step)
 
         # LR schedule
         w_step = args.warmup_steps
@@ -266,8 +263,6 @@ class train_callback(pl.Callback):
         grad_norm = getattr(trainer, "my_grad_norm", None)
         if self._last_completed_real_step is None:
             self._last_completed_real_step = max(0, int(real_step) - 1)
-        if self._active_loss_step is None:
-            self._active_loss_step = int(self._last_completed_real_step)
         step_advanced = int(real_step) > int(self._last_completed_real_step)
 
         if trainer.is_global_zero:  # logging
@@ -296,23 +291,21 @@ class train_callback(pl.Callback):
                 trainer.my_loss = self._pending_loss_sum / self._pending_loss_count
 
             if step_advanced and len(args.wandb) > 0:
-                log_step = int(self._active_loss_step)
                 lll = build_wandb_train_metrics(
                     args,
                     trainer,
-                    log_step,
+                    real_step,
                     token_per_optimizer_step,
                     t_cost,
                     kt_s,
                     grad_norm,
                 )
-                trainer.my_wandb.log(lll, step=log_step)
+                trainer.my_wandb.log(lll, step=int(real_step))
 
         if not step_advanced:
             return
 
         self._last_completed_real_step = int(real_step)
-        self._active_loss_step = int(real_step)
         self._pending_loss_sum = 0.0
         self._pending_loss_count = 0
 

@@ -1765,7 +1765,7 @@ def test_train_callback_runs_save_and_eval_on_same_step(tmp_path, monkeypatch):
     assert events == [("save", "rwkv-step-10.pth"), ("eval", 10)]
 
 
-def test_train_callback_wandb_logs_accumulated_loss_once_at_resume_step(tmp_path):
+def test_train_callback_wandb_logs_accumulated_loss_once_at_completed_step(tmp_path):
     class FakeWandb:
         def __init__(self):
             self.records = []
@@ -1823,10 +1823,10 @@ def test_train_callback_wandb_logs_accumulated_loss_once_at_resume_step(tmp_path
 
     assert len(trainer.my_wandb.records) == 1
     values, step = trainer.my_wandb.records[0]
-    assert step == 350
-    assert values["train/step"] == 350
+    assert step == 351
+    assert values["train/step"] == 351
     assert values["train/loss"] == pytest.approx(2.5)
-    assert values["train/samples"] == 350 * 32
+    assert values["train/samples"] == 351 * 32
     trainer.my_log.close()
 
 

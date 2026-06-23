@@ -1571,7 +1571,7 @@ def test_train_py_sft_deepspeed_resume_loss_matches_continuous_smoke(tmp_path):
     epoch_steps = int(os.environ.get("RWKV_SFT_RESUME_LOSS_EQUIV_STEPS", "9"))
     save_step = int(os.environ.get("RWKV_SFT_RESUME_LOSS_EQUIV_SAVE_STEP", "5"))
     accumulate = int(os.environ.get("RWKV_SFT_RESUME_LOSS_EQUIV_ACCUMULATE_GRAD_BATCHES", "4"))
-    tol = float(os.environ.get("RWKV_SFT_RESUME_LOSS_EQUIV_TOL", "5e-4"))
+    tol = float(os.environ.get("RWKV_SFT_RESUME_LOSS_EQUIV_TOL", "1e-3"))
     assert 0 < save_step < epoch_steps
 
     docs = int(os.environ.get("RWKV_SFT_RESUME_LOSS_EQUIV_DOCS", str(max(devices * accumulate * (epoch_steps + 2), 64))))

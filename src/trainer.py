@@ -168,6 +168,10 @@ class train_callback(pl.Callback):
         self._saved_step_markers = set()
         self.eval_loader = eval_loader
         self._eval_step_markers = set()
+        self._last_completed_real_step = None
+        self._active_loss_step = None
+        self._pending_loss_sum = 0.0
+        self._pending_loss_count = 0
 
     def _ensure_run_logging_state(self, trainer):
         args = self.args
@@ -205,6 +209,10 @@ class train_callback(pl.Callback):
         args = self.args
 
         real_step = trainer.global_step + args.epoch_begin * args.epoch_steps
+        if self._last_completed_real_step is None:
+            self._last_completed_real_step = int(real_step)
+        if self._active_loss_step is None:
+            self._active_loss_step = int(real_step)
 
         # LR schedule
         w_step = args.warmup_steps
@@ -256,6 +264,11 @@ class train_callback(pl.Callback):
         token_per_optimizer_step = args.ctx_len * getattr(args, "effective_bsz", args.real_bsz)
         real_step = trainer.global_step + args.epoch_begin * args.epoch_steps
         grad_norm = getattr(trainer, "my_grad_norm", None)
+        if self._last_completed_real_step is None:
+            self._last_completed_real_step = max(0, int(real_step) - 1)
+        if self._active_loss_step is None:
+            self._active_loss_step = int(self._last_completed_real_step)
+        step_advanced = int(real_step) > int(self._last_completed_real_step)
 
         if trainer.is_global_zero:  # logging
             t_now = time.time_ns()
@@ -269,24 +282,39 @@ class train_callback(pl.Callback):
             except:
                 pass
             trainer.my_time_ns = t_now
-            trainer.my_loss = trainer.my_loss_all.float().mean().item()
-            trainer.my_loss_sum += trainer.my_loss
+            current_loss = trainer.my_loss_all.float().mean().item()
+            trainer.my_loss = current_loss
+            trainer.my_loss_sum += current_loss
             trainer.my_loss_count += 1
             trainer.my_epoch_loss = trainer.my_loss_sum / trainer.my_loss_count
             self.log("lr", trainer.my_lr, prog_bar=True, on_step=True)
             self.log("loss", trainer.my_epoch_loss, prog_bar=True, on_step=True)
+            self._pending_loss_sum += current_loss
+            self._pending_loss_count += 1
 
-            if len(args.wandb) > 0:
+            if step_advanced and self._pending_loss_count > 0:
+                trainer.my_loss = self._pending_loss_sum / self._pending_loss_count
+
+            if step_advanced and len(args.wandb) > 0:
+                log_step = int(self._active_loss_step)
                 lll = build_wandb_train_metrics(
                     args,
                     trainer,
-                    real_step,
+                    log_step,
                     token_per_optimizer_step,
                     t_cost,
                     kt_s,
                     grad_norm,
                 )
-                trainer.my_wandb.log(lll, step=int(real_step))
+                trainer.my_wandb.log(lll, step=log_step)
+
+        if not step_advanced:
+            return
+
+        self._last_completed_real_step = int(real_step)
+        self._active_loss_step = int(real_step)
+        self._pending_loss_sum = 0.0
+        self._pending_loss_count = 0
 
         if (trainer.is_global_zero) or is_deepspeed_strategy(args.strategy): # save pth
             if args.magic_prime > 0:

@@ -176,6 +176,231 @@ def test_save_train_checkpoint_prunes_old_deepspeed_directories_and_waits_for_ba
     assert sorted(p.name for p in tmp_path.iterdir()) == ["rwkv-2.pth"]
 
 
+def test_trainer_helper_branches_cover_save_prune_move_and_grad_norm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    module = SimpleNamespace(
+        state_dict=lambda: {
+            "encoder.weight": torch.tensor([1]),
+            "decoder.weight": torch.tensor([2]),
+            "head.weight": torch.tensor([3]),
+        }
+    )
+    assert sorted(trainer_mod.build_save_dict(SimpleNamespace(data_type="wds_img"), module)) == [
+        "decoder.weight",
+        "encoder.weight",
+    ]
+    assert "head.weight" in trainer_mod.build_save_dict(SimpleNamespace(data_type="binidx"), module)
+
+    trainer_mod.prune_old_checkpoints(SimpleNamespace(proj_dir=str(tmp_path / "missing"), keep_last_n_checkpoints=2))
+    trainer_mod.prune_old_checkpoints(SimpleNamespace(proj_dir=str(tmp_path), keep_last_n_checkpoints=0))
+    _make_file_checkpoint(tmp_path, "rwkv-1.pth", 100)
+    _make_file_checkpoint(tmp_path, "rwkv-2.pth", 200)
+    trainer_mod.prune_old_checkpoints(SimpleNamespace(proj_dir=str(tmp_path), keep_last_n_checkpoints=1))
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["rwkv-2.pth"]
+
+    tensor = torch.tensor([1])
+    moved = trainer_mod.move_batch_to_device(
+        {"a": (tensor,), "b": [tensor], "c": "unchanged"},
+        torch.device("cpu"),
+    )
+    assert torch.equal(moved["a"][0], tensor)
+    assert torch.equal(moved["b"][0], tensor)
+    assert moved["c"] == "unchanged"
+
+    trainer_mod.strategy_barrier(SimpleNamespace(strategy=SimpleNamespace(barrier=lambda: (_ for _ in ()).throw(RuntimeError("boom")))))
+
+    class OwnerWithBadNorm:
+        def get_global_grad_norm(self):
+            raise TypeError("try next")
+
+        def get_grad_norm(self):
+            return "not-float"
+
+        gradient_norm = None
+
+    assert trainer_mod.get_global_grad_norm(SimpleNamespace(strategy=SimpleNamespace(model=OwnerWithBadNorm())), object()) is None
+    assert trainer_mod.get_global_grad_norm(SimpleNamespace(strategy=""), SimpleNamespace(parameters=None)) is None
+
+    module_without_grads = torch.nn.Linear(2, 1)
+    assert trainer_mod.get_global_grad_norm(SimpleNamespace(strategy=""), module_without_grads) is None
+
+
+def test_train_callback_logging_state_can_initialize_wandb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    init_calls = []
+    fake_wandb = SimpleNamespace(init=lambda **kwargs: init_calls.append(kwargs))
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+    callback = trainer_mod.train_callback(
+        SimpleNamespace(
+            proj_dir=str(tmp_path),
+            wandb="project",
+            run_name="wandb-test",
+            my_timestamp="2026-06-23-11-45-00",
+        )
+    )
+    callback._ensure_run_logging_state(SimpleNamespace(is_global_zero=False))
+    assert not (tmp_path / "train_log.txt").exists()
+
+    trainer = SimpleNamespace(global_step=7, is_global_zero=True, strategy=SimpleNamespace(config={"x": 1}))
+    callback._ensure_run_logging_state(trainer)
+    trainer.my_log.close()
+
+    assert init_calls == [
+        {
+            "project": "project",
+            "name": "wandb-test 2026-06-23-11-45-00",
+            "config": callback.args,
+            "save_code": False,
+        }
+    ]
+    assert trainer.my_wandb is fake_wandb
+    assert "RESUME RUN @ step 7" in (tmp_path / "train_log.txt").read_text(encoding="utf-8")
+
+
+def test_train_callback_final_checkpoint_and_epoch_end_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    events = []
+
+    def fake_save(args, trainer, pl_module, file_name):
+        events.append(Path(file_name).name)
+
+    monkeypatch.setattr(trainer_mod, "save_train_checkpoint", fake_save)
+
+    args = SimpleNamespace(
+        data_type="sft_binidx",
+        strategy="",
+        proj_dir=str(tmp_path),
+        magic_prime=12,
+        save_every_n_steps=0,
+        save_at_step=0,
+        sft_eval_every_n_steps=0,
+        ctx_len=16,
+        real_bsz=2,
+        effective_bsz=2,
+        epoch_begin=0,
+        epoch_steps=100,
+        warmup_steps=0,
+        my_exit_tokens=0,
+        lr_init=1e-4,
+        lr_final=1e-5,
+        lr_wsd_decay_iters=0,
+        lr_wsd_decay_style="cosine",
+        weight_decay=0.0,
+        wandb="",
+        run_name="final-test",
+        my_timestamp="2026-06-23-11-50-00",
+        epoch_save=1,
+        epoch_count=2,
+    )
+    callback = trainer_mod.train_callback(args)
+    callback.log = lambda *args, **kwargs: None
+
+    trainer = SimpleNamespace(
+        global_step=4,
+        current_epoch=1,
+        is_global_zero=True,
+        strategy=SimpleNamespace(config={}),
+        optimizers=[SimpleNamespace(param_groups=[{"weight_decay": 0.0, "my_lr_scale": 1.0}])],
+        my_loss_all=torch.tensor([1.0]),
+    )
+    callback.on_train_batch_start(trainer, object(), None, 0)
+    trainer.global_step = 5
+    callback.on_train_batch_end(trainer, object(), None, None, 0)
+    callback.on_train_epoch_end(trainer, object())
+    trainer.my_log.close()
+
+    assert events == ["rwkv-final.pth", "rwkv-1.pth"]
+
+
+def test_train_callback_eval_zero_mask_and_invalid_batch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(trainer_mod, "strategy_barrier", lambda trainer: None)
+
+    class FakeModule:
+        device = torch.device("cpu")
+        training = False
+
+        def eval(self):
+            self.training = False
+
+        def training_step(self, batch, batch_idx):
+            return torch.tensor(9.0)
+
+    class FakeWandb:
+        def __init__(self):
+            self.records = []
+
+        def log(self, values, step):
+            self.records.append((values, step))
+
+    class ZeroMaskLoader:
+        dataset = SimpleNamespace()
+
+        def __iter__(self):
+            return iter(
+                [
+                    (
+                        torch.zeros((1, 2), dtype=torch.long),
+                        torch.zeros((1, 2), dtype=torch.long),
+                        torch.zeros((1, 2)),
+                    )
+                ]
+            )
+
+    callback = trainer_mod.train_callback(
+        SimpleNamespace(proj_dir=str(tmp_path), wandb="enabled", run_name="eval-zero", my_timestamp="now", sft_eval_steps=0),
+        eval_loader=ZeroMaskLoader(),
+    )
+    trainer = SimpleNamespace(
+        global_rank=0,
+        world_size=1,
+        is_global_zero=True,
+        strategy=SimpleNamespace(barrier=lambda: None),
+        my_log=open(tmp_path / "train_log.txt", "a"),
+        my_wandb=FakeWandb(),
+    )
+    callback._run_sft_eval(trainer, FakeModule(), real_step=3)
+    assert trainer.my_wandb.records[0][0]["eval/loss"] == 0.0
+    assert trainer.my_wandb.records[0][0]["eval/ppl"] == 1.0
+
+    class BadLoader:
+        dataset = SimpleNamespace()
+
+        def __iter__(self):
+            return iter([(torch.zeros((1, 2), dtype=torch.long),)])
+
+    callback.eval_loader = BadLoader()
+    with pytest.raises(ValueError, match="SFT eval requires"):
+        callback._run_sft_eval(trainer, FakeModule(), real_step=4)
+    trainer.my_log.close()
+
+
+def test_generate_init_weight_stage0_and_stage1_interpolation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    save_calls = []
+
+    def fake_save(payload, path):
+        save_calls.append((payload, path))
+
+    monkeypatch.setattr(trainer_mod.torch, "save", fake_save)
+
+    trainer_mod.generate_init_weight(
+        SimpleNamespace(args=SimpleNamespace(train_stage=0), generate_init_weight=lambda: {"x": torch.tensor([1.0])}),
+        str(tmp_path / "init.pth"),
+    )
+    assert save_calls[-1][1] == str(tmp_path / "init.pth")
+
+    monkeypatch.setattr(trainer_mod.torch, "load", lambda path, map_location=None: {"x": torch.tensor([0.0, 2.0])})
+    monkeypatch.setattr(trainer_mod, "exit", lambda code=0: (_ for _ in ()).throw(SystemExit(code)), raising=False)
+
+    with pytest.raises(SystemExit):
+        trainer_mod.generate_init_weight(
+            SimpleNamespace(
+                args=SimpleNamespace(train_stage=1, load_model="base.pth"),
+                generate_init_weight=lambda: {"x": torch.zeros(4)},
+            ),
+            str(tmp_path / "stage1.pth"),
+        )
+    interpolated = save_calls[-1][0]["x"]
+    assert torch.equal(interpolated, torch.tensor([0.0, 1.0, 2.0, 2.0]))
+
+
 def test_resume_smoke_defaults_require_real_restore_and_progress_markers():
     assert resume_smoke.default_require_patterns() == [
         "Resuming trainer state from",

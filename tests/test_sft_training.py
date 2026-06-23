@@ -1765,6 +1765,127 @@ def test_train_callback_runs_save_and_eval_on_same_step(tmp_path, monkeypatch):
     assert events == [("save", "rwkv-step-10.pth"), ("eval", 10)]
 
 
+def test_train_callback_wandb_logs_accumulated_loss_once_at_resume_step(tmp_path):
+    class FakeWandb:
+        def __init__(self):
+            self.records = []
+
+        def log(self, values, step):
+            self.records.append((values, step))
+
+    callback = trainer_mod.train_callback(
+        SimpleNamespace(
+            data_type="sft_binidx",
+            strategy="",
+            proj_dir=str(tmp_path),
+            magic_prime=0,
+            save_every_n_steps=0,
+            save_at_step=0,
+            sft_eval_every_n_steps=0,
+            ctx_len=16,
+            real_bsz=8,
+            effective_bsz=32,
+            epoch_begin=0,
+            epoch_steps=1000,
+            warmup_steps=0,
+            my_exit_tokens=0,
+            lr_init=1e-4,
+            lr_final=1e-5,
+            lr_wsd_decay_iters=0,
+            lr_wsd_decay_style="cosine",
+            weight_decay=0.0,
+            wandb="enabled",
+            run_name="accum-loss-test",
+            my_timestamp="2026-06-23-11-30-00",
+        )
+    )
+    callback.log = lambda *args, **kwargs: None
+
+    trainer = SimpleNamespace(
+        global_step=350,
+        is_global_zero=True,
+        strategy=SimpleNamespace(config={}),
+        optimizers=[SimpleNamespace(param_groups=[{"weight_decay": 0.0, "my_lr_scale": 1.0}])],
+        my_wandb=FakeWandb(),
+    )
+
+    for loss in (1.0, 2.0, 3.0):
+        callback.on_train_batch_start(trainer, object(), None, 0)
+        trainer.my_loss_all = torch.tensor([loss])
+        callback.on_train_batch_end(trainer, object(), None, None, 0)
+
+    assert trainer.my_wandb.records == []
+
+    callback.on_train_batch_start(trainer, object(), None, 0)
+    trainer.global_step = 351
+    trainer.my_loss_all = torch.tensor([4.0])
+    callback.on_train_batch_end(trainer, object(), None, None, 0)
+
+    assert len(trainer.my_wandb.records) == 1
+    values, step = trainer.my_wandb.records[0]
+    assert step == 350
+    assert values["train/step"] == 350
+    assert values["train/loss"] == pytest.approx(2.5)
+    assert values["train/samples"] == 350 * 32
+    trainer.my_log.close()
+
+
+def test_train_callback_does_not_repeat_save_or_eval_at_resume_step(tmp_path, monkeypatch):
+    events = []
+
+    def fake_save(args, trainer, pl_module, file_name):
+        events.append(("save", Path(file_name).name))
+
+    def fake_eval(self, trainer, pl_module, real_step):
+        events.append(("eval", real_step))
+
+    monkeypatch.setattr(trainer_mod, "save_train_checkpoint", fake_save)
+    monkeypatch.setattr(trainer_mod.train_callback, "_run_sft_eval", fake_eval)
+
+    callback = trainer_mod.train_callback(
+        SimpleNamespace(
+            data_type="sft_binidx",
+            strategy="",
+            proj_dir=str(tmp_path),
+            magic_prime=0,
+            save_every_n_steps=350,
+            save_at_step=0,
+            sft_eval_every_n_steps=350,
+            ctx_len=16,
+            real_bsz=8,
+            effective_bsz=32,
+            epoch_begin=0,
+            epoch_steps=1000,
+            warmup_steps=0,
+            my_exit_tokens=0,
+            lr_init=1e-4,
+            lr_final=1e-5,
+            lr_wsd_decay_iters=0,
+            lr_wsd_decay_style="cosine",
+            weight_decay=0.0,
+            wandb="",
+            run_name="resume-save-test",
+            my_timestamp="2026-06-23-11-35-00",
+        ),
+        eval_loader=object(),
+    )
+    callback.log = lambda *args, **kwargs: None
+
+    trainer = SimpleNamespace(
+        global_step=350,
+        is_global_zero=True,
+        strategy=SimpleNamespace(config={}),
+        optimizers=[SimpleNamespace(param_groups=[{"weight_decay": 0.0, "my_lr_scale": 1.0}])],
+        my_loss_all=torch.tensor([1.0]),
+    )
+
+    callback.on_train_batch_start(trainer, object(), None, 0)
+    callback.on_train_batch_end(trainer, object(), None, None, 0)
+
+    assert events == []
+    trainer.my_log.close()
+
+
 def test_train_callback_sft_eval_logs_mask_token_weighted_loss(tmp_path, monkeypatch):
     batches = [
         (

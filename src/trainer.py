@@ -62,19 +62,58 @@ def prune_old_checkpoints(args):
 
 
 def save_train_checkpoint(args, trainer, pl_module, file_name):
-    my_save(
-        args, trainer,
-        build_save_dict(args, pl_module),
-        file_name,
-    )
+    progress_snapshot = mark_current_batch_completed_for_checkpoint(trainer)
+    try:
+        my_save(
+            args, trainer,
+            build_save_dict(args, pl_module),
+            file_name,
+        )
+        if is_deepspeed_strategy(args.strategy):
+            trainer.strategy.barrier()
+
+        if trainer.is_global_zero:
+            prune_old_checkpoints(args)
+    finally:
+        restore_progress_snapshot(progress_snapshot)
+
     if is_deepspeed_strategy(args.strategy):
         trainer.strategy.barrier()
 
-    if trainer.is_global_zero:
-        prune_old_checkpoints(args)
 
-    if is_deepspeed_strategy(args.strategy):
-        trainer.strategy.barrier()
+def _snapshot_progress_tracker(progress):
+    snapshot = []
+    for tracker_name in ("total", "current"):
+        tracker = getattr(progress, tracker_name, None)
+        if tracker is None:
+            continue
+        values = {}
+        for attr in ("ready", "started", "processed", "completed"):
+            if hasattr(tracker, attr):
+                values[attr] = getattr(tracker, attr)
+        snapshot.append((tracker, values))
+    return snapshot
+
+
+def mark_current_batch_completed_for_checkpoint(trainer):
+    fit_loop = getattr(trainer, "fit_loop", None)
+    epoch_loop = getattr(fit_loop, "epoch_loop", None)
+    batch_progress = getattr(epoch_loop, "batch_progress", None)
+    if batch_progress is None:
+        return []
+
+    snapshot = _snapshot_progress_tracker(batch_progress)
+    for tracker, _ in snapshot:
+        target = getattr(tracker, "processed", getattr(tracker, "ready", getattr(tracker, "completed", 0)))
+        if hasattr(tracker, "completed") and tracker.completed < target:
+            tracker.completed = target
+    return snapshot
+
+
+def restore_progress_snapshot(snapshot):
+    for tracker, values in snapshot:
+        for attr, value in values.items():
+            setattr(tracker, attr, value)
 
 
 def move_batch_to_device(batch, device):

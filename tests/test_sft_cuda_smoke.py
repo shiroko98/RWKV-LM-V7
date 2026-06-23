@@ -480,6 +480,20 @@ def _fake_wandb_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
     return env, fake_log
 
 
+def _read_fake_wandb_train_losses(fake_log: Path) -> dict[int, float]:
+    losses: dict[int, float] = {}
+    for line in fake_log.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        if event.get("event") != "log":
+            continue
+        values = event.get("values", {})
+        if "train/loss" in values:
+            losses[int(event["step"])] = float(values["train/loss"])
+    return losses
+
+
 def _run_checkpoint_merge_command(command: list[str], label: str) -> str:
     result = subprocess.run(
         command,
@@ -1531,6 +1545,148 @@ def test_train_py_sft_deepspeed_shuffle_resume_smoke(tmp_path):
         "resume_output_tail": resume_output[-4000:],
     }
     summary_file = os.environ.get("RWKV_SFT_SHUFFLE_RESUME_SUMMARY_FILE", "")
+    if summary_file:
+        Path(summary_file).expanduser().write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+
+@pytest.mark.cuda
+@pytest.mark.slow
+def test_train_py_sft_deepspeed_resume_loss_matches_continuous_smoke(tmp_path):
+    model_path = _require_cuda_smoke("RWKV_RUN_TRAIN_PY_SFT_RESUME_LOSS_EQUIV_SMOKE")
+    pad_length = int(os.environ.get("RWKV_SFT_RESUME_LOSS_EQUIV_PAD_LENGTH", os.environ.get("RWKV_SFT_SMOKE_PAD_LENGTH", "257")))
+    ctx_len = pad_length - 1
+    assert ctx_len > 0 and ctx_len % 16 == 0, "ctx_len must be positive and divisible by the RWKV7 chunk length 16"
+
+    devices = int(os.environ.get("RWKV_SFT_SMOKE_DEVICES", "2"))
+    strategy = os.environ.get("RWKV_SFT_SMOKE_STRATEGY", "deepspeed_stage_3_offload")
+    if devices < 2:
+        pytest.skip("DeepSpeed resume loss equivalence smoke requires RWKV_SFT_SMOKE_DEVICES >= 2")
+    if torch.cuda.device_count() < devices:
+        pytest.skip(f"only {torch.cuda.device_count()} CUDA device(s) visible, need {devices}")
+    if "deepspeed" not in strategy:
+        pytest.skip("DeepSpeed resume loss equivalence smoke requires a DeepSpeed strategy")
+
+    state = _load_state_dict(model_path)
+    dims = _infer_rwkv7_dims(state)
+    epoch_steps = int(os.environ.get("RWKV_SFT_RESUME_LOSS_EQUIV_STEPS", "9"))
+    save_step = int(os.environ.get("RWKV_SFT_RESUME_LOSS_EQUIV_SAVE_STEP", "5"))
+    accumulate = int(os.environ.get("RWKV_SFT_RESUME_LOSS_EQUIV_ACCUMULATE_GRAD_BATCHES", "4"))
+    tol = float(os.environ.get("RWKV_SFT_RESUME_LOSS_EQUIV_TOL", "5e-4"))
+    assert 0 < save_step < epoch_steps
+
+    docs = int(os.environ.get("RWKV_SFT_RESUME_LOSS_EQUIV_DOCS", str(max(devices * accumulate * (epoch_steps + 2), 64))))
+    prefix = _build_synthetic_sft_binidx(
+        tmp_path,
+        pad_length,
+        docs=docs,
+        vocab_size=dims["vocab_size"],
+        name="resume_loss_equiv_sft",
+    )
+    fused_chunk = int(os.environ.get("RWKV_SFT_RESUME_LOSS_EQUIV_FUSED_CHUNK", os.environ.get("RWKV_SFT_FUSED_CE_TRAIN_PY_CHUNK", "512")))
+
+    common_extra_args = [
+        "--epoch_save",
+        "0",
+        "--save_every_n_steps",
+        "0",
+        "--keep_last_n_checkpoints",
+        "0",
+        "--wandb",
+        "fake-sft-resume-loss-equiv",
+    ]
+
+    continuous_env_dir = tmp_path / "continuous_wandb"
+    continuous_env_dir.mkdir()
+    continuous_env, continuous_wandb_log = _fake_wandb_env(continuous_env_dir)
+    continuous_proj_dir = tmp_path / "resume_loss_continuous"
+    continuous_command = _train_py_command(
+        load_model=model_path,
+        prefix=prefix,
+        proj_dir=continuous_proj_dir,
+        dims=dims,
+        ctx_len=ctx_len,
+        epoch_steps=epoch_steps,
+        epoch_count=1,
+        devices=devices,
+        strategy=strategy,
+        sft_masked_fused_ce_chunk=fused_chunk,
+        accumulate_grad_batches=accumulate,
+        extra_args=common_extra_args + ["--save_at_step", str(save_step)],
+    )
+    continuous_output = _run_train_py(
+        continuous_command,
+        "train.py SFT DeepSpeed continuous source for resume loss equivalence",
+        env=continuous_env,
+    )
+    step_checkpoint = continuous_proj_dir / f"rwkv-step-{save_step}.pth"
+    assert step_checkpoint.is_dir(), f"expected DeepSpeed checkpoint directory: {step_checkpoint}"
+
+    resume_env_dir = tmp_path / "resume_wandb"
+    resume_env_dir.mkdir()
+    resume_env, resume_wandb_log = _fake_wandb_env(resume_env_dir)
+    resume_proj_dir = tmp_path / "resume_loss_resumed"
+    resume_command = _train_py_command(
+        load_model=step_checkpoint,
+        prefix=prefix,
+        proj_dir=resume_proj_dir,
+        dims=dims,
+        ctx_len=ctx_len,
+        epoch_steps=epoch_steps,
+        epoch_count=1,
+        devices=devices,
+        strategy=strategy,
+        sft_masked_fused_ce_chunk=fused_chunk,
+        accumulate_grad_batches=accumulate,
+        extra_args=common_extra_args,
+    )
+    resume_output = _run_train_py(resume_command, "train.py SFT DeepSpeed resume loss equivalence", env=resume_env)
+
+    continuous_losses = _read_fake_wandb_train_losses(continuous_wandb_log)
+    resume_losses = _read_fake_wandb_train_losses(resume_wandb_log)
+    compared_steps = list(range(save_step + 1, epoch_steps + 1))
+    diffs = {
+        step: abs(continuous_losses[step] - resume_losses[step])
+        for step in compared_steps
+        if step in continuous_losses and step in resume_losses
+    }
+    missing = [step for step in compared_steps if step not in continuous_losses or step not in resume_losses]
+    assert not missing, {
+        "missing_steps": missing,
+        "continuous_steps": sorted(continuous_losses),
+        "resume_steps": sorted(resume_losses),
+    }
+    assert all(diff <= tol for diff in diffs.values()), json.dumps(
+        {
+            "tol": tol,
+            "diffs": diffs,
+            "continuous_losses": {step: continuous_losses[step] for step in compared_steps},
+            "resume_losses": {step: resume_losses[step] for step in compared_steps},
+            "continuous_output_tail": continuous_output[-4000:],
+            "resume_output_tail": resume_output[-4000:],
+        },
+        indent=2,
+    )
+
+    summary = {
+        "pad_length": pad_length,
+        "ctx_len": ctx_len,
+        "devices": devices,
+        "strategy": strategy,
+        "docs": docs,
+        "epoch_steps": epoch_steps,
+        "save_step": save_step,
+        "accumulate_grad_batches": accumulate,
+        "fused_chunk": fused_chunk,
+        "tol": tol,
+        "diffs": diffs,
+        "continuous_losses": {step: continuous_losses[step] for step in compared_steps},
+        "resume_losses": {step: resume_losses[step] for step in compared_steps},
+        "continuous_proj_dir": str(continuous_proj_dir),
+        "resume_proj_dir": str(resume_proj_dir),
+        "continuous_output_tail": continuous_output[-4000:],
+        "resume_output_tail": resume_output[-4000:],
+    }
+    summary_file = os.environ.get("RWKV_SFT_RESUME_LOSS_EQUIV_SUMMARY_FILE", "")
     if summary_file:
         Path(summary_file).expanduser().write_text(json.dumps(summary, indent=2), encoding="utf-8")
 

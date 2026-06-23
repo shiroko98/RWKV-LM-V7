@@ -176,6 +176,45 @@ def test_save_train_checkpoint_prunes_old_deepspeed_directories_and_waits_for_ba
     assert sorted(p.name for p in tmp_path.iterdir()) == ["rwkv-2.pth"]
 
 
+def test_save_train_checkpoint_marks_inflight_batch_completed_during_save(monkeypatch: pytest.MonkeyPatch):
+    seen_progress = []
+
+    def fake_my_save(args, trainer, dd, ff):
+        progress = trainer.fit_loop.epoch_loop.batch_progress
+        seen_progress.append(
+            (
+                progress.current.ready,
+                progress.current.processed,
+                progress.current.completed,
+                progress.total.ready,
+                progress.total.processed,
+                progress.total.completed,
+            )
+        )
+
+    monkeypatch.setattr(trainer_mod, "my_save", fake_my_save)
+
+    current = SimpleNamespace(ready=20, started=20, processed=20, completed=19)
+    total = SimpleNamespace(ready=20, started=20, processed=20, completed=19)
+    trainer = SimpleNamespace(
+        is_global_zero=False,
+        fit_loop=SimpleNamespace(epoch_loop=SimpleNamespace(batch_progress=SimpleNamespace(current=current, total=total))),
+    )
+    args = SimpleNamespace(strategy="", data_type="binidx", proj_dir="", keep_last_n_checkpoints=0)
+
+    trainer_mod.save_train_checkpoint(args, trainer, SimpleNamespace(state_dict=lambda: {"x": 1}), "dummy.pth")
+
+    assert seen_progress == [(20, 20, 20, 20, 20, 20)]
+    assert current.completed == 19
+    assert total.completed == 19
+
+
+def test_progress_snapshot_handles_missing_batch_progress():
+    trainer = SimpleNamespace()
+    assert trainer_mod.mark_current_batch_completed_for_checkpoint(trainer) == []
+    trainer_mod.restore_progress_snapshot([])
+
+
 def test_trainer_helper_branches_cover_save_prune_move_and_grad_norm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     module = SimpleNamespace(
         state_dict=lambda: {

@@ -200,6 +200,12 @@ def build_wandb_train_metrics(args, trainer, real_step, token_per_optimizer_step
     return metrics
 
 
+def update_progress_bar_metrics(trainer, metrics):
+    progress_bar_metrics = getattr(trainer, "progress_bar_metrics", None)
+    if isinstance(progress_bar_metrics, dict):
+        progress_bar_metrics.update(metrics)
+
+
 class train_callback(pl.Callback):
     def __init__(self, args, eval_loader=None):
         super().__init__()
@@ -324,18 +330,20 @@ class train_callback(pl.Callback):
                 trainer.my_loss = self._pending_loss_sum / self._pending_loss_count
 
             if step_advanced:
+                progress_metrics = {}
                 try:
                     t_cost = (t_now - trainer.my_step_time_ns) / 1e9
                     if t_cost > 0:
                         kt_s = token_per_optimizer_step / t_cost / 1000
-                        self.log("REAL it/s", 1.0 / t_cost, prog_bar=True, on_step=True)
-                        self.log("Kt/s", kt_s, prog_bar=True, on_step=True)
+                        progress_metrics["REAL it/s"] = 1.0 / t_cost
+                        progress_metrics["Kt/s"] = kt_s
                 except:
                     t_cost = 0
                     kt_s = 0
                 trainer.my_step_time_ns = t_now
-                self.log("lr", trainer.my_lr, prog_bar=True, on_step=True)
-                self.log("loss", trainer.my_loss, prog_bar=True, on_step=True)
+                progress_metrics["lr"] = trainer.my_lr
+                progress_metrics["loss"] = trainer.my_loss
+                update_progress_bar_metrics(trainer, progress_metrics)
 
             if step_advanced and len(args.wandb) > 0:
                 lll = build_wandb_train_metrics(

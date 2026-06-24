@@ -1867,23 +1867,25 @@ def test_train_callback_progress_metrics_log_once_at_completed_optimizer_step(tm
         is_global_zero=True,
         strategy=SimpleNamespace(config={}),
         optimizers=[SimpleNamespace(param_groups=[{"weight_decay": 0.0, "my_lr_scale": 1.0}])],
+        progress_bar_metrics={},
     )
 
     callback.on_train_batch_start(trainer, object(), None, 0)
     trainer.my_loss_all = torch.tensor([1.0])
     callback.on_train_batch_end(trainer, object(), None, None, 0)
     assert logged == []
+    assert trainer.progress_bar_metrics == {}
 
     callback.on_train_batch_start(trainer, object(), None, 0)
     trainer.global_step = 21
     trainer.my_loss_all = torch.tensor([3.0])
     callback.on_train_batch_end(trainer, object(), None, None, 0)
 
-    assert [name for name, _, _ in logged] == ["REAL it/s", "Kt/s", "lr", "loss"]
-    assert logged[0][1] == pytest.approx(0.5)
-    assert logged[1][1] == pytest.approx((16 * 32) / 2.0 / 1000)
-    assert logged[3][1] == pytest.approx(2.0)
-    assert all(entry[2]["prog_bar"] is True for entry in logged)
+    assert logged == []
+    assert trainer.progress_bar_metrics["REAL it/s"] == pytest.approx(0.5)
+    assert trainer.progress_bar_metrics["Kt/s"] == pytest.approx((16 * 32) / 2.0 / 1000)
+    assert trainer.progress_bar_metrics["lr"] == pytest.approx(1e-4)
+    assert trainer.progress_bar_metrics["loss"] == pytest.approx(2.0)
     trainer.my_log.close()
 
 

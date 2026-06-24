@@ -296,38 +296,46 @@ class train_callback(pl.Callback):
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         args = self.args
-        token_per_micro_batch = args.ctx_len * args.real_bsz
         token_per_optimizer_step = args.ctx_len * getattr(args, "effective_bsz", args.real_bsz)
         real_step = trainer.global_step + args.epoch_begin * args.epoch_steps
         grad_norm = getattr(trainer, "my_grad_norm", None)
         if self._last_completed_real_step is None:
             self._last_completed_real_step = max(0, int(real_step) - 1)
         step_advanced = int(real_step) > int(self._last_completed_real_step)
+        t_cost = 0
+        kt_s = 0
 
         if trainer.is_global_zero:  # logging
             t_now = time.time_ns()
-            kt_s = 0
-            t_cost = 0
-            try:
-                t_cost = (t_now - trainer.my_time_ns) / 1e9
-                kt_s = token_per_micro_batch / t_cost / 1000
-                self.log("REAL it/s", 1.0 / t_cost, prog_bar=True, on_step=True)
-                self.log("Kt/s", kt_s, prog_bar=True, on_step=True)
-            except:
-                pass
+            if not hasattr(trainer, "my_time_ns"):
+                trainer.my_time_ns = t_now
+            if not hasattr(trainer, "my_step_time_ns"):
+                trainer.my_step_time_ns = trainer.my_time_ns
             trainer.my_time_ns = t_now
             current_loss = trainer.my_loss_all.float().mean().item()
             trainer.my_loss = current_loss
             trainer.my_loss_sum += current_loss
             trainer.my_loss_count += 1
             trainer.my_epoch_loss = trainer.my_loss_sum / trainer.my_loss_count
-            self.log("lr", trainer.my_lr, prog_bar=True, on_step=True)
-            self.log("loss", trainer.my_epoch_loss, prog_bar=True, on_step=True)
             self._pending_loss_sum += current_loss
             self._pending_loss_count += 1
 
             if step_advanced and self._pending_loss_count > 0:
                 trainer.my_loss = self._pending_loss_sum / self._pending_loss_count
+
+            if step_advanced:
+                try:
+                    t_cost = (t_now - trainer.my_step_time_ns) / 1e9
+                    if t_cost > 0:
+                        kt_s = token_per_optimizer_step / t_cost / 1000
+                        self.log("REAL it/s", 1.0 / t_cost, prog_bar=True, on_step=True)
+                        self.log("Kt/s", kt_s, prog_bar=True, on_step=True)
+                except:
+                    t_cost = 0
+                    kt_s = 0
+                trainer.my_step_time_ns = t_now
+                self.log("lr", trainer.my_lr, prog_bar=True, on_step=True)
+                self.log("loss", trainer.my_loss, prog_bar=True, on_step=True)
 
             if step_advanced and len(args.wandb) > 0:
                 lll = build_wandb_train_metrics(

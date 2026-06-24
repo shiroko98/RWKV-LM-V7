@@ -1830,6 +1830,63 @@ def test_train_callback_wandb_logs_accumulated_loss_once_at_completed_step(tmp_p
     trainer.my_log.close()
 
 
+def test_train_callback_progress_metrics_log_once_at_completed_optimizer_step(tmp_path, monkeypatch):
+    callback = trainer_mod.train_callback(
+        SimpleNamespace(
+            data_type="sft_binidx",
+            strategy="",
+            proj_dir=str(tmp_path),
+            magic_prime=0,
+            save_every_n_steps=0,
+            save_at_step=0,
+            sft_eval_every_n_steps=0,
+            ctx_len=16,
+            real_bsz=8,
+            effective_bsz=32,
+            epoch_begin=0,
+            epoch_steps=1000,
+            warmup_steps=0,
+            my_exit_tokens=0,
+            lr_init=1e-4,
+            lr_final=1e-5,
+            lr_wsd_decay_iters=0,
+            lr_wsd_decay_style="cosine",
+            weight_decay=0.0,
+            wandb="",
+            run_name="progress-step-test",
+            my_timestamp="2026-06-24-09-00-00",
+        )
+    )
+    logged = []
+    callback.log = lambda name, value, **kwargs: logged.append((name, value, kwargs))
+    times = iter([1_000_000_000, 3_000_000_000])
+    monkeypatch.setattr(trainer_mod.time, "time_ns", lambda: next(times))
+
+    trainer = SimpleNamespace(
+        global_step=20,
+        is_global_zero=True,
+        strategy=SimpleNamespace(config={}),
+        optimizers=[SimpleNamespace(param_groups=[{"weight_decay": 0.0, "my_lr_scale": 1.0}])],
+    )
+
+    callback.on_train_batch_start(trainer, object(), None, 0)
+    trainer.my_loss_all = torch.tensor([1.0])
+    callback.on_train_batch_end(trainer, object(), None, None, 0)
+    assert logged == []
+
+    callback.on_train_batch_start(trainer, object(), None, 0)
+    trainer.global_step = 21
+    trainer.my_loss_all = torch.tensor([3.0])
+    callback.on_train_batch_end(trainer, object(), None, None, 0)
+
+    assert [name for name, _, _ in logged] == ["REAL it/s", "Kt/s", "lr", "loss"]
+    assert logged[0][1] == pytest.approx(0.5)
+    assert logged[1][1] == pytest.approx((16 * 32) / 2.0 / 1000)
+    assert logged[3][1] == pytest.approx(2.0)
+    assert all(entry[2]["prog_bar"] is True for entry in logged)
+    trainer.my_log.close()
+
+
 def test_train_callback_does_not_repeat_save_or_eval_at_resume_step(tmp_path, monkeypatch):
     events = []
 

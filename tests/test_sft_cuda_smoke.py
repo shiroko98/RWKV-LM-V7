@@ -328,6 +328,101 @@ def test_cuda_sft_masked_fused_ce_op_matches_full_logits(tmp_path):
     assert max_zero_abs <= zero_atol, json.dumps(summary, indent=2)
 
 
+@pytest.mark.cuda
+@pytest.mark.slow
+def test_cuda_sft_masked_fused_ce_op_longrow_matches_full_logits(tmp_path):
+    _require_cuda_flag("RWKV_RUN_CUDA_SFT_MASKED_FUSED_CE_OP_LONGROW_SMOKE")
+    if torch.version.hip is not None:
+        pytest.skip("SFT masked fused CE long-row equivalence is CUDA-only")
+
+    batch = int(os.environ.get("RWKV_SFT_FUSED_CE_OP_LONGROW_BATCH", "1"))
+    time_len = int(os.environ.get("RWKV_SFT_FUSED_CE_OP_LONGROW_TIME", "32769"))
+    hidden_size = int(os.environ.get("RWKV_SFT_FUSED_CE_OP_LONGROW_HIDDEN", "128"))
+    vocab_size = int(os.environ.get("RWKV_SFT_FUSED_CE_OP_LONGROW_VOCAB", "65536"))
+    chunk_rows = int(os.environ.get("RWKV_SFT_FUSED_CE_OP_LONGROW_CHUNK", "257"))
+    dtype_name = os.environ.get("RWKV_SFT_FUSED_CE_OP_LONGROW_DTYPE", "bf16").lower()
+    dtype = torch.float32 if dtype_name in {"fp32", "float32"} else torch.bfloat16
+    seed = int(os.environ.get("RWKV_SFT_FUSED_CE_OP_LONGROW_SEED", "1234"))
+    assert batch > 0 and time_len > 0 and hidden_size > 0 and vocab_size > 0
+    assert chunk_rows > 0
+    if vocab_size != 65536:
+        pytest.skip("rwkv7_head_l2wrap_ce_bf16_v4.forward_masked currently expects vocab_size=65536")
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    extension = _load_masked_head_ce_extension(chunk_rows)
+
+    base_hidden = (torch.randn(batch, time_len, hidden_size, device="cuda", dtype=torch.float32) * 0.05).to(dtype)
+    base_weight = (torch.randn(vocab_size, hidden_size, device="cuda", dtype=torch.float32) * 0.02).to(dtype)
+    targets = torch.randint(0, vocab_size, (batch, time_len), device="cuda", dtype=torch.long)
+    loss_mask = torch.ones(batch, time_len, device="cuda", dtype=torch.float32).contiguous()
+
+    def run_reference():
+        hidden = base_hidden.detach().clone().requires_grad_(True)
+        weight = base_weight.detach().clone().requires_grad_(True)
+        logits = F.linear(hidden, weight).float()
+        per_token = F.cross_entropy(
+            logits.reshape(-1, vocab_size),
+            targets.reshape(-1),
+            reduction="none",
+        ).view_as(targets)
+        loss = (per_token * loss_mask).sum() / loss_mask.sum()
+        loss.backward()
+        return loss.detach(), hidden.grad.detach(), weight.grad.detach()
+
+    def run_fused():
+        hidden = base_hidden.detach().clone().contiguous()
+        weight = base_weight.detach().clone().contiguous()
+        loss, grad_hidden, grad_weight = extension.forward_masked(
+            hidden,
+            weight,
+            targets.contiguous(),
+            loss_mask,
+            chunk_rows,
+        )
+        torch.cuda.synchronize()
+        return loss.detach(), grad_hidden.detach(), grad_weight.detach()
+
+    ref_loss, ref_grad_hidden, ref_grad_weight = run_reference()
+    fused_loss, fused_grad_hidden, fused_grad_weight = run_fused()
+
+    loss_diff = float((ref_loss.float() - fused_loss.float()).abs().item())
+    grad_hidden_max_abs_diff = float((ref_grad_hidden.float() - fused_grad_hidden.float()).abs().max().item())
+    grad_weight_max_abs_diff = float((ref_grad_weight.float() - fused_grad_weight.float()).abs().max().item())
+    grad_hidden_mean_abs_diff = float((ref_grad_hidden.float() - fused_grad_hidden.float()).abs().mean().item())
+    grad_weight_mean_abs_diff = float((ref_grad_weight.float() - fused_grad_weight.float()).abs().mean().item())
+    loss_atol = float(os.environ.get("RWKV_SFT_FUSED_CE_OP_LONGROW_LOSS_ATOL", "2e-2"))
+    grad_atol = float(os.environ.get("RWKV_SFT_FUSED_CE_OP_LONGROW_GRAD_ATOL", "3e-2"))
+    mean_grad_atol = float(os.environ.get("RWKV_SFT_FUSED_CE_OP_LONGROW_MEAN_GRAD_ATOL", "5e-3"))
+    summary = {
+        "batch": batch,
+        "time_len": time_len,
+        "hidden_size": hidden_size,
+        "vocab_size": vocab_size,
+        "chunk_rows": chunk_rows,
+        "dtype": str(dtype).removeprefix("torch."),
+        "seed": seed,
+        "mask_sum": float(loss_mask.sum().item()),
+        "loss_diff": loss_diff,
+        "loss_atol": loss_atol,
+        "grad_hidden_max_abs_diff": grad_hidden_max_abs_diff,
+        "grad_weight_max_abs_diff": grad_weight_max_abs_diff,
+        "grad_atol": grad_atol,
+        "grad_hidden_mean_abs_diff": grad_hidden_mean_abs_diff,
+        "grad_weight_mean_abs_diff": grad_weight_mean_abs_diff,
+        "mean_grad_atol": mean_grad_atol,
+    }
+    summary_file = os.environ.get("RWKV_SFT_FUSED_CE_OP_LONGROW_SUMMARY_FILE", "")
+    if summary_file:
+        Path(summary_file).expanduser().write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    assert loss_diff <= loss_atol, json.dumps(summary, indent=2)
+    assert grad_hidden_max_abs_diff <= grad_atol, json.dumps(summary, indent=2)
+    assert grad_weight_max_abs_diff <= grad_atol, json.dumps(summary, indent=2)
+    assert grad_hidden_mean_abs_diff <= mean_grad_atol, json.dumps(summary, indent=2)
+    assert grad_weight_mean_abs_diff <= mean_grad_atol, json.dumps(summary, indent=2)
+
+
 def _base_sft_args(prefix: Path, dims: dict[str, int], ctx_len: int, **overrides) -> SimpleNamespace:
     args = SimpleNamespace(
         vocab_size=dims["vocab_size"],

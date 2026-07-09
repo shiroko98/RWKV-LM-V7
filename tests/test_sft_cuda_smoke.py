@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import textwrap
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -495,6 +496,189 @@ def _run_train_py(command: list[str], label: str, env: dict[str, str] | None = N
     if result.returncode != 0:
         pytest.fail(f"{label} failed with code {result.returncode}\n{combined_output[-8000:]}")
     return combined_output
+
+
+def _write_train_py_sft_gather_verify_wrapper(script_path: Path) -> Path:
+    script_path.write_text(
+        textwrap.dedent(
+            f"""
+            import argparse
+            import json
+            import os
+            import runpy
+            import sys
+            from pathlib import Path
+
+            ROOT = Path({str(ROOT)!r})
+            if str(ROOT) not in sys.path:
+                sys.path.insert(0, str(ROOT))
+
+            def _rank0_log_event(payload):
+                log_path = os.environ.get("RWKV_SFT_GATHER_VERIFY_LOG", "")
+                if not log_path:
+                    return
+                if int(os.environ.get("RANK", "0") or 0) != 0:
+                    return
+                with open(log_path, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(payload, sort_keys=True) + "\\n")
+
+            def _apply_train_env_from_argv(argv):
+                parser = argparse.ArgumentParser(add_help=False)
+                parser.add_argument("--head_chunk", default="0")
+                parser.add_argument("--sft_masked_fused_ce_chunk", default="0")
+                parser.add_argument("--head_size", default="64")
+                parser.add_argument("--my_testing", default="")
+                parser.add_argument("--kernel", default="")
+                parser.add_argument("--precision", default="bf16")
+                parser.add_argument("--strategy", default="")
+                known, _ = parser.parse_known_args(argv)
+                os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"] = str(known.head_chunk)
+                os.environ["RWKV_SFT_MASKED_FUSED_CE_CHUNK"] = str(known.sft_masked_fused_ce_chunk)
+                os.environ["RWKV_HEAD_SIZE"] = str(known.head_size)
+                os.environ["RWKV_MY_TESTING"] = str(known.my_testing)
+                os.environ["RWKV_KERNEL"] = str(known.kernel)
+                os.environ["RWKV_FLOAT_MODE"] = str(known.precision)
+                os.environ["RWKV_JIT_ON"] = "0" if "deepspeed_stage_3" in str(known.strategy) else "1"
+
+            _apply_train_env_from_argv(sys.argv[1:])
+
+            import torch
+            import torch.distributed as dist
+            from pytorch_lightning.utilities import rank_zero_info
+            from src.model import RWKV, head_masked_cross_entropy_cuda
+            from src.trainer import train_callback
+
+            _ORIG_SFT_LOSS_STEP = RWKV.sft_loss_step
+            _ORIG_ON_BEFORE_OPTIMIZER_STEP = train_callback.on_before_optimizer_step
+
+            def _patched_sft_loss_step(self, batch, batch_idx, gather_head=False):
+                loss = _ORIG_SFT_LOSS_STEP(self, batch, batch_idx, gather_head=gather_head)
+                if (not gather_head) and isinstance(batch, (tuple, list)) and len(batch) == 3:
+                    self._sft_verify_last_batch = tuple(t.detach().clone() for t in batch)
+                    self._sft_verify_last_batch_idx = int(batch_idx)
+                    self._sft_verify_last_local_loss = loss.detach().float()
+                    _rank0_log_event(
+                        {{
+                            "event": "captured_batch",
+                            "batch_idx": int(batch_idx),
+                            "local_mask_tokens": float(batch[2].detach().float().sum().item()),
+                        }}
+                    )
+                return loss
+
+            def _patched_on_before_optimizer_step(self, trainer, pl_module, optimizer, optimizer_idx=None):
+                _ORIG_ON_BEFORE_OPTIMIZER_STEP(self, trainer, pl_module, optimizer, optimizer_idx)
+                batch = getattr(pl_module, "_sft_verify_last_batch", None)
+                train_loss = getattr(pl_module, "_sft_verify_last_local_loss", None)
+                if batch is None or train_loss is None:
+                    _rank0_log_event(
+                        {{
+                            "event": "missing_capture",
+                            "global_step": int(getattr(trainer, "global_step", 0)),
+                        }}
+                    )
+                    return
+
+                batch_idx = int(getattr(pl_module, "_sft_verify_last_batch_idx", 0))
+                local_tokens = batch[2].detach().float().sum().to(device=train_loss.device, dtype=torch.float32)
+                fused_chunk = int(getattr(pl_module.args, "sft_masked_fused_ce_chunk", 0) or 0)
+                if fused_chunk <= 0:
+                    raise AssertionError("SFT gather verify wrapper expects sft_masked_fused_ce_chunk > 0.")
+
+                def _gather_full_weight(linear_weight, device):
+                    ds_tensor = getattr(linear_weight, "ds_tensor", None)
+                    ds_shape = tuple(getattr(linear_weight, "ds_shape", linear_weight.shape))
+                    ds_numel = int(getattr(linear_weight, "ds_numel", linear_weight.numel()))
+                    if ds_tensor is None or not (dist.is_available() and dist.is_initialized()):
+                        return linear_weight.detach().to(device=device).view(ds_shape)
+                    shard = ds_tensor.detach().to(device=device)
+                    gathered = [torch.empty_like(shard) for _ in range(dist.get_world_size())]
+                    dist.all_gather(gathered, shard)
+                    return torch.cat(gathered, dim=0)[:ds_numel].view(ds_shape)
+
+                was_training = pl_module.training
+                try:
+                    pl_module.eval()
+                    with torch.no_grad():
+                        idx, targets, loss_mask = batch
+                        hidden = pl_module._forward_features(idx)
+                        full_weight = _gather_full_weight(pl_module.head.weight, hidden.device)
+                        ref_loss = head_masked_cross_entropy_cuda(
+                            hidden,
+                            full_weight,
+                            targets,
+                            loss_mask,
+                            fused_chunk,
+                        ).detach().float()
+                finally:
+                    if was_training:
+                        pl_module.train()
+
+                stats = torch.stack(
+                    [
+                        train_loss.to(dtype=torch.float32) * local_tokens,
+                        ref_loss.to(dtype=torch.float32) * local_tokens,
+                        local_tokens,
+                    ]
+                )
+                if dist.is_available() and dist.is_initialized():
+                    dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+
+                token_count = float(stats[2].item())
+                train_weighted_loss = float((stats[0] / stats[2]).item()) if token_count > 0 else 0.0
+                ref_weighted_loss = float((stats[1] / stats[2]).item()) if token_count > 0 else 0.0
+                diff = abs(train_weighted_loss - ref_weighted_loss)
+                tol = float(os.environ.get("RWKV_SFT_GATHER_VERIFY_TOL", "5e-4"))
+
+                pl_module._sft_verify_last_batch = None
+                pl_module._sft_verify_last_batch_idx = None
+                pl_module._sft_verify_last_local_loss = None
+
+                if trainer.is_global_zero:
+                    _rank0_log_event(
+                        {{
+                            "event": "verified",
+                            "batch_idx": batch_idx,
+                            "train_weighted_loss": train_weighted_loss,
+                            "ref_weighted_loss": ref_weighted_loss,
+                            "abs_diff": diff,
+                            "tol": tol,
+                            "global_mask_tokens": token_count,
+                        }}
+                    )
+                    rank_zero_info(
+                        "########## SFT_GATHER_VERIFY "
+                        f"train_loss={{train_weighted_loss:.6f}} "
+                        f"ref_loss={{ref_weighted_loss:.6f}} "
+                        f"diff={{diff:.6e}} tokens={{token_count:.0f}} ##########"
+                    )
+
+                if diff > tol:
+                    raise AssertionError(
+                        json.dumps(
+                            {{
+                                "train_weighted_loss": train_weighted_loss,
+                                "ref_weighted_loss": ref_weighted_loss,
+                                "abs_diff": diff,
+                                "tol": tol,
+                                "global_mask_tokens": token_count,
+                                "batch_idx": batch_idx,
+                            }},
+                            indent=2,
+                        )
+                    )
+
+            RWKV.sft_loss_step = _patched_sft_loss_step
+            train_callback.on_before_optimizer_step = _patched_on_before_optimizer_step
+
+            sys.argv[0] = str(ROOT / "train.py")
+            runpy.run_path(sys.argv[0], run_name="__main__")
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    return script_path
 
 
 def _fake_wandb_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
@@ -1108,7 +1292,7 @@ def test_train_py_sft_cuda_one_step(tmp_path):
     dims = _infer_rwkv7_dims(state)
     proj_dir = tmp_path / "out"
 
-    command = _train_py_command(
+    train_command = _train_py_command(
         load_model=model_path,
         prefix=prefix,
         proj_dir=proj_dir,
@@ -1244,7 +1428,7 @@ def test_train_py_sft_deepspeed_masked_fused_ce_smoke(tmp_path):
     dims = _infer_rwkv7_dims(state)
     proj_dir = tmp_path / "fused_ce_train_py"
 
-    command = _train_py_command(
+    train_command = _train_py_command(
         load_model=model_path,
         prefix=prefix,
         proj_dir=proj_dir,
@@ -1277,6 +1461,107 @@ def test_train_py_sft_deepspeed_masked_fused_ce_smoke(tmp_path):
     if summary_file:
         Path(summary_file).expanduser().write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
+    assert torch.isfinite(torch.tensor(loss)).item(), json.dumps(summary, indent=2)
+
+
+@pytest.mark.cuda
+@pytest.mark.slow
+def test_train_py_sft_deepspeed_masked_fused_ce_gather_verify_smoke(tmp_path):
+    model_path = _require_cuda_smoke("RWKV_RUN_TRAIN_PY_SFT_FUSED_CE_GATHER_VERIFY_SMOKE")
+    pad_length = int(os.environ.get("RWKV_SFT_FUSED_CE_GATHER_VERIFY_PAD_LENGTH", os.environ.get("RWKV_SFT_SMOKE_PAD_LENGTH", "257")))
+    ctx_len = pad_length - 1
+    assert ctx_len > 0 and ctx_len % 16 == 0, "ctx_len must be positive and divisible by the RWKV7 chunk length 16"
+
+    devices = int(os.environ.get("RWKV_SFT_SMOKE_DEVICES", "2"))
+    strategy = os.environ.get("RWKV_SFT_SMOKE_STRATEGY", "deepspeed_stage_3_offload")
+    if devices < 2:
+        pytest.skip("DeepSpeed gather-verify smoke requires RWKV_SFT_SMOKE_DEVICES >= 2")
+    if torch.cuda.device_count() < devices:
+        pytest.skip(f"only {torch.cuda.device_count()} CUDA device(s) visible, need {devices}")
+    if "deepspeed" not in strategy:
+        pytest.skip("DeepSpeed gather-verify smoke requires a DeepSpeed strategy")
+
+    epoch_steps = int(os.environ.get("RWKV_SFT_FUSED_CE_GATHER_VERIFY_STEPS", "2"))
+    fused_chunk = int(os.environ.get("RWKV_SFT_FUSED_CE_GATHER_VERIFY_CHUNK", os.environ.get("RWKV_SFT_FUSED_CE_TRAIN_PY_CHUNK", "512")))
+    gather_tol = float(os.environ.get("RWKV_SFT_GATHER_VERIFY_TOL", "5e-4"))
+    assert epoch_steps >= 1
+    assert fused_chunk > 0
+
+    state = _load_state_dict(model_path)
+    dims = _infer_rwkv7_dims(state)
+    docs = int(os.environ.get("RWKV_SFT_FUSED_CE_GATHER_VERIFY_DOCS", str(max(devices * epoch_steps, 16))))
+    prefix = _build_synthetic_sft_binidx(
+        tmp_path,
+        pad_length,
+        docs=docs,
+        vocab_size=dims["vocab_size"],
+        name="gather_verify_sft",
+    )
+    proj_dir = tmp_path / "fused_ce_gather_verify_train_py"
+    wrapper_path = _write_train_py_sft_gather_verify_wrapper(tmp_path / "train_py_sft_gather_verify_wrapper.py")
+
+    train_command = _train_py_command(
+        load_model=model_path,
+        prefix=prefix,
+        proj_dir=proj_dir,
+        dims=dims,
+        ctx_len=ctx_len,
+        epoch_steps=epoch_steps,
+        epoch_count=1,
+        devices=devices,
+        strategy=strategy,
+        sft_masked_fused_ce_chunk=fused_chunk,
+        accumulate_grad_batches=1,
+    )
+    master_port = int(os.environ.get("RWKV_SFT_FUSED_CE_GATHER_VERIFY_MASTER_PORT", "29617"))
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc_per_node",
+        str(devices),
+        "--master_port",
+        str(master_port),
+        str(wrapper_path),
+        *train_command[2:],
+    ]
+    env = os.environ.copy()
+    env["RWKV_SFT_GATHER_VERIFY_TOL"] = str(gather_tol)
+    verify_log = tmp_path / "gather_verify.jsonl"
+    env["RWKV_SFT_GATHER_VERIFY_LOG"] = str(verify_log)
+    output = _run_train_py(command, "train.py SFT DeepSpeed fused CE gather verify", env=env)
+    loss = _read_train_log_epoch_loss(proj_dir)
+
+    verify_events = []
+    if verify_log.is_file():
+        verify_events = [
+            json.loads(line)
+            for line in verify_log.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    verified_events = [event for event in verify_events if event.get("event") == "verified"]
+    summary = {
+        "pad_length": pad_length,
+        "ctx_len": ctx_len,
+        "devices": devices,
+        "strategy": strategy,
+        "epoch_steps": epoch_steps,
+        "docs": docs,
+        "fused_chunk": fused_chunk,
+        "gather_tol": gather_tol,
+        "master_port": master_port,
+        "verify_event_count": len(verified_events),
+        "verify_events": verify_events,
+        "loss": loss,
+        "proj_dir": str(proj_dir),
+        "output_tail": output[-4000:],
+    }
+    summary_file = os.environ.get("RWKV_SFT_FUSED_CE_GATHER_VERIFY_SUMMARY_FILE", "")
+    if summary_file:
+        Path(summary_file).expanduser().write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    assert len(verified_events) >= epoch_steps, json.dumps(summary, indent=2)
     assert torch.isfinite(torch.tensor(loss)).item(), json.dumps(summary, indent=2)
 
 

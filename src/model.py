@@ -862,6 +862,10 @@ class RWKV(pl.LightningModule):
 
         self.ln_out = nn.LayerNorm(args.n_embd)
         self.head = nn.Linear(args.n_embd, args.vocab_size, bias=False)
+        self._sft_grad_accum_global_tokens = None
+        self._sft_grad_accum_micro_batches = 0
+        self._sft_last_loss_sum = None
+        self._sft_last_token_count = None
 
     def configure_optimizers(self):
         args = self.args
@@ -937,6 +941,25 @@ class RWKV(pl.LightningModule):
             return nullcontext()
         return deepspeed.zero.GatheredParameters([weight], modifier_rank=0)
 
+    def _record_sft_training_loss(self, loss: torch.Tensor, loss_mask: torch.Tensor) -> torch.Tensor:
+        local_token_count = loss_mask.detach().float().sum().to(device=loss.device, dtype=torch.float32)
+        global_token_count = local_token_count.clone()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(global_token_count, op=torch.distributed.ReduceOp.SUM)
+
+        loss_sum = loss * local_token_count.to(dtype=loss.dtype)
+        self._sft_last_loss_sum = loss.detach().float() * local_token_count
+        self._sft_last_token_count = local_token_count
+        if self._sft_grad_accum_global_tokens is None or self._sft_grad_accum_global_tokens.device != global_token_count.device:
+            self._sft_grad_accum_global_tokens = torch.zeros_like(global_token_count)
+        self._sft_grad_accum_global_tokens = self._sft_grad_accum_global_tokens + global_token_count
+        self._sft_grad_accum_micro_batches += 1
+        return loss_sum
+
+    def reset_sft_grad_accum_state(self):
+        self._sft_grad_accum_global_tokens = None
+        self._sft_grad_accum_micro_batches = 0
+
     def _sft_loss_from_hidden(self, hidden, targets, loss_mask, gather_head=False):
         args = self.args
         sft_masked_fused_ce_chunk = getattr(args, "sft_masked_fused_ce_chunk", 0)
@@ -985,7 +1008,8 @@ class RWKV(pl.LightningModule):
 
         def training_step(self, batch, batch_idx):
             if len(batch) == 3:
-                return self.sft_loss_step(batch, batch_idx)
+                loss = self.sft_loss_step(batch, batch_idx)
+                return self._record_sft_training_loss(loss, batch[2])
             idx, targets = batch
             hidden = self(idx)
             return head_l2wrap_cross_entropy(hidden, self.head.weight, targets)
@@ -999,7 +1023,8 @@ class RWKV(pl.LightningModule):
 
         def training_step(self, batch, batch_idx):
             if len(batch) == 3:
-                return self.sft_loss_step(batch, batch_idx)
+                loss = self.sft_loss_step(batch, batch_idx)
+                return self._record_sft_training_loss(loss, batch[2])
             idx, targets = batch
             logits = self(idx)
 
@@ -1012,6 +1037,13 @@ class RWKV(pl.LightningModule):
             return l2wrap_cross_entropy(logits, targets)
 
     def training_step_end(self, batch_parts):
+        if self._sft_last_loss_sum is not None and self._sft_last_token_count is not None:
+            all = self.all_gather(self._sft_last_loss_sum)
+            token_counts = self.all_gather(self._sft_last_token_count)
+            if self.trainer.is_global_zero:
+                self.trainer.my_loss_all = all
+                self.trainer.my_loss_token_counts = token_counts
+            return
         all = self.all_gather(batch_parts)
         if self.trainer.is_global_zero:
             self.trainer.my_loss_all = all

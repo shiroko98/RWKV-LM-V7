@@ -538,6 +538,48 @@ def test_masked_head_cross_entropy_zero_mask_and_validation():
         masked_head_cross_entropy(hidden, weight, targets, zero_mask, chunk_size=0)
 
 
+def test_sft_token_weighted_gradient_rescaling_matches_large_batch():
+    torch.manual_seed(123)
+    logits = torch.randn(2, 3, 5)
+    targets = torch.tensor([[0, 1, 2], [3, 4, 1]], dtype=torch.long)
+    loss_mask = torch.tensor([[1, 1, 0], [1, 0, 0]], dtype=torch.float32)
+
+    full_logits = torch.nn.Parameter(logits.clone())
+    full_loss = masked_cross_entropy(full_logits, targets, loss_mask)
+    full_loss.backward()
+
+    accum_logits = torch.nn.Parameter(logits.clone())
+    accum_steps = 2
+    for row in range(accum_steps):
+        micro_logits = accum_logits[row : row + 1]
+        micro_targets = targets[row : row + 1]
+        micro_mask = loss_mask[row : row + 1]
+        micro_loss = masked_cross_entropy(micro_logits, micro_targets, micro_mask)
+        micro_loss_sum = micro_loss * micro_mask.sum()
+        (micro_loss_sum / accum_steps).backward()
+
+    class FakeModule:
+        def __init__(self, parameter):
+            self.parameter = parameter
+            self._sft_grad_accum_global_tokens = loss_mask.sum()
+            self._sft_grad_accum_micro_batches = accum_steps
+
+        def parameters(self):
+            return [self.parameter]
+
+        def reset_sft_grad_accum_state(self):
+            self._sft_grad_accum_global_tokens = None
+            self._sft_grad_accum_micro_batches = 0
+
+    module = FakeModule(accum_logits)
+    scale = trainer_mod.rescale_sft_token_weighted_gradients(SimpleNamespace(world_size=1), module)
+
+    assert scale == pytest.approx(accum_steps / float(loss_mask.sum().item()))
+    assert module._sft_grad_accum_global_tokens is None
+    assert module._sft_grad_accum_micro_batches == 0
+    assert torch.allclose(accum_logits.grad, full_logits.grad, atol=1e-6)
+
+
 def test_configure_epoch_schedule_preserves_sft_steps_and_keeps_pretrain_schedule():
     sft_args = SimpleNamespace(data_type="sft_binidx", epoch_steps=7, epoch_count=3, real_bsz=8, sft_one_pass=0)
     train.configure_epoch_schedule(sft_args)
@@ -1886,6 +1928,55 @@ def test_train_callback_progress_metrics_log_once_at_completed_optimizer_step(tm
     assert trainer.progress_bar_metrics["Kt/s"] == pytest.approx((16 * 32) / 2.0 / 1000)
     assert trainer.progress_bar_metrics["lr"] == pytest.approx(1e-4)
     assert trainer.progress_bar_metrics["loss"] == pytest.approx(2.0)
+    trainer.my_log.close()
+
+
+def test_train_callback_uses_token_weighted_current_loss_when_available(tmp_path, monkeypatch):
+    callback = trainer_mod.train_callback(
+        SimpleNamespace(
+            data_type="sft_binidx",
+            strategy="",
+            proj_dir=str(tmp_path),
+            magic_prime=0,
+            save_every_n_steps=0,
+            save_at_step=0,
+            sft_eval_every_n_steps=0,
+            ctx_len=16,
+            real_bsz=8,
+            effective_bsz=32,
+            epoch_begin=0,
+            epoch_steps=1000,
+            warmup_steps=0,
+            my_exit_tokens=0,
+            lr_init=1e-4,
+            lr_final=1e-5,
+            lr_wsd_decay_iters=0,
+            lr_wsd_decay_style="cosine",
+            weight_decay=0.0,
+            wandb="",
+            run_name="weighted-loss-test",
+            my_timestamp="2026-07-09-12-00-00",
+        )
+    )
+    monkeypatch.setattr(trainer_mod.time, "time_ns", lambda: 1_000_000_000)
+
+    trainer = SimpleNamespace(
+        global_step=7,
+        is_global_zero=True,
+        strategy=SimpleNamespace(config={}),
+        my_loss_all=torch.tensor([4.0, 18.0]),
+        my_loss_token_counts=torch.tensor([2.0, 6.0]),
+        my_loss_sum=0.0,
+        my_loss_count=0,
+        my_lr=1e-4,
+        my_wd=0.0,
+        optimizers=[SimpleNamespace(param_groups=[{"weight_decay": 0.0, "my_lr_scale": 1.0}])],
+    )
+
+    callback.on_train_batch_start(trainer, object(), None, 0)
+    callback.on_train_batch_end(trainer, object(), None, None, 0)
+
+    assert trainer.my_loss == pytest.approx((4.0 + 18.0) / (2.0 + 6.0))
     trainer.my_log.close()
 
 

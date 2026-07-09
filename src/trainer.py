@@ -176,6 +176,34 @@ def get_global_grad_norm(trainer, pl_module):
     return grad_norm_sq ** 0.5
 
 
+def rescale_sft_token_weighted_gradients(trainer, pl_module):
+    global_token_count = getattr(pl_module, "_sft_grad_accum_global_tokens", None)
+    micro_batches = int(getattr(pl_module, "_sft_grad_accum_micro_batches", 0) or 0)
+    if global_token_count is None or micro_batches <= 0:
+        return None
+
+    if torch.is_tensor(global_token_count):
+        global_token_count_value = float(global_token_count.detach().float().item())
+    else:
+        global_token_count_value = float(global_token_count)
+    pl_module.reset_sft_grad_accum_state()
+    if global_token_count_value <= 0:
+        return None
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        world_size = torch.distributed.get_world_size()
+    else:
+        world_size = int(getattr(trainer, "world_size", 1) or 1)
+
+    scale = (micro_batches * world_size) / global_token_count_value
+    parameters = getattr(pl_module, "parameters", None)
+    if callable(parameters):
+        for parameter in parameters():
+            if parameter.grad is not None:
+                parameter.grad.mul_(scale)
+    return scale
+
+
 def build_wandb_train_metrics(args, trainer, real_step, token_per_optimizer_step, t_cost, kt_s, grad_norm):
     effective_bsz = getattr(args, "effective_bsz", args.real_bsz)
     cumulative_tokens = real_step * token_per_optimizer_step
@@ -296,6 +324,9 @@ class train_callback(pl.Callback):
         self._ensure_run_logging_state(trainer)
 
     def on_before_optimizer_step(self, trainer, pl_module, optimizer, optimizer_idx=None):
+        grad_scale = rescale_sft_token_weighted_gradients(trainer, pl_module)
+        if grad_scale is not None:
+            trainer.my_sft_grad_scale = grad_scale
         grad_norm = get_global_grad_norm(trainer, pl_module)
         if grad_norm is not None:
             trainer.my_grad_norm = grad_norm
@@ -318,7 +349,15 @@ class train_callback(pl.Callback):
             if not hasattr(trainer, "my_step_time_ns"):
                 trainer.my_step_time_ns = trainer.my_time_ns
             trainer.my_time_ns = t_now
-            current_loss = trainer.my_loss_all.float().mean().item()
+            token_counts = getattr(trainer, "my_loss_token_counts", None)
+            if token_counts is not None:
+                token_count_sum = token_counts.float().sum()
+                if float(token_count_sum.item()) > 0:
+                    current_loss = (trainer.my_loss_all.float().sum() / token_count_sum).item()
+                else:
+                    current_loss = 0.0
+            else:
+                current_loss = trainer.my_loss_all.float().mean().item()
             trainer.my_loss = current_loss
             trainer.my_loss_sum += current_loss
             trainer.my_loss_count += 1

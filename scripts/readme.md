@@ -1,0 +1,1 @@
+bash scripts/stop_rwkv_train.sh "$(pgrep -fo 'python .*train\.py')"

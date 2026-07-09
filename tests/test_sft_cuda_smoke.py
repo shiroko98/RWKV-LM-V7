@@ -152,12 +152,43 @@ def _build_synthetic_sft_binidx(tmp_path: Path, pad_length: int, docs: int, voca
     encoded_docs = []
     for doc_id in range(docs):
         input_ids = [16 + ((doc_id * 131 + pos * 7) % (max_token_id - 16)) for pos in range(pad_length)]
-        loss_mask = [0] + [1 if ((doc_id + pos) % 3 != 0) else 0 for pos in range(1, pad_length)]
-        if sum(loss_mask) == 0:
-            loss_mask[-1] = 1
+        train_tokens = pad_length - 1
+        if train_tokens <= 0:
+            loss_mask = [0] * pad_length
+        else:
+            pattern = doc_id % 6
+            if pattern == 0:
+                loss_mask = [0] + [1] * train_tokens
+            elif pattern == 1:
+                single_index = 1 + ((doc_id * 7) % train_tokens)
+                loss_mask = [0] + [1 if pos == single_index else 0 for pos in range(1, pad_length)]
+            elif pattern == 2:
+                short_prefix = max(1, min(16, max(1, train_tokens // 32)))
+                loss_mask = [0] + [1 if pos <= short_prefix else 0 for pos in range(1, pad_length)]
+            elif pattern == 3:
+                medium_prefix = max(1, train_tokens // 4)
+                loss_mask = [0] + [1 if pos <= medium_prefix else 0 for pos in range(1, pad_length)]
+            elif pattern == 4:
+                loss_mask = [0] + [1 if (pos % 2 == 0) else 0 for pos in range(1, pad_length)]
+            else:
+                stride = 7
+                phase = doc_id % stride
+                loss_mask = [0] + [1 if ((pos + phase) % stride == 0) else 0 for pos in range(1, pad_length)]
         encoded_docs.append(EncodedDocument(input_ids=input_ids, loss_mask=loss_mask))
+    if docs >= 2 and pad_length > 2:
+        mask_counts = [sum(doc.loss_mask) for doc in encoded_docs]
+        assert min(mask_counts) == 1
+        assert max(mask_counts) == pad_length - 1
+        assert len(set(mask_counts)) > 1
     write_documents(str(prefix), encoded_docs)
     return prefix
+
+
+def _load_sft_mask_counts(prefix: Path) -> list[int]:
+    from src.binidx import MMapIndexedDataset
+
+    mask_data = MMapIndexedDataset(str(prefix) + ".mask")
+    return [int(mask_data[i].sum()) for i in range(len(mask_data))]
 
 
 @pytest.mark.cuda
@@ -561,6 +592,22 @@ def test_build_tiny_sft_binidx_smoke_input(tmp_path):
     assert int(token_data.sizes[0]) == 257
     assert int(mask_data.sizes[0]) == 257
     assert int(mask_data[0].sum()) > 0
+
+
+def test_build_synthetic_sft_binidx_uses_high_variance_loss_masks(tmp_path):
+    prefix = _build_synthetic_sft_binidx(
+        tmp_path,
+        pad_length=257,
+        docs=12,
+        vocab_size=512,
+        name="synthetic_variance_sft",
+    )
+    mask_counts = _load_sft_mask_counts(prefix)
+
+    assert min(mask_counts) == 1
+    assert max(mask_counts) == 256
+    assert len(set(mask_counts)) >= 6
+    assert max(mask_counts) / min(mask_counts) >= 256
 
 
 @pytest.mark.cuda
@@ -1097,6 +1144,12 @@ def test_train_py_sft_deepspeed_accumulation_loss_matches_large_micro_batch(tmp_
     prefix = _build_accum_equiv_sft_binidx(tmp_path, pad_length, docs=devices * 2, vocab_size=dims["vocab_size"])
     large_proj_dir = tmp_path / "ds_large_micro_bsz"
     accum_proj_dir = tmp_path / "ds_accum"
+    fused_chunk = int(
+        os.environ.get(
+            "RWKV_SFT_DP_ZERO_ACCUM_EQUIV_FUSED_CHUNK",
+            os.environ.get("RWKV_SFT_FUSED_CE_TRAIN_PY_CHUNK", "512"),
+        )
+    )
 
     common_extra_args = [
         "--epoch_save",
@@ -1116,6 +1169,7 @@ def test_train_py_sft_deepspeed_accumulation_loss_matches_large_micro_batch(tmp_
         accumulate_grad_batches=1,
         devices=devices,
         strategy=strategy,
+        sft_masked_fused_ce_chunk=fused_chunk,
         extra_args=common_extra_args,
     )
     accum_command = _train_py_command(
@@ -1130,6 +1184,7 @@ def test_train_py_sft_deepspeed_accumulation_loss_matches_large_micro_batch(tmp_
         accumulate_grad_batches=2,
         devices=devices,
         strategy=strategy,
+        sft_masked_fused_ce_chunk=fused_chunk,
         extra_args=common_extra_args,
     )
 
@@ -1147,6 +1202,7 @@ def test_train_py_sft_deepspeed_accumulation_loss_matches_large_micro_batch(tmp_
         "strategy": strategy,
         "pad_length": pad_length,
         "ctx_len": ctx_len,
+        "fused_chunk": fused_chunk,
         "large_micro_bsz_loss": large_loss,
         "accumulated_loss": accum_loss,
         "loss_diff": diff,
@@ -1724,6 +1780,12 @@ def test_train_py_sft_shuffle_eval_wandb_loss_matches_baseline(tmp_path):
     epoch_steps = int(os.environ.get("RWKV_SFT_SHUFFLE_EVAL_WANDB_EQUIV_STEPS", "2"))
     tol = float(os.environ.get("RWKV_SFT_SHUFFLE_EVAL_WANDB_EQUIV_LOSS_TOL", "5e-4"))
     shuffle_seed = int(os.environ.get("RWKV_SFT_SHUFFLE_EVAL_WANDB_EQUIV_SEED", "16180"))
+    fused_chunk = int(
+        os.environ.get(
+            "RWKV_SFT_SHUFFLE_EVAL_WANDB_EQUIV_FUSED_CHUNK",
+            os.environ.get("RWKV_SFT_FUSED_CE_TRAIN_PY_CHUNK", "512"),
+        )
+    )
     docs = int(os.environ.get("RWKV_SFT_SHUFFLE_EVAL_WANDB_EQUIV_DOCS", str(max(devices * (epoch_steps + 2), 16))))
     eval_docs = int(os.environ.get("RWKV_SFT_SHUFFLE_EVAL_WANDB_EQUIV_HELDOUT_DOCS", str(max(2, devices // 2))))
     assert docs > eval_docs > 0
@@ -1765,6 +1827,7 @@ def test_train_py_sft_shuffle_eval_wandb_loss_matches_baseline(tmp_path):
         epoch_count=1,
         devices=devices,
         strategy=strategy,
+        sft_masked_fused_ce_chunk=fused_chunk,
         extra_args=common_extra_args,
     )
     eval_wandb_command = _train_py_command(
@@ -1777,6 +1840,7 @@ def test_train_py_sft_shuffle_eval_wandb_loss_matches_baseline(tmp_path):
         epoch_count=1,
         devices=devices,
         strategy=strategy,
+        sft_masked_fused_ce_chunk=fused_chunk,
         extra_args=common_extra_args
         + [
             "--wandb",
@@ -1818,6 +1882,7 @@ def test_train_py_sft_shuffle_eval_wandb_loss_matches_baseline(tmp_path):
         "docs": docs,
         "eval_docs": eval_docs,
         "shuffle_seed": shuffle_seed,
+        "fused_chunk": fused_chunk,
         "split_eval": split_eval.tolist(),
         "raw_tail": list(range(docs - eval_docs, docs)),
         "epoch_steps": epoch_steps,
@@ -1853,6 +1918,12 @@ def test_train_py_sft_eval_wandb_loss_matches_baseline(tmp_path):
     dims = _infer_rwkv7_dims(state)
     epoch_steps = int(os.environ.get("RWKV_SFT_EVAL_WANDB_EQUIV_STEPS", "2"))
     tol = float(os.environ.get("RWKV_SFT_EVAL_WANDB_EQUIV_LOSS_TOL", "5e-4"))
+    fused_chunk = int(
+        os.environ.get(
+            "RWKV_SFT_EVAL_WANDB_EQUIV_FUSED_CHUNK",
+            os.environ.get("RWKV_SFT_FUSED_CE_TRAIN_PY_CHUNK", "512"),
+        )
+    )
     prefix = _build_synthetic_sft_binidx(
         tmp_path,
         pad_length,
@@ -1882,6 +1953,7 @@ def test_train_py_sft_eval_wandb_loss_matches_baseline(tmp_path):
         epoch_count=1,
         devices=devices,
         strategy=strategy,
+        sft_masked_fused_ce_chunk=fused_chunk,
         extra_args=common_extra_args,
     )
     eval_wandb_command = _train_py_command(
@@ -1894,6 +1966,7 @@ def test_train_py_sft_eval_wandb_loss_matches_baseline(tmp_path):
         epoch_count=1,
         devices=devices,
         strategy=strategy,
+        sft_masked_fused_ce_chunk=fused_chunk,
         extra_args=common_extra_args
         + [
             "--wandb",
@@ -1937,6 +2010,7 @@ def test_train_py_sft_eval_wandb_loss_matches_baseline(tmp_path):
         "devices": devices,
         "strategy": strategy,
         "epoch_steps": epoch_steps,
+        "fused_chunk": fused_chunk,
         "baseline_loss": baseline_loss,
         "eval_wandb_loss": eval_wandb_loss,
         "loss_abs_diff": abs(baseline_loss - eval_wandb_loss),
@@ -2017,6 +2091,12 @@ def test_train_py_sft_deepspeed_resume_keeps_wsd_lr_position(tmp_path):
     epoch_steps = int(os.environ.get("RWKV_SFT_WSD_RESUME_EPOCH_STEPS", "33"))
     decay_iters = int(os.environ.get("RWKV_SFT_WSD_RESUME_DECAY_ITERS", "9"))
     warmup_steps = int(os.environ.get("RWKV_SFT_WSD_RESUME_WARMUP_STEPS", "4"))
+    fused_chunk = int(
+        os.environ.get(
+            "RWKV_SFT_WSD_RESUME_FUSED_CHUNK",
+            os.environ.get("RWKV_SFT_FUSED_CE_TRAIN_PY_CHUNK", "512"),
+        )
+    )
     decay_start = epoch_steps - decay_iters
     save_step = int(os.environ.get("RWKV_SFT_WSD_RESUME_SAVE_STEP", str(decay_start + (decay_iters - 1) // 2)))
     assert epoch_steps > decay_iters > 0
@@ -2052,6 +2132,7 @@ def test_train_py_sft_deepspeed_resume_keeps_wsd_lr_position(tmp_path):
         epoch_count=1,
         devices=devices,
         strategy=strategy,
+        sft_masked_fused_ce_chunk=fused_chunk,
         extra_args=common_extra_args,
     )
     _run_train_py(first_command, "train.py SFT DeepSpeed WSD initial run")
@@ -2069,6 +2150,7 @@ def test_train_py_sft_deepspeed_resume_keeps_wsd_lr_position(tmp_path):
         epoch_count=1,
         devices=devices,
         strategy=strategy,
+        sft_masked_fused_ce_chunk=fused_chunk,
         extra_args=[
             "--lr_init",
             lr_init,
@@ -2094,6 +2176,7 @@ def test_train_py_sft_deepspeed_resume_keeps_wsd_lr_position(tmp_path):
     summary = {
         "devices": devices,
         "strategy": strategy,
+        "fused_chunk": fused_chunk,
         "epoch_steps": epoch_steps,
         "warmup_steps": warmup_steps,
         "lr_wsd_decay_iters": decay_iters,

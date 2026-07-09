@@ -336,15 +336,16 @@ def test_cuda_sft_masked_fused_ce_op_longrow_matches_full_logits(tmp_path):
         pytest.skip("SFT masked fused CE long-row equivalence is CUDA-only")
 
     batch = int(os.environ.get("RWKV_SFT_FUSED_CE_OP_LONGROW_BATCH", "1"))
-    time_len = int(os.environ.get("RWKV_SFT_FUSED_CE_OP_LONGROW_TIME", "32769"))
+    time_len = int(os.environ.get("RWKV_SFT_FUSED_CE_OP_LONGROW_TIME", "86017"))
     hidden_size = int(os.environ.get("RWKV_SFT_FUSED_CE_OP_LONGROW_HIDDEN", "128"))
     vocab_size = int(os.environ.get("RWKV_SFT_FUSED_CE_OP_LONGROW_VOCAB", "65536"))
     chunk_rows = int(os.environ.get("RWKV_SFT_FUSED_CE_OP_LONGROW_CHUNK", "257"))
+    ref_row_chunk = int(os.environ.get("RWKV_SFT_FUSED_CE_OP_LONGROW_REF_ROW_CHUNK", "2048"))
     dtype_name = os.environ.get("RWKV_SFT_FUSED_CE_OP_LONGROW_DTYPE", "bf16").lower()
     dtype = torch.float32 if dtype_name in {"fp32", "float32"} else torch.bfloat16
     seed = int(os.environ.get("RWKV_SFT_FUSED_CE_OP_LONGROW_SEED", "1234"))
     assert batch > 0 and time_len > 0 and hidden_size > 0 and vocab_size > 0
-    assert chunk_rows > 0
+    assert chunk_rows > 0 and ref_row_chunk > 0
     if vocab_size != 65536:
         pytest.skip("rwkv7_head_l2wrap_ce_bf16_v4.forward_masked currently expects vocab_size=65536")
 
@@ -358,17 +359,34 @@ def test_cuda_sft_masked_fused_ce_op_longrow_matches_full_logits(tmp_path):
     loss_mask = torch.ones(batch, time_len, device="cuda", dtype=torch.float32).contiguous()
 
     def run_reference():
-        hidden = base_hidden.detach().clone().requires_grad_(True)
-        weight = base_weight.detach().clone().requires_grad_(True)
-        logits = F.linear(hidden, weight).float()
-        per_token = F.cross_entropy(
-            logits.reshape(-1, vocab_size),
-            targets.reshape(-1),
-            reduction="none",
-        ).view_as(targets)
-        loss = (per_token * loss_mask).sum() / loss_mask.sum()
-        loss.backward()
-        return loss.detach(), hidden.grad.detach(), weight.grad.detach()
+        flat_hidden = base_hidden.detach().float().view(-1, hidden_size)
+        flat_targets = targets.reshape(-1)
+        flat_mask = loss_mask.reshape(-1).float()
+        mask_sum = flat_mask.sum()
+        assert float(mask_sum.item()) > 0
+        grad_hidden = torch.zeros_like(flat_hidden)
+        grad_weight = torch.zeros(vocab_size, hidden_size, device="cuda", dtype=torch.float32)
+        loss_sum = torch.zeros((), device="cuda", dtype=torch.float32)
+
+        for row_start in range(0, flat_hidden.shape[0], ref_row_chunk):
+            row_end = min(row_start + ref_row_chunk, flat_hidden.shape[0])
+            hidden_chunk = flat_hidden[row_start:row_end].clone().requires_grad_(True)
+            weight = base_weight.detach().float().clone().requires_grad_(True)
+            target_chunk = flat_targets[row_start:row_end]
+            mask_chunk = flat_mask[row_start:row_end]
+            logits = F.linear(hidden_chunk, weight)
+            per_token = F.cross_entropy(logits, target_chunk, reduction="none")
+            loss_chunk = (per_token * mask_chunk).sum() / mask_sum
+            loss_chunk.backward()
+            grad_hidden[row_start:row_end] = hidden_chunk.grad.detach()
+            grad_weight += weight.grad.detach()
+            loss_sum += loss_chunk.detach()
+
+        return (
+            loss_sum.detach(),
+            grad_hidden.view(batch, time_len, hidden_size).detach(),
+            grad_weight.detach(),
+        )
 
     def run_fused():
         hidden = base_hidden.detach().clone().contiguous()
@@ -400,6 +418,7 @@ def test_cuda_sft_masked_fused_ce_op_longrow_matches_full_logits(tmp_path):
         "hidden_size": hidden_size,
         "vocab_size": vocab_size,
         "chunk_rows": chunk_rows,
+        "ref_row_chunk": ref_row_chunk,
         "dtype": str(dtype).removeprefix("torch."),
         "seed": seed,
         "mask_sum": float(loss_mask.sum().item()),

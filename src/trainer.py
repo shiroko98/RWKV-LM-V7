@@ -182,6 +182,46 @@ def is_gradient_accumulation_boundary(trainer, pl_module):
     return True
 
 
+def _grad_norm_reduce_device():
+    if torch.cuda.is_available():
+        try:
+            return torch.device("cuda", torch.cuda.current_device())
+        except Exception:
+            pass
+    return torch.device("cpu")
+
+
+def _compute_gradient_tensor_global_norm(gradients, shard_across_ranks=False):
+    gradients = [grad for grad in gradients if grad is not None]
+    if not gradients:
+        return None
+
+    reduce_device = _grad_norm_reduce_device()
+    grad_norm_sq = torch.zeros((), device=reduce_device, dtype=torch.float64)
+    for grad in gradients:
+        grad_norm_sq += grad.detach().to(device=reduce_device, dtype=torch.float64, non_blocking=True).pow(2).sum()
+
+    if shard_across_ranks and torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(grad_norm_sq, op=torch.distributed.ReduceOp.SUM)
+
+    return float(grad_norm_sq.sqrt().item())
+
+
+def get_current_global_grad_norm(trainer, pl_module):
+    deepspeed_gradients = _iter_deepspeed_gradient_tensors(trainer)
+    if deepspeed_gradients:
+        return _compute_gradient_tensor_global_norm(deepspeed_gradients, shard_across_ranks=True)
+
+    parameters = getattr(pl_module, "parameters", None)
+    if callable(parameters):
+        parameter_grads = [parameter.grad for parameter in parameters() if parameter.grad is not None]
+        current_norm = _compute_gradient_tensor_global_norm(parameter_grads, shard_across_ranks=False)
+        if current_norm is not None:
+            return current_norm
+
+    return get_global_grad_norm(trainer, pl_module)
+
+
 def get_global_grad_norm(trainer, pl_module):
     strategy = getattr(trainer, "strategy", None)
     strategy_model = _get_strategy_model(trainer)
@@ -388,7 +428,7 @@ class train_callback(pl.Callback):
         grad_scale = rescale_sft_token_weighted_gradients(trainer, pl_module)
         if grad_scale is not None:
             trainer.my_sft_grad_scale = grad_scale
-        grad_norm = get_global_grad_norm(trainer, pl_module)
+        grad_norm = get_current_global_grad_norm(trainer, pl_module)
         if grad_norm is not None:
             trainer.my_grad_norm = grad_norm
 

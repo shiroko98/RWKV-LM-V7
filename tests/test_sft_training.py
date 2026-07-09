@@ -1824,6 +1824,37 @@ def test_get_global_grad_norm_computes_local_non_deepspeed_norm():
     assert trainer_mod.get_global_grad_norm(trainer, module) == pytest.approx(2 ** 0.5)
 
 
+def test_get_current_global_grad_norm_prefers_live_deepspeed_gradients():
+    grad_a = torch.tensor([3.0, 4.0], dtype=torch.float32)
+    grad_b = torch.tensor([12.0], dtype=torch.float32)
+    trainer = SimpleNamespace(
+        strategy=SimpleNamespace(
+            model=SimpleNamespace(
+                optimizer=SimpleNamespace(
+                    offload_optimizer=True,
+                    fp32_partitioned_groups_flat=[
+                        SimpleNamespace(grad=grad_a),
+                        SimpleNamespace(grad=grad_b),
+                    ],
+                )
+            )
+        )
+    )
+
+    assert trainer_mod.get_current_global_grad_norm(trainer, object()) == pytest.approx(13.0)
+
+
+def test_get_current_global_grad_norm_computes_live_local_parameter_norm():
+    trainer = SimpleNamespace(strategy="")
+    module = torch.nn.Linear(2, 1, bias=False)
+    with torch.no_grad():
+        module.weight.fill_(1.0)
+    loss = module(torch.ones(1, 2)).sum()
+    loss.backward()
+
+    assert trainer_mod.get_current_global_grad_norm(trainer, module) == pytest.approx(2 ** 0.5)
+
+
 def test_train_callback_before_optimizer_step_accepts_optimizer_idx(tmp_path, monkeypatch):
     callback = trainer_mod.train_callback(
         SimpleNamespace(
@@ -1835,7 +1866,7 @@ def test_train_callback_before_optimizer_step_accepts_optimizer_idx(tmp_path, mo
             run_name="grad-norm-hook-test",
         )
     )
-    monkeypatch.setattr(trainer_mod, "get_global_grad_norm", lambda trainer, pl_module: 4.25)
+    monkeypatch.setattr(trainer_mod, "get_current_global_grad_norm", lambda trainer, pl_module: 4.25)
     trainer = SimpleNamespace()
 
     callback.on_before_optimizer_step(trainer, object(), object(), 0)
@@ -1861,7 +1892,7 @@ def test_train_callback_before_optimizer_step_skips_deepspeed_non_boundary(tmp_p
     )
     monkeypatch.setattr(
         trainer_mod,
-        "get_global_grad_norm",
+        "get_current_global_grad_norm",
         lambda trainer, pl_module: (_ for _ in ()).throw(AssertionError("should not read grad norm before boundary")),
     )
     trainer = SimpleNamespace(strategy=SimpleNamespace(model=SimpleNamespace(is_gradient_accumulation_boundary=lambda: False)))
@@ -1870,6 +1901,54 @@ def test_train_callback_before_optimizer_step_skips_deepspeed_non_boundary(tmp_p
 
     assert not hasattr(trainer, "my_grad_norm")
     assert not hasattr(trainer, "my_sft_grad_scale")
+
+
+def test_train_callback_before_optimizer_step_logs_post_rescale_live_norm(tmp_path):
+    callback = trainer_mod.train_callback(
+        SimpleNamespace(
+            data_type="sft_binidx",
+            strategy="deepspeed_stage_3_offload",
+            proj_dir=str(tmp_path),
+            wandb="",
+            my_timestamp="2026-07-09-22-20-00",
+            run_name="grad-norm-live-value-test",
+        )
+    )
+
+    grad_a = torch.tensor([6.0, 8.0], dtype=torch.float32)
+    grad_b = torch.tensor([0.0, 12.0], dtype=torch.float32)
+
+    module = SimpleNamespace(
+        _sft_grad_accum_global_tokens=torch.tensor(16.0),
+        _sft_grad_accum_micro_batches=4,
+    )
+
+    def reset_state():
+        module._sft_grad_accum_global_tokens = None
+        module._sft_grad_accum_micro_batches = 0
+
+    module.reset_sft_grad_accum_state = reset_state
+
+    trainer = SimpleNamespace(
+        world_size=2,
+        strategy=SimpleNamespace(
+            model=SimpleNamespace(
+                is_gradient_accumulation_boundary=lambda: True,
+                optimizer=SimpleNamespace(
+                    offload_optimizer=True,
+                    fp32_partitioned_groups_flat=[
+                        SimpleNamespace(grad=grad_a),
+                        SimpleNamespace(grad=grad_b),
+                    ],
+                ),
+            )
+        ),
+    )
+
+    callback.on_before_optimizer_step(trainer, module, object(), 0)
+
+    assert trainer.my_sft_grad_scale == pytest.approx(0.5)
+    assert trainer.my_grad_norm == pytest.approx((3.0 ** 2 + 4.0 ** 2 + 6.0 ** 2) ** 0.5)
 
 
 def test_train_callback_runs_save_and_eval_on_same_step(tmp_path, monkeypatch):

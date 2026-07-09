@@ -11,6 +11,7 @@ import pytest
 import torch
 from torch.nn import functional as F
 
+from src import trainer as trainer_mod
 from src.sft_split import compute_sft_shuffled_split_indices
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -120,10 +121,23 @@ def _build_accum_equiv_sft_binidx(tmp_path: Path, pad_length: int, docs: int, vo
     encoded_docs = []
     for doc_id in range(docs):
         input_ids = [10 + ((doc_id * 997 + pos * 17) % (max_token_id - 10)) for pos in range(pad_length)]
+        train_tokens = pad_length - 1
+        if train_tokens <= 0:
+            loss_mask = [0] * pad_length
+        elif doc_id % 4 == 0:
+            loss_mask = [0] + [1] * train_tokens
+        elif doc_id % 4 == 1:
+            single_index = 1 + (doc_id % train_tokens)
+            loss_mask = [0] + [1 if pos == single_index else 0 for pos in range(1, pad_length)]
+        elif doc_id % 4 == 2:
+            short_tokens = max(1, min(16, train_tokens // 8))
+            loss_mask = [0] + [1 if pos <= short_tokens else 0 for pos in range(1, pad_length)]
+        else:
+            loss_mask = [0] + [1 if (pos % 3 != 0) else 0 for pos in range(1, pad_length)]
         encoded_docs.append(
             EncodedDocument(
                 input_ids=input_ids,
-                loss_mask=[0] + [1] * (pad_length - 1),
+                loss_mask=loss_mask,
             )
         )
     write_documents(str(prefix), encoded_docs)
@@ -640,31 +654,28 @@ def test_cuda_sft_gradient_accumulation_loss_matches_large_batch(tmp_path, monke
     large_batch = tuple(torch.stack([example[field] for example in examples]).cuda(non_blocking=True) for field in range(3))
 
     with torch.no_grad():
-        large_batch_loss = model.training_step(large_batch, 0).detach().float()
+        large_batch_loss_sum = model.training_step(large_batch, 0).detach().float()
+        large_batch_mask_count = large_batch[2].sum().detach().float()
         accumulated_loss_sum = torch.zeros((), device="cuda", dtype=torch.float32)
-        weighted_loss_sum = torch.zeros((), device="cuda", dtype=torch.float32)
         mask_count_sum = torch.zeros((), device="cuda", dtype=torch.float32)
         mask_counts = []
-        micro_losses = []
+        micro_loss_sums = []
 
         for example in examples:
             micro_batch = tuple(t.unsqueeze(0).cuda(non_blocking=True) for t in example)
-            micro_loss = model.training_step(micro_batch, 0).detach().float()
+            micro_loss_sum = model.training_step(micro_batch, 0).detach().float()
             mask_count = micro_batch[2].sum().detach().float()
             assert mask_count.item() > 0
-            accumulated_loss_sum += micro_loss
-            weighted_loss_sum += micro_loss * mask_count
+            accumulated_loss_sum += micro_loss_sum
             mask_count_sum += mask_count
             mask_counts.append(mask_count.item())
-            micro_losses.append(micro_loss.item())
+            micro_loss_sums.append(micro_loss_sum.item())
 
-        accumulated_loss = accumulated_loss_sum / accum_steps
-        weighted_accumulated_loss = weighted_loss_sum / mask_count_sum
+        large_batch_loss = large_batch_loss_sum / large_batch_mask_count
+        weighted_accumulated_loss = accumulated_loss_sum / mask_count_sum
 
     loss_value = large_batch_loss.item()
-    accumulated_value = accumulated_loss.item()
     weighted_value = weighted_accumulated_loss.item()
-    accumulated_diff = abs(loss_value - accumulated_value)
     weighted_diff = abs(loss_value - weighted_value)
     atol = float(os.environ.get("RWKV_SFT_ACCUM_EQUIV_ATOL", "1e-2"))
     rtol = float(os.environ.get("RWKV_SFT_ACCUM_EQUIV_RTOL", "1e-3"))
@@ -674,19 +685,17 @@ def test_cuda_sft_gradient_accumulation_loss_matches_large_batch(tmp_path, monke
         "ctx_len": ctx_len,
         "accum_steps": accum_steps,
         "large_batch_loss": loss_value,
-        "accumulated_micro_loss": accumulated_value,
         "token_weighted_accumulated_loss": weighted_value,
-        "accumulated_diff": accumulated_diff,
         "token_weighted_diff": weighted_diff,
         "allowed_diff": allowed,
         "mask_counts": mask_counts,
-        "micro_losses": micro_losses,
+        "micro_loss_sums": micro_loss_sums,
     }
     summary_file = os.environ.get("RWKV_SFT_ACCUM_EQUIV_SUMMARY_FILE", "")
     if summary_file:
         Path(summary_file).expanduser().write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
-    assert accumulated_diff <= allowed, json.dumps(summary, indent=2)
+    assert len(set(mask_counts)) > 1, json.dumps(summary, indent=2)
     assert weighted_diff <= allowed, json.dumps(summary, indent=2)
 
 
@@ -765,6 +774,7 @@ def test_cuda_sft_masked_ce_chunk_training_matches_full_logits(tmp_path, monkeyp
             loss = model.training_step(batch, step)
             assert torch.isfinite(loss.detach()).item()
             loss.backward()
+            trainer_mod.rescale_sft_token_weighted_gradients(SimpleNamespace(world_size=1), model)
             grad_norm_sq = 0.0
             for parameter in model.parameters():
                 if parameter.grad is not None:
@@ -939,6 +949,7 @@ def test_cuda_sft_masked_fused_ce_training_matches_full_logits(tmp_path, monkeyp
             loss = model.training_step(batch, step)
             assert torch.isfinite(loss.detach()).item()
             loss.backward()
+            trainer_mod.rescale_sft_token_weighted_gradients(SimpleNamespace(world_size=1), model)
             grad_norm_sq = 0.0
             for parameter in model.parameters():
                 if parameter.grad is not None:

@@ -1043,10 +1043,13 @@ class RWKV(pl.LightningModule):
             if self.trainer.is_global_zero:
                 self.trainer.my_loss_all = all
                 self.trainer.my_loss_token_counts = token_counts
+            self._sft_last_loss_sum = None
+            self._sft_last_token_count = None
             return
         all = self.all_gather(batch_parts)
         if self.trainer.is_global_zero:
             self.trainer.my_loss_all = all
+            self.trainer.my_loss_token_counts = None
 
     def generate_init_weight(self):
         print(

@@ -580,6 +580,90 @@ def test_sft_token_weighted_gradient_rescaling_matches_large_batch():
     assert torch.allclose(accum_logits.grad, full_logits.grad, atol=1e-6)
 
 
+def test_sft_token_weighted_gradient_rescaling_uses_deepspeed_offload_gradients():
+    grad_a = torch.tensor([2.0, -4.0], dtype=torch.float32)
+    grad_b = torch.tensor([6.0], dtype=torch.float32)
+
+    class FlatGroup:
+        def __init__(self, grad):
+            self.grad = grad
+
+    class FakeModule:
+        def __init__(self):
+            self._sft_grad_accum_global_tokens = torch.tensor(16.0)
+            self._sft_grad_accum_micro_batches = 4
+            self.parameter = torch.nn.Parameter(torch.zeros(1))
+
+        def parameters(self):
+            return [self.parameter]
+
+        def reset_sft_grad_accum_state(self):
+            self._sft_grad_accum_global_tokens = None
+            self._sft_grad_accum_micro_batches = 0
+
+    trainer = SimpleNamespace(
+        world_size=2,
+        strategy=SimpleNamespace(
+            model=SimpleNamespace(
+                optimizer=SimpleNamespace(
+                    offload_optimizer=True,
+                    fp32_partitioned_groups_flat=[FlatGroup(grad_a), FlatGroup(grad_b)],
+                )
+            )
+        ),
+    )
+    module = FakeModule()
+
+    scale = trainer_mod.rescale_sft_token_weighted_gradients(trainer, module)
+
+    assert scale == pytest.approx(0.5)
+    assert torch.equal(grad_a, torch.tensor([1.0, -2.0], dtype=torch.float32))
+    assert torch.equal(grad_b, torch.tensor([3.0], dtype=torch.float32))
+    assert module.parameter.grad is None
+    assert module._sft_grad_accum_global_tokens is None
+    assert module._sft_grad_accum_micro_batches == 0
+
+
+def test_sft_token_weighted_gradient_rescaling_uses_deepspeed_averaged_gradients():
+    grad_a = torch.tensor([3.0, -9.0], dtype=torch.float32)
+    grad_b = torch.tensor([12.0], dtype=torch.float32)
+
+    class FakeModule:
+        def __init__(self):
+            self._sft_grad_accum_global_tokens = torch.tensor(24.0)
+            self._sft_grad_accum_micro_batches = 3
+            self.parameter = torch.nn.Parameter(torch.zeros(1))
+
+        def parameters(self):
+            return [self.parameter]
+
+        def reset_sft_grad_accum_state(self):
+            self._sft_grad_accum_global_tokens = None
+            self._sft_grad_accum_micro_batches = 0
+
+    trainer = SimpleNamespace(
+        world_size=2,
+        strategy=SimpleNamespace(
+            model=SimpleNamespace(
+                optimizer=SimpleNamespace(
+                    offload_optimizer=False,
+                    averaged_gradients={0: [grad_a], 1: [grad_b]},
+                )
+            )
+        ),
+    )
+    module = FakeModule()
+
+    scale = trainer_mod.rescale_sft_token_weighted_gradients(trainer, module)
+
+    assert scale == pytest.approx(0.25)
+    assert torch.equal(grad_a, torch.tensor([0.75, -2.25], dtype=torch.float32))
+    assert torch.equal(grad_b, torch.tensor([3.0], dtype=torch.float32))
+    assert module.parameter.grad is None
+    assert module._sft_grad_accum_global_tokens is None
+    assert module._sft_grad_accum_micro_batches == 0
+
+
 def test_configure_epoch_schedule_preserves_sft_steps_and_keeps_pretrain_schedule():
     sft_args = SimpleNamespace(data_type="sft_binidx", epoch_steps=7, epoch_count=3, real_bsz=8, sft_one_pass=0)
     train.configure_epoch_schedule(sft_args)
@@ -1757,6 +1841,35 @@ def test_train_callback_before_optimizer_step_accepts_optimizer_idx(tmp_path, mo
     callback.on_before_optimizer_step(trainer, object(), object(), 0)
 
     assert trainer.my_grad_norm == pytest.approx(4.25)
+
+
+def test_train_callback_before_optimizer_step_skips_deepspeed_non_boundary(tmp_path, monkeypatch):
+    callback = trainer_mod.train_callback(
+        SimpleNamespace(
+            data_type="sft_binidx",
+            strategy="deepspeed_stage_3_offload",
+            proj_dir=str(tmp_path),
+            wandb="",
+            my_timestamp="2026-07-09-21-20-00",
+            run_name="grad-norm-boundary-test",
+        )
+    )
+    monkeypatch.setattr(
+        trainer_mod,
+        "rescale_sft_token_weighted_gradients",
+        lambda trainer, pl_module: (_ for _ in ()).throw(AssertionError("should not rescale before boundary")),
+    )
+    monkeypatch.setattr(
+        trainer_mod,
+        "get_global_grad_norm",
+        lambda trainer, pl_module: (_ for _ in ()).throw(AssertionError("should not read grad norm before boundary")),
+    )
+    trainer = SimpleNamespace(strategy=SimpleNamespace(model=SimpleNamespace(is_gradient_accumulation_boundary=lambda: False)))
+
+    callback.on_before_optimizer_step(trainer, object(), object(), 0)
+
+    assert not hasattr(trainer, "my_grad_norm")
+    assert not hasattr(trainer, "my_sft_grad_scale")
 
 
 def test_train_callback_runs_save_and_eval_on_same_step(tmp_path, monkeypatch):

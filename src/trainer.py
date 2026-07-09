@@ -135,9 +135,56 @@ def strategy_barrier(trainer):
         pass
 
 
+def _get_strategy_model(trainer):
+    return getattr(getattr(trainer, "strategy", None), "model", None)
+
+
+def _iter_deepspeed_gradient_tensors(trainer):
+    strategy_model = _get_strategy_model(trainer)
+    optimizer = getattr(strategy_model, "optimizer", None)
+    if optimizer is None:
+        return []
+
+    if getattr(optimizer, "offload_optimizer", False):
+        flat_groups = getattr(optimizer, "fp32_partitioned_groups_flat", None) or []
+        return [flat.grad for flat in flat_groups if getattr(flat, "grad", None) is not None]
+
+    averaged_gradients = getattr(optimizer, "averaged_gradients", None)
+    if averaged_gradients is None:
+        return []
+
+    if isinstance(averaged_gradients, dict):
+        gradient_groups = averaged_gradients.values()
+    else:
+        gradient_groups = averaged_gradients
+
+    gradients = []
+    for group in gradient_groups:
+        if group is None:
+            continue
+        if torch.is_tensor(group):
+            gradients.append(group)
+            continue
+        gradients.extend(grad for grad in group if grad is not None)
+    return gradients
+
+
+def is_gradient_accumulation_boundary(trainer, pl_module):
+    strategy_model = _get_strategy_model(trainer)
+    if strategy_model is not None:
+        boundary_fn = getattr(strategy_model, "is_gradient_accumulation_boundary", None)
+        if callable(boundary_fn):
+            return bool(boundary_fn())
+
+    strategy = getattr(trainer, "strategy", None)
+    if is_deepspeed_strategy(strategy):
+        return False
+    return True
+
+
 def get_global_grad_norm(trainer, pl_module):
     strategy = getattr(trainer, "strategy", None)
-    strategy_model = getattr(strategy, "model", None)
+    strategy_model = _get_strategy_model(trainer)
     for owner in (strategy_model, getattr(pl_module, "model", None), pl_module):
         if owner is None:
             continue
@@ -196,6 +243,12 @@ def rescale_sft_token_weighted_gradients(trainer, pl_module):
         world_size = int(getattr(trainer, "world_size", 1) or 1)
 
     scale = (micro_batches * world_size) / global_token_count_value
+    deepspeed_gradients = _iter_deepspeed_gradient_tensors(trainer)
+    if deepspeed_gradients:
+        for grad in deepspeed_gradients:
+            grad.mul_(scale)
+        return scale
+
     parameters = getattr(pl_module, "parameters", None)
     if callable(parameters):
         for parameter in parameters():
@@ -330,6 +383,8 @@ class train_callback(pl.Callback):
         self._ensure_run_logging_state(trainer)
 
     def on_before_optimizer_step(self, trainer, pl_module, optimizer, optimizer_idx=None):
+        if not is_gradient_accumulation_boundary(trainer, pl_module):
+            return
         grad_scale = rescale_sft_token_weighted_gradients(trainer, pl_module)
         if grad_scale is not None:
             trainer.my_sft_grad_scale = grad_scale

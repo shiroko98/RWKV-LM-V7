@@ -1872,6 +1872,69 @@ def test_train_callback_wandb_logs_accumulated_loss_once_at_completed_step(tmp_p
     trainer.my_log.close()
 
 
+def test_train_callback_wandb_logs_token_weighted_loss_once_at_completed_step(tmp_path):
+    class FakeWandb:
+        def __init__(self):
+            self.records = []
+
+        def log(self, values, step):
+            self.records.append((values, step))
+
+    callback = trainer_mod.train_callback(
+        SimpleNamespace(
+            data_type="sft_binidx",
+            strategy="",
+            proj_dir=str(tmp_path),
+            magic_prime=0,
+            save_every_n_steps=0,
+            save_at_step=0,
+            sft_eval_every_n_steps=0,
+            ctx_len=16,
+            real_bsz=8,
+            effective_bsz=32,
+            epoch_begin=0,
+            epoch_steps=1000,
+            warmup_steps=0,
+            my_exit_tokens=0,
+            lr_init=1e-4,
+            lr_final=1e-5,
+            lr_wsd_decay_iters=0,
+            lr_wsd_decay_style="cosine",
+            weight_decay=0.0,
+            wandb="enabled",
+            run_name="weighted-accum-loss-test",
+            my_timestamp="2026-07-09-15-10-00",
+        )
+    )
+
+    trainer = SimpleNamespace(
+        global_step=500,
+        is_global_zero=True,
+        strategy=SimpleNamespace(config={}),
+        optimizers=[SimpleNamespace(param_groups=[{"weight_decay": 0.0, "my_lr_scale": 1.0}])],
+        my_wandb=FakeWandb(),
+    )
+
+    callback.on_train_batch_start(trainer, object(), None, 0)
+    trainer.my_loss_all = torch.tensor([10.0], dtype=torch.float32)
+    trainer.my_loss_token_counts = torch.tensor([1.0], dtype=torch.float32)
+    callback.on_train_batch_end(trainer, object(), None, None, 0)
+
+    callback.on_train_batch_start(trainer, object(), None, 0)
+    trainer.global_step = 501
+    trainer.my_loss_all = torch.tensor([6.0], dtype=torch.float32)
+    trainer.my_loss_token_counts = torch.tensor([3.0], dtype=torch.float32)
+    callback.on_train_batch_end(trainer, object(), None, None, 0)
+
+    assert len(trainer.my_wandb.records) == 1
+    values, step = trainer.my_wandb.records[0]
+    assert step == 501
+    assert values["train/step"] == 501
+    assert values["train/loss"] == pytest.approx((10.0 + 6.0) / (1.0 + 3.0))
+    assert values["train/epoch_loss"] == pytest.approx((10.0 + 6.0) / (1.0 + 3.0))
+    trainer.my_log.close()
+
+
 def test_train_callback_progress_metrics_log_once_at_completed_optimizer_step(tmp_path, monkeypatch):
     callback = trainer_mod.train_callback(
         SimpleNamespace(
@@ -1977,6 +2040,65 @@ def test_train_callback_uses_token_weighted_current_loss_when_available(tmp_path
     callback.on_train_batch_end(trainer, object(), None, None, 0)
 
     assert trainer.my_loss == pytest.approx((4.0 + 18.0) / (2.0 + 6.0))
+    trainer.my_log.close()
+
+
+def test_train_callback_uses_token_weighted_loss_for_completed_step_and_epoch(tmp_path, monkeypatch):
+    callback = trainer_mod.train_callback(
+        SimpleNamespace(
+            data_type="sft_binidx",
+            strategy="",
+            proj_dir=str(tmp_path),
+            magic_prime=0,
+            save_every_n_steps=0,
+            save_at_step=0,
+            sft_eval_every_n_steps=0,
+            ctx_len=16,
+            real_bsz=8,
+            effective_bsz=32,
+            epoch_begin=0,
+            epoch_steps=1000,
+            warmup_steps=0,
+            my_exit_tokens=0,
+            lr_init=1e-4,
+            lr_final=1e-5,
+            lr_wsd_decay_iters=0,
+            lr_wsd_decay_style="cosine",
+            weight_decay=0.0,
+            wandb="",
+            run_name="weighted-step-loss-test",
+            my_timestamp="2026-07-09-15-15-00",
+        )
+    )
+    monkeypatch.setattr(trainer_mod.time, "time_ns", lambda: 1_000_000_000)
+
+    trainer = SimpleNamespace(
+        global_step=20,
+        is_global_zero=True,
+        strategy=SimpleNamespace(config={}),
+        my_loss_sum=0.0,
+        my_loss_count=0,
+        my_loss_token_sum=0.0,
+        my_loss_token_count=0.0,
+        my_lr=1e-4,
+        my_wd=0.0,
+        optimizers=[SimpleNamespace(param_groups=[{"weight_decay": 0.0, "my_lr_scale": 1.0}])],
+    )
+
+    callback.on_train_batch_start(trainer, object(), None, 0)
+    trainer.my_loss_all = torch.tensor([10.0], dtype=torch.float32)
+    trainer.my_loss_token_counts = torch.tensor([1.0], dtype=torch.float32)
+    callback.on_train_batch_end(trainer, object(), None, None, 0)
+
+    callback.on_train_batch_start(trainer, object(), None, 0)
+    trainer.global_step = 21
+    trainer.my_loss_all = torch.tensor([6.0], dtype=torch.float32)
+    trainer.my_loss_token_counts = torch.tensor([3.0], dtype=torch.float32)
+    callback.on_train_batch_end(trainer, object(), None, None, 0)
+
+    expected = (10.0 + 6.0) / (1.0 + 3.0)
+    assert trainer.my_loss == pytest.approx(expected)
+    assert trainer.my_epoch_loss == pytest.approx(expected)
     trainer.my_log.close()
 
 

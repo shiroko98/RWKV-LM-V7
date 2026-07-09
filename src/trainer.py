@@ -244,6 +244,8 @@ class train_callback(pl.Callback):
         self._last_completed_real_step = None
         self._pending_loss_sum = 0.0
         self._pending_loss_count = 0
+        self._pending_loss_token_sum = 0.0
+        self._pending_loss_token_count = 0.0
 
     def _ensure_run_logging_state(self, trainer):
         args = self.args
@@ -254,6 +256,10 @@ class train_callback(pl.Callback):
             trainer.my_loss_sum = 0
         if not hasattr(trainer, "my_loss_count"):
             trainer.my_loss_count = 0
+        if not hasattr(trainer, "my_loss_token_sum"):
+            trainer.my_loss_token_sum = 0.0
+        if not hasattr(trainer, "my_loss_token_count"):
+            trainer.my_loss_token_count = 0.0
 
         if not hasattr(trainer, "my_log") or getattr(trainer.my_log, "closed", False):
             trainer.my_log = open(args.proj_dir + "/train_log.txt", "a")
@@ -348,6 +354,14 @@ class train_callback(pl.Callback):
                 trainer.my_time_ns = t_now
             if not hasattr(trainer, "my_step_time_ns"):
                 trainer.my_step_time_ns = trainer.my_time_ns
+            if not hasattr(trainer, "my_loss_sum"):
+                trainer.my_loss_sum = 0
+            if not hasattr(trainer, "my_loss_count"):
+                trainer.my_loss_count = 0
+            if not hasattr(trainer, "my_loss_token_sum"):
+                trainer.my_loss_token_sum = 0.0
+            if not hasattr(trainer, "my_loss_token_count"):
+                trainer.my_loss_token_count = 0.0
             trainer.my_time_ns = t_now
             token_counts = getattr(trainer, "my_loss_token_counts", None)
             if token_counts is not None:
@@ -358,15 +372,31 @@ class train_callback(pl.Callback):
                     current_loss = 0.0
             else:
                 current_loss = trainer.my_loss_all.float().mean().item()
+            if token_counts is not None:
+                current_loss_sum = float(trainer.my_loss_all.float().sum().item())
+                current_token_count = float(token_counts.float().sum().item())
+            else:
+                current_loss_sum = current_loss
+                current_token_count = 1.0
             trainer.my_loss = current_loss
             trainer.my_loss_sum += current_loss
             trainer.my_loss_count += 1
-            trainer.my_epoch_loss = trainer.my_loss_sum / trainer.my_loss_count
+            trainer.my_loss_token_sum += current_loss_sum
+            trainer.my_loss_token_count += current_token_count
+            if trainer.my_loss_token_count > 0:
+                trainer.my_epoch_loss = trainer.my_loss_token_sum / trainer.my_loss_token_count
+            else:
+                trainer.my_epoch_loss = trainer.my_loss_sum / max(trainer.my_loss_count, 1)
             self._pending_loss_sum += current_loss
             self._pending_loss_count += 1
+            self._pending_loss_token_sum += current_loss_sum
+            self._pending_loss_token_count += current_token_count
 
-            if step_advanced and self._pending_loss_count > 0:
-                trainer.my_loss = self._pending_loss_sum / self._pending_loss_count
+            if step_advanced:
+                if self._pending_loss_token_count > 0:
+                    trainer.my_loss = self._pending_loss_token_sum / self._pending_loss_token_count
+                elif self._pending_loss_count > 0:
+                    trainer.my_loss = self._pending_loss_sum / self._pending_loss_count
 
             if step_advanced:
                 progress_metrics = {}
@@ -402,6 +432,8 @@ class train_callback(pl.Callback):
         self._last_completed_real_step = int(real_step)
         self._pending_loss_sum = 0.0
         self._pending_loss_count = 0
+        self._pending_loss_token_sum = 0.0
+        self._pending_loss_token_count = 0.0
 
         if (trainer.is_global_zero) or is_deepspeed_strategy(args.strategy): # save pth
             if args.magic_prime > 0:
@@ -530,6 +562,8 @@ class train_callback(pl.Callback):
 
             trainer.my_loss_sum = 0
             trainer.my_loss_count = 0
+            trainer.my_loss_token_sum = 0.0
+            trainer.my_loss_token_count = 0.0
 
 @rank_zero_only
 def generate_init_weight(model, init_weight_name):

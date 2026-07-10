@@ -1415,7 +1415,7 @@ def test_train_py_sft_cuda_one_step(tmp_path):
         epoch_steps=1,
         epoch_count=1,
     )
-    _run_train_py(command, "train.py SFT CUDA smoke")
+    _run_train_py(train_command, "train.py SFT CUDA smoke")
 
     assert (proj_dir / "train_log.txt").is_file()
 
@@ -1555,7 +1555,7 @@ def test_train_py_sft_deepspeed_masked_fused_ce_smoke(tmp_path):
         sft_masked_fused_ce_chunk=fused_chunk,
     )
     started_at = time.perf_counter()
-    output = _run_train_py(command, "train.py SFT DeepSpeed masked fused CE")
+    output = _run_train_py(train_command, "train.py SFT DeepSpeed masked fused CE")
     elapsed_sec = time.perf_counter() - started_at
     loss = _read_train_log_epoch_loss(proj_dir)
 

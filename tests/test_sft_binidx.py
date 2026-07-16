@@ -190,6 +190,41 @@ def test_tokenizer_encode_decode_and_print_tokens(tokenizer: TRIE_TOKENIZER):
     assert stdout.getvalue().strip()
 
 
+def test_tokenizer_special_first_isolates_registered_markers(tokenizer: TRIE_TOKENIZER):
+    expected_special_ids = {
+        "<|im_start|>": 65530,
+        "<|im_end|>": 65531,
+        "<|endoftext|>": 65532,
+        "<think>": 65533,
+        "<tool_call>": 65534,
+    }
+    legacy_tokenizer = TRIE_TOKENIZER(
+        str(VOCAB_PATH),
+        strict_length=True,
+        special_first=False,
+    )
+
+    for prefix, marker, expected_id in (
+        (" ", "<think>", 65533),
+        (".", "<|im_end|>", 65531),
+        (">", "<tool_call>", 65534),
+    ):
+        text = prefix + marker
+        token_ids, byte_spans = tokenizer.encodeBytesWithSpans(text.encode("utf-8"))
+
+        assert token_ids[-1] == expected_id
+        assert token_ids.count(expected_id) == 1
+        assert byte_spans[-1] == (len(prefix.encode("utf-8")), len(text.encode("utf-8")))
+        assert legacy_tokenizer.encode(text) != token_ids
+
+    all_markers = "".join(expected_special_ids)
+    assert tokenizer.encode(all_markers) == list(expected_special_ids.values())
+    assert b"</think>" not in tokenizer.special_token2idx
+    assert b"</tool_call>" not in tokenizer.special_token2idx
+    assert tokenizer.decode(tokenizer.encode("</think></tool_call>")) == "</think></tool_call>"
+    assert max(tokenizer.encode("Assistant: <think>\n")) < 65536
+
+
 def test_trie_repr_and_default_value_storage():
     trie = TRIE()
     leaf = trie.add(b"ab")
@@ -600,6 +635,24 @@ def test_tokenize_with_char_spans_and_mask_projection(tokenizer: TRIE_TOKENIZER)
     assert sum(projected) >= 1
 
 
+def test_tokenize_with_char_spans_preserves_special_first_boundaries(tokenizer: TRIE_TOKENIZER):
+    text = "Assistant: <think>\nanswer.<|im_end|>\n><tool_call>"
+    token_ids, char_spans = _tokenize_with_char_spans(tokenizer, text)
+
+    expected = {
+        "<think>": 65533,
+        "<|im_end|>": 65531,
+        "<tool_call>": 65534,
+    }
+    for marker, token_id in expected.items():
+        marker_start = text.index(marker)
+        marker_end = marker_start + len(marker)
+        token_index = token_ids.index(token_id)
+
+        assert token_ids.count(token_id) == 1
+        assert char_spans[token_index] == (marker_start, marker_end)
+
+
 def test_tokenize_with_char_spans_masks_all_byte_tokens_for_split_utf8_char(tokenizer: TRIE_TOKENIZER):
     text = "A⋃_{i=1} B"
     trainable_char = text.index("⋃")
@@ -642,6 +695,32 @@ def test_encode_separator_produces_masked_newline(tokenizer: TRIE_TOKENIZER):
     separator = _encode_separator(tokenizer)
     assert tokenizer.decode(separator.input_ids) == "\n"
     assert separator.loss_mask == [0] * len(separator.input_ids)
+
+
+def test_build_document_from_record_writes_atomic_special_token_ids(
+    tokenizer: TRIE_TOKENIZER,
+    chat_template,
+):
+    record = {
+        "messages": [
+            {"role": "user", "content": "请调用工具。"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"function": {"name": "demo", "arguments": {}}}],
+            },
+        ]
+    }
+
+    encoded = build_document_from_record(record, tokenizer=tokenizer, template=chat_template)
+    decoded = tokenizer.decode(encoded.input_ids)
+
+    assert "<think>" in decoded
+    assert "<tool_call>" in decoded
+    assert 65533 in encoded.input_ids
+    assert 65534 in encoded.input_ids
+    assert 65531 in encoded.input_ids
+    assert 65532 == encoded.input_ids[-1]
 
 
 def test_build_document_from_record_trains_only_final_assistant_with_added_think(

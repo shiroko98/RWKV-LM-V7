@@ -1,12 +1,14 @@
+import argparse
 import fileinput
 import json
 import os
 import random
 import sys
+from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 try:
     from tokenizer.rwkv_tokenizer import TRIE_TOKENIZER  # noqa: E402
@@ -41,25 +43,31 @@ bb/aa/dd/cc/dd/aa/bb/cc/dd/bb/cc/aa/
 where the data is repeated 3 times (each time with different shuffle)
 """
 
-########################################################################################################
-# MMapIndexedDatasetBuilder
-########################################################################################################
 
-try:
-    tokenizer = TRIE_TOKENIZER("tokenizer/rwkv_vocab_v20230424.txt")
-except FileNotFoundError:
-    tokenizer = TRIE_TOKENIZER("data/tokenizer/rwkv_vocab_v20230424.txt")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_VOCAB = REPO_ROOT / "rwkv_vocab_v20260603.txt"
 
 
-def index_file_path(prefix_path):
-    return prefix_path + ".idx"
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Convert raw JSONL text into an RWKV binidx dataset."
+    )
+    parser.add_argument("input_jsonl", type=str)
+    parser.add_argument("n_epoch", type=int)
+    parser.add_argument("ctx_len", type=int)
+    parser.add_argument(
+        "--vocab",
+        type=str,
+        default=str(DEFAULT_VOCAB),
+        help=(
+            "RWKV vocab file. Defaults to the special-first 20260603 vocab; "
+            "pass an older vocab explicitly only for legacy compatibility."
+        ),
+    )
+    return parser
 
 
-def data_file_path(prefix_path):
-    return prefix_path + ".bin"
-
-
-class MMapIndexedDatasetBuilder(object):
+class MMapIndexedDatasetBuilder:
     def __init__(self, out_file, dtype=np.uint16):
         self._data_file = open(out_file, "wb")
         self._dtype = dtype
@@ -80,21 +88,16 @@ class MMapIndexedDatasetBuilder(object):
             index.write(self._sizes, self._doc_idx)
 
 
-cnt = 0
-
-
-def add_raw(raw):
-    global builder, cnt
+def add_raw(raw, *, tokenizer: TRIE_TOKENIZER, builder, count: int) -> int:
     out = tokenizer.encode(raw)
     if tokenizer.decode(out) != raw:
-        print("ERROR" * 100)
-        exit(0)
+        raise ValueError("Tokenizer failed the raw-text round-trip check.")
     out.append(0)  # [0] = end_of_doc for rwkv tokenizer
     builder.add_item(np.array(out, dtype=np.uint16))
     builder.end_document()
-    if cnt % 500 == 0:
-        print(cnt, end=" ", flush=True)
-    cnt += 1
+    if count % 500 == 0:
+        print(count, end=" ", flush=True)
+    return count + 1
 
 
 def is_prime(n):
@@ -111,82 +114,85 @@ def is_prime(n):
         i += 6
     return True
 
-########################################################################################################
 
+def main(argv=None):
+    args = build_arg_parser().parse_args(argv)
+    if args.n_epoch <= 0:
+        raise ValueError("n_epoch must be a positive integer.")
+    if args.ctx_len <= 0:
+        raise ValueError("ctx_len must be a positive integer.")
 
-N_EPOCH = int(sys.argv[2].strip())
-IN_FILE = sys.argv[1].strip()
-OUT_NAME = os.path.splitext(os.path.basename(IN_FILE))[0]
-CTX_LEN = int(sys.argv[3].strip())
-TEMP_FILE = "make_data_temp.jsonl"
+    n_epoch = args.n_epoch
+    input_file = args.input_jsonl
+    out_name = os.path.splitext(os.path.basename(input_file))[0]
+    ctx_len = args.ctx_len
+    temp_file = "make_data_temp.jsonl"
+    tokenizer = TRIE_TOKENIZER(args.vocab, strict_length=True)
 
-print(f"### Convert {IN_FILE} to {OUT_NAME}.bin/idx...")
+    print(f"### Vocab: {Path(args.vocab).resolve()}")
+    print(f"### Convert {input_file} to {out_name}.bin/idx...")
 
-with open(IN_FILE, "r", encoding="utf-8") as file:
-    non_empty_lines = [line.strip() for line in file if line.strip()]
+    with open(input_file, "r", encoding="utf-8") as file:
+        non_empty_lines = [line.strip() for line in file if line.strip()]
 
-print(f"### Found {len(non_empty_lines)} non-empty lines in {IN_FILE}")
+    print(f"### Found {len(non_empty_lines)} non-empty lines in {input_file}")
 
-file = open(TEMP_FILE, "w", encoding="utf-8")
-for i in range(N_EPOCH):
-    print(f"Shuffle: {i+1} out of {N_EPOCH}")
-    random.shuffle(non_empty_lines)
-    for entry in non_empty_lines:
-        file.write(entry + "\n")
-file.close()
+    with open(temp_file, "w", encoding="utf-8") as file:
+        for epoch in range(n_epoch):
+            print(f"Shuffle: {epoch + 1} out of {n_epoch}")
+            random.shuffle(non_empty_lines)
+            for entry in non_empty_lines:
+                file.write(entry + "\n")
 
-########################################################################################################
+    print("### Building binidx...")
+    builder = MMapIndexedDatasetBuilder(f"{out_name}.bin")
+    count = 0
+    with fileinput.input(temp_file, encoding="utf-8") as input_lines:
+        for line in input_lines:
+            count = add_raw(
+                json.loads(line)["text"],
+                tokenizer=tokenizer,
+                builder=builder,
+                count=count,
+            )
+    builder.finalize(f"{out_name}.idx")
+    print("done")
 
-print("### Building binidx...")
+    print("### Verifying result...")
+    data = MMapIndexedDataset(out_name)
+    data_len = len(data)
+    data_size = len(data._bin_buffer) // data._index._dtype_size
 
-builder = MMapIndexedDatasetBuilder(f"{OUT_NAME}.bin")
-with fileinput.input(TEMP_FILE, encoding="utf-8") as ffff:
-    for line in ffff:
-        x = json.loads(line)["text"]
-        add_raw(x)
-builder.finalize((f"{OUT_NAME}.idx"))
-print("done")
+    preview_limit = 100
+    for idx in [0, data_len - 1]:
+        _, size = data._index[idx]
+        token_ids = data.get(idx=idx, offset=0, length=size).astype(int)
+        print("-" * 70 + f"[{out_name} idx {idx} sz {size}]")
+        assert token_ids[-1] == 0
+        token_ids = token_ids[:-1]
+        if len(token_ids) > preview_limit:
+            print(tokenizer.decode(token_ids[:preview_limit]))
+            print("· " * 30)
+            print(tokenizer.decode(token_ids[-preview_limit:]))
+        else:
+            print(tokenizer.decode(token_ids))
 
-print("### Verifying result...")
-data = MMapIndexedDataset(OUT_NAME)
-data_len = len(data)
-data_size = len(data._bin_buffer) // data._index._dtype_size
+    print(
+        f"{'-' * 80}\n### Final {out_name}.bin/idx has {data_size} tokens, "
+        f"{data_len} items. Dtype {data._index.dtype}"
+    )
 
-TODO = [0, data_len - 1]
-PREVIEW_LIMIT = 100
-for idx in TODO:
-    ptr, size = data._index[idx]
-    dix = data.get(idx=idx, offset=0, length=size).astype(int)
-    print("-" * 70 + f"[{OUT_NAME} idx {idx} sz {size}]")
-    assert dix[-1] == 0
-    dix = dix[:-1]
-    if len(dix) > PREVIEW_LIMIT:
-        try:
-            print(tokenizer.decode(dix[:PREVIEW_LIMIT]))
-        except BaseException:
-            try:
-                print(tokenizer.decode(dix[: PREVIEW_LIMIT + 1]))
-            except BaseException:
-                print(tokenizer.decode(dix[: PREVIEW_LIMIT + 2]))
-        print("· " * 30)
-        try:  # avoid utf-8 bug
-            print(tokenizer.decode(dix[-PREVIEW_LIMIT:]))
-        except BaseException:
-            try:
-                print(tokenizer.decode(dix[-PREVIEW_LIMIT - 1:]))
-            except BaseException:
-                print(tokenizer.decode(dix[-PREVIEW_LIMIT - 2:]))
-    else:
-        print(tokenizer.decode(dix))
-
-print(f"{'-'*80}\n### Final {OUT_NAME}.bin/idx has {data_size} tokens, {data_len} items. Dtype {data._index.dtype}")
-
-if data_size >= CTX_LEN * 3:
-    n_chunk = int(data_size // CTX_LEN) - 1
-    for i in range(n_chunk, 0, -1):
-        if i % 3 == 2:
-            if is_prime(i):
-                print(f"\n### magic_prime = {i} (for ctxlen {CTX_LEN})")
+    if data_size >= ctx_len * 3:
+        n_chunk = int(data_size // ctx_len) - 1
+        for candidate in range(n_chunk, 0, -1):
+            if candidate % 3 == 2 and is_prime(candidate):
+                print(f"\n### magic_prime = {candidate} (for ctxlen {ctx_len})")
                 print(
-                    f'\n--my_exit_tokens {data_size} --magic_prime {i} --ctx_len {CTX_LEN}\n')
-                exit(0)
+                    f"\n--my_exit_tokens {data_size} --magic_prime {candidate} "
+                    f"--ctx_len {ctx_len}\n"
+                )
+                return
+
+
+if __name__ == "__main__":
+    main()

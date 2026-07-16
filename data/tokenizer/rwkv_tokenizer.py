@@ -7,6 +7,20 @@ from __future__ import annotations
 import ast
 import warnings
 
+
+# These token strings are exported by the special-first HF converter with their
+# existing RWKV vocabulary IDs. They must be isolated before greedy trie
+# tokenization so an ordinary token such as b" <" cannot consume the leading
+# b"<" of a marker.
+RWKV_SPECIAL_TOKENS = (
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|endoftext|>",
+    "<think>",
+    "<tool_call>",
+)
+
+
 class TRIE:
     __slots__ = tuple("ch,to,values,front".split(","))
     to: list
@@ -75,9 +89,14 @@ def parse_vocab_line(line: str, *, strict_length: bool = False):
 
 
 class TRIE_TOKENIZER():
-    def __init__(self, file_name, *, strict_length: bool = False):
+    def __init__(
+        self,
+        file_name,
+        *,
+        strict_length: bool = False,
+        special_first: bool = True,
+    ):
         self.idx2token = {}
-        sorted = []  # must be already sorted
         mismatch_count = 0
         with open(file_name, "r", encoding="utf-8") as f:
             lines = f.readlines()
@@ -88,7 +107,6 @@ class TRIE_TOKENIZER():
             )
             if len(token_bytes) != declared_length:
                 mismatch_count += 1
-            sorted += [token_bytes]
             self.idx2token[idx] = token_bytes
 
         if mismatch_count > 0:
@@ -103,19 +121,82 @@ class TRIE_TOKENIZER():
         for k, v in self.idx2token.items():
             self.token2idx[v] = int(k)
 
+        self.special_first = bool(special_first)
+        self.special_token2idx = {
+            token.encode("utf-8"): self.token2idx[token.encode("utf-8")]
+            for token in RWKV_SPECIAL_TOKENS
+            if token.encode("utf-8") in self.token2idx
+        }
+        self._special_tokens_by_length = sorted(
+            self.special_token2idx,
+            key=len,
+            reverse=True,
+        )
+
         self.root = TRIE()
         for t, i in self.token2idx.items():
             _ = self.root.add(t, val=(t, i))
 
-    def encodeBytes(self, src: bytes):
+    def _encode_plain_bytes_with_spans(self, src: bytes, *, offset: int = 0):
         idx: int = 0
         tokens = []
-        while (idx < len(src)):
-            _idx: int = idx
+        byte_spans = []
+        while idx < len(src):
+            start = idx
             idx, _, values = self.root.find_longest(src, idx)
-            assert (idx != _idx)
+            assert idx != start
             _, token = next(iter(values))
             tokens.append(token)
+            byte_spans.append((offset + start, offset + idx))
+        return tokens, byte_spans
+
+    def _find_next_special_token(self, src: bytes, start: int):
+        best_start = None
+        best_token = None
+        for token in self._special_tokens_by_length:
+            token_start = src.find(token, start)
+            if token_start < 0:
+                continue
+            if best_start is None or token_start < best_start:
+                best_start = token_start
+                best_token = token
+        return best_start, best_token
+
+    def encodeBytesWithSpans(self, src: bytes):
+        if not self.special_first or not self.special_token2idx:
+            return self._encode_plain_bytes_with_spans(src)
+
+        tokens = []
+        byte_spans = []
+        cursor = 0
+        while cursor < len(src):
+            special_start, special_token = self._find_next_special_token(src, cursor)
+            if special_start is None or special_token is None:
+                plain_tokens, plain_spans = self._encode_plain_bytes_with_spans(
+                    src[cursor:],
+                    offset=cursor,
+                )
+                tokens.extend(plain_tokens)
+                byte_spans.extend(plain_spans)
+                break
+
+            if special_start > cursor:
+                plain_tokens, plain_spans = self._encode_plain_bytes_with_spans(
+                    src[cursor:special_start],
+                    offset=cursor,
+                )
+                tokens.extend(plain_tokens)
+                byte_spans.extend(plain_spans)
+
+            special_end = special_start + len(special_token)
+            tokens.append(self.special_token2idx[special_token])
+            byte_spans.append((special_start, special_end))
+            cursor = special_end
+
+        return tokens, byte_spans
+
+    def encodeBytes(self, src: bytes):
+        tokens, _ = self.encodeBytesWithSpans(src)
         return tokens
 
     def decodeBytes(self, tokens):

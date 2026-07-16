@@ -494,17 +494,7 @@ def _char_mask_from_span(text: str, train_start: int, train_end: int) -> list[in
 
 def _tokenize_with_char_spans(tokenizer: TRIE_TOKENIZER, text: str) -> tuple[list[int], list[tuple[int, int]]]:
     encoded = text.encode("utf-8")
-    idx = 0
-    tokens: list[int] = []
-    byte_spans: list[tuple[int, int]] = []
-    while idx < len(encoded):
-        prev_idx = idx
-        idx, _, values = tokenizer.root.find_longest(encoded, idx)
-        if idx == prev_idx:
-            raise AssertionError("Tokenizer failed to advance while encoding text.")
-        _, token_id = next(iter(values))
-        tokens.append(token_id)
-        byte_spans.append((prev_idx, idx))
+    tokens, byte_spans = tokenizer.encodeBytesWithSpans(encoded)
 
     byte_to_char = [0] * len(encoded)
     byte_index = 0

@@ -87,6 +87,11 @@ class BuiltDocument:
     info_events: list[dict[str, object]]
 
 
+@dataclass(frozen=True)
+class DocumentBuildFailure:
+    event: dict[str, object]
+
+
 @dataclass
 class FilterStats:
     filtered: int = 0
@@ -1149,16 +1154,26 @@ def _init_document_worker(
     _PROCESS_CURRENT_LOCATION = current_location
 
 
-def _build_document_from_source_line_in_worker(source: JsonlSourceLine) -> BuiltDocument:
+def _build_document_from_source_line_in_worker(
+    source: JsonlSourceLine,
+) -> BuiltDocument | DocumentBuildFailure:
     if _PROCESS_TOKENIZER is None or _PROCESS_TEMPLATE is None:
         raise RuntimeError("SFT document worker was not initialized.")
-    return _build_document_from_source_line(
-        source,
-        tokenizer=_PROCESS_TOKENIZER,
-        template=_PROCESS_TEMPLATE,
-        current_date=_PROCESS_CURRENT_DATE,
-        current_location=_PROCESS_CURRENT_LOCATION,
-    )
+    try:
+        return _build_document_from_source_line(
+            source,
+            tokenizer=_PROCESS_TOKENIZER,
+            template=_PROCESS_TEMPLATE,
+            current_date=_PROCESS_CURRENT_DATE,
+            current_location=_PROCESS_CURRENT_LOCATION,
+        )
+    except Exception as exc:
+        if isinstance(exc, SFTDocumentBuildError):
+            event = dict(exc.event)
+        else:
+            event = _source_error_event(source, exc)
+        event["skipped"] = True
+        return DocumentBuildFailure(event=event)
 
 
 def _emit_document_progress(
@@ -1229,8 +1244,23 @@ def build_documents_from_sources(
                     current_location=current_location,
                 )
             except Exception as exc:
-                _emit_exception_error(error_callback, exc, source=source)
-                raise
+                if isinstance(exc, SFTDocumentBuildError):
+                    event = dict(exc.event)
+                else:
+                    event = _source_error_event(source, exc)
+                event["skipped"] = True
+                if error_callback is not None:
+                    error_callback(event)
+                done += 1
+                _emit_document_progress(
+                    progress_callback,
+                    done=done,
+                    total=progress_total,
+                    source=source,
+                    group_index=progress_group_index,
+                    group_count=progress_group_count,
+                )
+                continue
             if error_callback is not None:
                 for event in built.info_events:
                     error_callback(event)
@@ -1267,6 +1297,19 @@ def build_documents_from_sources(
         )
         try:
             for source, built in zip(sources, mapped_documents):
+                if isinstance(built, DocumentBuildFailure):
+                    if error_callback is not None:
+                        error_callback(built.event)
+                    done += 1
+                    _emit_document_progress(
+                        progress_callback,
+                        done=done,
+                        total=progress_total,
+                        source=source,
+                        group_index=progress_group_index,
+                        group_count=progress_group_count,
+                    )
+                    continue
                 if error_callback is not None:
                     for event in built.info_events:
                         error_callback(event)
@@ -1524,6 +1567,7 @@ def write_best_fit_decreasing_sharded_documents(
         "source_lines": 0,
         "source_documents": 0,
         "filtered_documents": 0,
+        "skipped_documents": 0,
     }
 
     read_pool = (
@@ -1536,6 +1580,15 @@ def write_best_fit_decreasing_sharded_documents(
         group_count = (len(input_paths) + pack_shard_group_size - 1) // pack_shard_group_size
         for group_index, start in enumerate(range(0, len(input_paths), pack_shard_group_size), start=1):
             input_group = input_paths[start:start + pack_shard_group_size]
+            group_skipped_documents = 0
+
+            def group_error_callback(event: dict[str, object]) -> None:
+                nonlocal group_skipped_documents
+                if event.get("skipped") is True:
+                    group_skipped_documents += 1
+                if error_callback is not None:
+                    error_callback(event)
+
             cache_prefix = (
                 _cache_group_prefix(
                     pack_cache_dir,
@@ -1561,6 +1614,7 @@ def write_best_fit_decreasing_sharded_documents(
                 stats["source_lines"] += cache_meta["source_lines"]
                 stats["source_documents"] += cache_meta["source_documents"]
                 stats["filtered_documents"] += cache_meta["filtered_documents"]
+                stats["skipped_documents"] += cache_meta.get("skipped_documents", 0)
                 _emit_group_progress(
                     progress_callback,
                     stage="cache-hit",
@@ -1597,7 +1651,7 @@ def write_best_fit_decreasing_sharded_documents(
                 worker_chunksize=worker_chunksize,
                 process_pool=document_pool,
                 progress_callback=progress_callback,
-                error_callback=error_callback,
+                error_callback=group_error_callback,
                 progress_total=len(shuffled_sources),
                 progress_group_index=group_index,
                 progress_group_count=group_count,
@@ -1627,6 +1681,7 @@ def write_best_fit_decreasing_sharded_documents(
                         "source_lines": len(sources),
                         "source_documents": len(shuffled_sources),
                         "filtered_documents": filter_stats.filtered,
+                        "skipped_documents": group_skipped_documents,
                     },
                 )
                 shard_stats = _merge_binidx_pair_into_builders(
@@ -1660,6 +1715,7 @@ def write_best_fit_decreasing_sharded_documents(
             stats["source_lines"] += len(sources)
             stats["source_documents"] += len(shuffled_sources)
             stats["filtered_documents"] += filter_stats.filtered
+            stats["skipped_documents"] += group_skipped_documents
     finally:
         if read_pool is not None:
             read_pool.shutdown()
@@ -1748,6 +1804,15 @@ def build_binidx_dataset(
         sources = load_jsonl_sources(input_paths, num_workers=num_workers, progress_callback=progress_callback)
         rng = random.Random(seed)
         shuffled_sources = shuffled_epoch_sources(sources, n_epoch, rng, shuffle=shuffle)
+        skipped_documents = 0
+
+        def nonpacked_error_callback(event: dict[str, object]) -> None:
+            nonlocal skipped_documents
+            if event.get("skipped") is True:
+                skipped_documents += 1
+            if error_callback is not None:
+                error_callback(event)
+
         documents = build_documents_from_sources(
             shuffled_sources,
             vocab_path=vocab_path,
@@ -1757,7 +1822,7 @@ def build_binidx_dataset(
             num_workers=num_workers,
             worker_chunksize=worker_chunksize,
             progress_callback=progress_callback,
-            error_callback=error_callback,
+            error_callback=nonpacked_error_callback,
             progress_total=len(shuffled_sources),
         )
 
@@ -1784,6 +1849,7 @@ def build_binidx_dataset(
         stats["source_lines"] = len(sources)
         stats["source_documents"] = len(shuffled_sources)
         stats["filtered_documents"] = filtered_documents
+        stats["skipped_documents"] = skipped_documents
 
     stats["output_prefix"] = prefix
     stats["source_files"] = len(input_paths)

@@ -1846,18 +1846,26 @@ def test_build_binidx_dataset_can_disable_shuffle_for_ordered_epochs(tmp_path):
     assert ["second-answer" in text for text in decoded_documents] == [False, True, False, True]
 
 
-def test_build_documents_from_sources_reports_json_errors(tokenizer: TRIE_TOKENIZER, chat_template):
+def test_build_documents_from_sources_skips_json_errors(tokenizer: TRIE_TOKENIZER, chat_template):
     sources = [JsonlSourceLine(text="{bad json", source_path="bad.jsonl", line_number=3)]
-    with pytest.raises(ValueError, match=r"bad\.jsonl:3"):
-        list(
-            build_documents_from_sources(
-                sources,
-                vocab_path=str(VOCAB_PATH),
-                template_path=str(TEMPLATE_PATH),
-                num_workers=2,
-                worker_chunksize=1,
-            )
+    events = []
+    documents = list(
+        build_documents_from_sources(
+            sources,
+            vocab_path=str(VOCAB_PATH),
+            template_path=str(TEMPLATE_PATH),
+            num_workers=2,
+            worker_chunksize=1,
+            error_callback=events.append,
         )
+    )
+
+    assert documents == []
+    assert len(events) == 1
+    assert events[0]["skipped"] is True
+    assert events[0]["source_path"] == "bad.jsonl"
+    assert events[0]["line_number"] == 3
+    assert events[0]["error_type"] == "JSONDecodeError"
 
 
 def test_build_documents_from_sources_logs_full_record_on_render_errors(
@@ -1877,18 +1885,19 @@ def test_build_documents_from_sources_logs_full_record_on_render_errors(
     )
     events = []
 
-    with pytest.raises(ValueError, match=r"reasoning\.jsonl:7"):
-        list(
-            build_documents_from_sources(
-                [source],
-                tokenizer=tokenizer,
-                template=chat_template,
-                error_callback=events.append,
-            )
+    documents = list(
+        build_documents_from_sources(
+            [source],
+            tokenizer=tokenizer,
+            template=chat_template,
+            error_callback=events.append,
         )
+    )
 
+    assert documents == []
     assert len(events) == 1
     event = events[0]
+    assert event["skipped"] is True
     assert event["source_path"] == "reasoning.jsonl"
     assert event["line_number"] == 7
     assert event["error_type"] == "ValueError"
@@ -1896,6 +1905,155 @@ def test_build_documents_from_sources_logs_full_record_on_render_errors(
     assert json.loads(event["source_text"]) == record
     assert event["record_summary"]["roles"] == ["user", "assistant"]
     assert event["record_summary"]["messages"][-1]["has_reasoning_content"] is True
+
+
+def test_build_documents_from_sources_skips_bad_records_and_preserves_good_encoding(
+    tokenizer: TRIE_TOKENIZER,
+    chat_template,
+):
+    bad_record = {
+        "messages": [
+            {"role": "user", "content": "调用工具"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "call_bad", "type": "function", "function": {"name": None, "arguments": "{}"}}
+                ],
+            },
+        ]
+    }
+    good_record = {"messages": [{"role": "assistant", "content": "正常答案"}]}
+    sources = [
+        JsonlSourceLine(json.dumps(bad_record, ensure_ascii=False), "bad.jsonl", 1),
+        JsonlSourceLine(json.dumps(good_record, ensure_ascii=False), "good.jsonl", 2),
+    ]
+    events = []
+
+    skipped_documents = list(
+        build_documents_from_sources(
+            sources,
+            tokenizer=tokenizer,
+            template=chat_template,
+            error_callback=events.append,
+        )
+    )
+    expected = build_document_from_record(good_record, tokenizer=tokenizer, template=chat_template)
+
+    assert len(skipped_documents) == 1
+    assert skipped_documents[0] == expected
+    assert tokenizer.decode(skipped_documents[0].input_ids) == tokenizer.decode(expected.input_ids)
+    assert len(events) == 1
+    assert events[0]["skipped"] is True
+    assert events[0]["source_path"] == "bad.jsonl"
+    assert events[0]["line_number"] == 1
+    assert events[0]["error_type"] == "TypeError"
+
+
+def test_build_documents_from_sources_skips_bad_records_in_parallel_and_continues():
+    bad_record = {
+        "messages": [
+            {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": None, "arguments": {}}}]}
+        ]
+    }
+    good_record = {"messages": [{"role": "assistant", "content": "并行后仍然保留"}]}
+    sources = [
+        JsonlSourceLine(json.dumps(good_record, ensure_ascii=False), "good-before.jsonl", 1),
+        JsonlSourceLine(json.dumps(bad_record, ensure_ascii=False), "bad.jsonl", 2),
+        JsonlSourceLine(json.dumps(good_record, ensure_ascii=False), "good-after.jsonl", 3),
+    ]
+    events = []
+
+    documents = list(
+        build_documents_from_sources(
+            sources,
+            vocab_path=str(VOCAB_PATH),
+            template_path=str(TEMPLATE_PATH),
+            num_workers=2,
+            worker_chunksize=1,
+            error_callback=events.append,
+        )
+    )
+
+    assert len(documents) == 2
+    assert all("并行后仍然保留" in TRIE_TOKENIZER(str(VOCAB_PATH), strict_length=True).decode(doc.input_ids) for doc in documents)
+    assert len(events) == 1
+    assert events[0]["skipped"] is True
+    assert events[0]["source_path"] == "bad.jsonl"
+    assert events[0]["line_number"] == 2
+
+
+def test_build_documents_from_sources_skips_unexpected_per_record_errors(
+    tokenizer: TRIE_TOKENIZER,
+    chat_template,
+    monkeypatch,
+):
+    original = sft_binidx._build_document_from_source_line
+
+    def fail_one(source, **kwargs):
+        if source.text == "unexpected":
+            raise RuntimeError("synthetic per-record failure")
+        return original(source, **kwargs)
+
+    monkeypatch.setattr(sft_binidx, "_build_document_from_source_line", fail_one)
+    sources = [
+        JsonlSourceLine("unexpected", "unexpected.jsonl", 8),
+        JsonlSourceLine(json.dumps({"messages": [{"role": "assistant", "content": "ok"}]}), "ok.jsonl", 9),
+    ]
+    events = []
+
+    documents = list(
+        build_documents_from_sources(
+            sources,
+            tokenizer=tokenizer,
+            template=chat_template,
+            error_callback=events.append,
+        )
+    )
+
+    assert len(documents) == 1
+    assert events[0]["skipped"] is True
+    assert events[0]["error_type"] == "RuntimeError"
+    assert events[0]["source_path"] == "unexpected.jsonl"
+
+
+def test_build_binidx_dataset_skips_errors_logs_and_counts_dropped_records(tmp_path):
+    bad_record = {
+        "messages": [
+            {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": None, "arguments": {}}}]}
+        ]
+    }
+    good_record = {"messages": [{"role": "assistant", "content": "保留的样本"}]}
+    input_path = tmp_path / "mixed.jsonl"
+    input_path.write_text(
+        "\n".join(json.dumps(record, ensure_ascii=False) for record in [bad_record, good_record, good_record]) + "\n",
+        encoding="utf-8",
+    )
+    output_prefix = str(tmp_path / "mixed_out")
+    events = []
+
+    stats = build_binidx_dataset(
+        str(input_path),
+        output_prefix=output_prefix,
+        vocab_path=str(VOCAB_PATH),
+        template_path=str(TEMPLATE_PATH),
+        n_epoch=1,
+        seed=1234,
+        pack_length=64,
+        shuffle=False,
+        pack_strategy="best-fit-decreasing",
+        error_callback=events.append,
+    )
+
+    assert stats["source_documents"] == 3
+    assert stats["skipped_documents"] == 1
+    assert len(events) == 1
+    assert events[0]["skipped"] is True
+    token_ds = MMapIndexedDataset(output_prefix)
+    tokenizer = TRIE_TOKENIZER(str(VOCAB_PATH), strict_length=True)
+    decoded = [tokenizer.decode(token_ds[index].astype(int).tolist()) for index in range(len(token_ds))]
+    assert len(decoded) == 2
+    assert all("保留的样本" in text for text in decoded)
 
 
 def test_build_documents_from_sources_logs_worker_errors_with_exact_source():
@@ -1919,19 +2077,20 @@ def test_build_documents_from_sources_logs_worker_errors_with_exact_source():
     ]
     events = []
 
-    with pytest.raises(ValueError, match=r"bad_worker\.jsonl:42"):
-        list(
-            build_documents_from_sources(
-                sources,
-                vocab_path=str(VOCAB_PATH),
-                template_path=str(TEMPLATE_PATH),
-                num_workers=2,
-                worker_chunksize=1,
-                error_callback=events.append,
-            )
+    documents = list(
+        build_documents_from_sources(
+            sources,
+            vocab_path=str(VOCAB_PATH),
+            template_path=str(TEMPLATE_PATH),
+            num_workers=2,
+            worker_chunksize=1,
+            error_callback=events.append,
         )
+    )
 
+    assert len(documents) == 1
     assert len(events) == 1
+    assert events[0]["skipped"] is True
     assert events[0]["source_path"] == "bad_worker.jsonl"
     assert events[0]["line_number"] == 42
     assert events[0]["record"] == bad_record
@@ -2167,26 +2326,26 @@ def test_cli_main_writes_error_log_with_full_record(tmp_path):
     output_prefix = tmp_path / "cli_error_log_out"
     error_log = tmp_path / "errors.jsonl"
 
-    with pytest.raises(ValueError, match=r"cli_error_log\.jsonl:1"):
-        make_sft_binidx_main(
-            [
-                str(input_path),
-                "--out-prefix",
-                str(output_prefix),
-                "--vocab",
-                str(VOCAB_PATH),
-                "--chat-template",
-                str(TEMPLATE_PATH),
-                "--pack-length",
-                "128",
-                "--no-progress",
-                "--error-log",
-                str(error_log),
-            ]
-        )
+    make_sft_binidx_main(
+        [
+            str(input_path),
+            "--out-prefix",
+            str(output_prefix),
+            "--vocab",
+            str(VOCAB_PATH),
+            "--chat-template",
+            str(TEMPLATE_PATH),
+            "--pack-length",
+            "128",
+            "--no-progress",
+            "--error-log",
+            str(error_log),
+        ]
+    )
 
     events = [json.loads(line) for line in error_log.read_text(encoding="utf-8").splitlines()]
     assert len(events) == 1
+    assert events[0]["skipped"] is True
     assert events[0]["source_path"] == str(input_path)
     assert events[0]["line_number"] == 1
     assert events[0]["record"] == record

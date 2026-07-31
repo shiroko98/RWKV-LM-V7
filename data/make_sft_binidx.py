@@ -218,7 +218,8 @@ def main(argv=None):
         f"prefix={stats['output_prefix']} "
         f"docs={stats['documents']} "
         f"tokens={stats['tokens']} "
-        f"trainable_tokens={stats['trainable_tokens']}"
+        f"trainable_tokens={stats['trainable_tokens']} "
+        f"skipped_documents={stats.get('skipped_documents', 0)}"
     )
 
 
